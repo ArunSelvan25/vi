@@ -1,0 +1,21 @@
+{
+  "name": "vi-property-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Property and tenancy management on Google Sheets, hosted free on GitHub Pages.",
+  "type": "module",
+  "scripts": {
+    "dev": "node test/mock-server.mjs",
+    "test": "node test/gas-test.mjs && node test/security-test.mjs && node test/production-test.mjs && node test/pwa-test.mjs && node test/smoke.mjs && node test/responsive-test.mjs && node test/pwa-browser-test.mjs",
+    "test:backend": "node test/gas-test.mjs",
+    "test:security": "node test/security-test.mjs",
+    "test:production": "node test/production-test.mjs",
+    "test:pwa": "node test/pwa-test.mjs",
+    "test:ui": "node test/smoke.mjs",
+    "test:pwa:ui": "node test/pwa-browser-test.mjs",
+    "test:responsive": "node test/responsive-test.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}

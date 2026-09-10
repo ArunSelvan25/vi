@@ -1,0 +1,77 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      # the runner ships with Chrome pre-installed
+      - name: Backend logic tests
+        run: npm run test:backend
+      - name: Security tests
+        run: npm run test:security
+      - name: Production-readiness tests
+        run: npm run test:production
+      - name: Installable-app checks
+        run: npm run test:pwa
+      - name: Browser smoke tests
+        run: npm run test:ui
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+      - name: Mobile layout tests
+        run: npm run test:responsive
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+      - name: Installable-app browser tests
+        run: npm run test:pwa:ui
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Optional: set a VIPM_API_URL repository secret to skip the setup wizard
+      # on every device. The URL is written into the published site, so it is
+      # visible to anyone who loads the page — this only keeps it out of git.
+      # Pair it with a SETUP_KEY script property. See docs/SETUP.md.
+      - name: Inject API URL from repository secret
+        env:
+          VIPM_API_URL: ${{ secrets.VIPM_API_URL }}
+        run: node scripts/set-api-url.mjs
+      # Gives the service worker a new identity so installed devices pick this
+      # release up instead of serving the last one from cache.
+      - name: Stamp service worker build
+        run: node scripts/stamp-build.mjs
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          # the whole repo is the site — there is no build step
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4
