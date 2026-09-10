@@ -764,26 +764,62 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
   .nav-item { height: 42px; }
 }
 
-/* ── notch and home-indicator safe areas ──────────────────────────────────
-   Installed to a home screen the app is drawn edge to edge, so on a phone with
-   a notch or a gesture bar the padding has to come from the device rather than
-   a guess. Harmless everywhere else: the insets are 0 in a normal browser. */
-@supports (padding: env(safe-area-inset-left)) {
-  .topbar { padding-left: max(var(--s4), env(safe-area-inset-left));
-            padding-right: max(var(--s4), env(safe-area-inset-right)); }
+/* ── notch, status bar and home indicator ────────────────────────────────
+   Added to a home screen on iOS the web view is drawn edge to edge, running
+   underneath the status bar — that is what `black-translucent` in index.html
+   asks for. So every edge the system owns has to be paid for here, the top one
+   included: without it the menu button sits under the clock and cannot be hit.
+
+   Kept in variables rather than calling env() at each site so that a test can
+   stand in for a device that has insets. They are 0 in an ordinary browser
+   tab and on desktop, where the layout is unchanged. */
+:root {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
+/* The bar keeps its own height and grows by the status bar on top of it, so
+   what is in it stays centred in the part you can actually see and touch. */
+.topbar {
+  height: calc(var(--topbar-h) + var(--safe-top));
+  padding-top: var(--safe-top);
+  padding-left: max(var(--s6), var(--safe-left));
+  padding-right: max(var(--s6), var(--safe-right));
+}
+/* The drawer's own header lines up with it. */
+.brand {
+  height: calc(var(--topbar-h) + var(--safe-top));
+  padding-top: var(--safe-top);
+}
+.sidebar { padding-left: var(--safe-left); }
+.main {
+  padding-left: max(var(--s6), var(--safe-left));
+  padding-right: max(var(--s6), var(--safe-right));
+  padding-bottom: max(var(--s6), var(--safe-bottom));
+}
+.toasts { bottom: max(var(--s5), var(--safe-bottom)); }
+/* A dialog and the sign-in screen are their own full-screen surfaces, so they
+   have to clear the status bar themselves rather than inherit it. */
+.backdrop {
+  padding-top: max(var(--s4), var(--safe-top));
+  padding-bottom: max(var(--s4), var(--safe-bottom));
+}
+.auth-screen {
+  padding-top: max(var(--s6), var(--safe-top));
+  padding-bottom: max(var(--s6), var(--safe-bottom));
+}
+
+@media (max-width: 1000px) {
+  .topbar {
+    padding-left: max(var(--s4), var(--safe-left));
+    padding-right: max(var(--s4), var(--safe-right));
+  }
   .main {
-    padding-left: max(var(--s6), env(safe-area-inset-left));
-    padding-right: max(var(--s6), env(safe-area-inset-right));
-    padding-bottom: max(var(--s6), env(safe-area-inset-bottom));
+    padding-left: max(var(--s4), var(--safe-left));
+    padding-right: max(var(--s4), var(--safe-right));
+    padding-bottom: max(var(--s4), var(--safe-bottom));
   }
-  .sidebar { padding-left: env(safe-area-inset-left); }
-  .toasts { bottom: max(var(--s5), env(safe-area-inset-bottom)); }
-  @media (max-width: 1000px) {
-    .main {
-      padding-left: max(var(--s4), env(safe-area-inset-left));
-      padding-right: max(var(--s4), env(safe-area-inset-right));
-      padding-bottom: max(var(--s4), env(safe-area-inset-bottom));
-    }
-    .toasts { bottom: max(var(--s4), env(safe-area-inset-bottom)); }
-  }
+  .toasts { bottom: max(var(--s4), var(--safe-bottom)); }
 }

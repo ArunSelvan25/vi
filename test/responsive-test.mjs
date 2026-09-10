@@ -221,6 +221,73 @@ for (const w of [320, 360, 390]) {
   ok(`"${btn.text}" is fully visible at ${w}px`, btn.right <= btn.vw + 1, JSON.stringify(btn));
 }
 
+console.log('\n— status bar and home indicator —');
+// Installed on iOS the app is drawn under the status bar, so the chrome has to
+// reserve room for it. Chrome on a desktop reports no insets, so we stand in
+// for an iPhone by setting the variables the stylesheet reads.
+const IOS = { top: 47, bottom: 34 };
+await page.setViewport({ width: 390, height: 844, isMobile: true });
+await showRoute('dashboard');
+await page.evaluate(({ top, bottom }) => {
+  const r = document.documentElement.style;
+  r.setProperty('--safe-top', top + 'px');
+  r.setProperty('--safe-bottom', bottom + 'px');
+}, IOS);
+await new Promise((s) => setTimeout(s, 250));
+
+const bar = await page.evaluate(() => {
+  const t = document.querySelector('.topbar');
+  const btn = t.querySelector('.icon-btn');
+  return { barTop: Math.round(t.getBoundingClientRect().top),
+           barHeight: Math.round(t.getBoundingClientRect().height),
+           btnTop: Math.round(btn.getBoundingClientRect().top),
+           btnBottom: Math.round(btn.getBoundingClientRect().bottom) };
+});
+ok('the bar still starts at the very top of the screen', bar.barTop === 0, JSON.stringify(bar));
+ok('the bar grows by the height of the status bar', bar.barHeight === 56 + IOS.top, JSON.stringify(bar));
+ok('the menu button clears the status bar', bar.btnTop >= IOS.top, JSON.stringify(bar));
+
+// the drawer's own header has to line up with it
+await page.evaluate(() => document.querySelector('.topbar .icon-btn').click());
+await new Promise((s) => setTimeout(s, 300));
+const brand = await page.evaluate(() => {
+  const b = document.querySelector('.sidebar .brand');
+  const r = b.getBoundingClientRect();
+  const label = b.querySelector('span');
+  return { top: Math.round(r.top), height: Math.round(r.height),
+           labelTop: label ? Math.round(label.getBoundingClientRect().top) : null };
+});
+ok('the drawer header clears the status bar too', brand.labelTop >= IOS.top, JSON.stringify(brand));
+await page.evaluate(() => document.body.classList.remove('nav-open'));
+
+// a dialog is its own full-screen surface and cannot inherit the inset
+await showRoute('tenants');
+await page.evaluate(() => [...document.querySelectorAll('.head-actions .btn-primary')].pop().click());
+await page.waitForSelector('.modal', { timeout: 5000 }).catch(() => {});
+await new Promise((s) => setTimeout(s, 300));
+const modalTop = await page.evaluate(() => {
+  const m = document.querySelector('.modal');
+  return m ? Math.round(m.getBoundingClientRect().top) : null;
+});
+ok('a dialog opens below the status bar', modalTop !== null && modalTop >= IOS.top,
+   'modal top = ' + modalTop);
+await page.keyboard.press('Escape');
+
+// nothing above should have cost us the rule everything else is built on
+await new Promise((s) => setTimeout(s, 250));
+const insetOverflow = await overflow();
+ok('insets do not make the page scroll sideways', insetOverflow.doc <= insetOverflow.vw + 1,
+   JSON.stringify(insetOverflow));
+
+// and with no insets — a browser tab, or Android — the layout is untouched
+await page.evaluate(() => {
+  document.documentElement.style.removeProperty('--safe-top');
+  document.documentElement.style.removeProperty('--safe-bottom');
+});
+await showRoute('dashboard');
+const plain = await page.evaluate(() => Math.round(document.querySelector('.topbar').getBoundingClientRect().height));
+ok('without insets the bar is its normal height', plain === 56, 'height = ' + plain);
+
 await browser.close(); server.kill();
 console.log('\n' + '─'.repeat(60));
 console.log(fail ? `${fail} RESPONSIVE CHECK(S) FAILED` : 'ALL RESPONSIVE CHECKS PASSED');

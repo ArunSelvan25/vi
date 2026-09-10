@@ -49,8 +49,13 @@ await page.evaluate(url => localStorage.setItem('vipm.apiUrl', url), BASE + '/ap
 await page.reload({ waitUntil: 'networkidle0' });
 
 const swState = await page.evaluate(async () => {
-  const reg = await navigator.serviceWorker.ready;
-  return { active: !!reg.active, state: reg.active && reg.active.state, scope: reg.scope };
+  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('no worker became ready in 20s')), 20000));
+  try {
+    const reg = await Promise.race([navigator.serviceWorker.ready, timeout]);
+    return { active: !!reg.active, state: reg.active && reg.active.state, scope: reg.scope };
+  } catch (e) {
+    return { active: false, state: 'never ready', scope: null, error: e.message };
+  }
 });
 ok('a service worker is active', swState.active && swState.state === 'activated', JSON.stringify(swState));
 ok('its scope is the site root', swState.scope === BASE + '/', swState.scope);
@@ -70,10 +75,19 @@ const names = Object.keys(cacheInfo);
 ok('exactly one shell cache exists', names.length === 1, JSON.stringify(names));
 const urls = cacheInfo[names[0]] || [];
 ok('the cache is named for the build', /^vipm-shell-/.test(names[0]), names[0]);
-ok('the whole shell is cached', urls.length >= 26, urls.length + ' entries');
-ok('index.html is cached', urls.some(u => u.endsWith('/index.html')));
-ok('every app module is cached', urls.filter(u => u.includes('/assets/js/')).length === 18,
-   urls.filter(u => u.includes('/assets/js/')).length + ' modules');
+
+// the list the worker itself declares, so adding a file never needs this edited
+const swSource = fs.readFileSync(new URL('../sw.js', import.meta.url), 'utf8');
+const shell = [...swSource.matchAll(/^\s*'(\.\/[^']*)',?$/gm)].map((m) => m[1]);
+const want = shell.map((rel) => new URL(rel.replace(/^\.\//, ''), BASE + '/').href);
+const missing = want.filter((u) => !urls.includes(u));
+ok('every file the worker precaches is in the cache', missing.length === 0,
+   `${urls.length} cached, missing ${missing.length}: ` + missing.map((u) => u.replace(BASE, '')).join(', '));
+ok('index.html is cached', urls.some((u) => u.endsWith('/index.html')));
+const modules = shell.filter((p) => p.endsWith('.js'));
+ok('every app module is cached', modules.length > 10 &&
+   modules.every((m) => urls.includes(new URL(m.replace(/^\.\//, ''), BASE + '/').href)),
+   `${modules.length} declared`);
 
 console.log('\n— the API must never be cached —');
 // force some traffic through the API first
