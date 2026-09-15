@@ -1,4 +1,4 @@
-import { el, icon, money, date, downloadCsv, isoDate } from '../ui.js';
+import { el, icon, money, date, downloadCsv, isoDate, modal, printDocument } from '../ui.js';
 import { store } from '../store.js';
 import { barChart, rankedBars } from '../components/charts.js';
 
@@ -54,17 +54,23 @@ export function reportsView() {
   function draw() {
     body.textContent = '';
 
-    const payments = store.payments.filter(p => inRange(p.payment_date) && matchProp(p));
-    const expenses = store.expenses.filter(e => inRange(e.date) && matchProp(e));
-    const tickets = store.maintenance.filter(m => inRange(m.completed_date || m.reported_date) && matchProp(m));
-    const invoices = store.invoices.filter(i => inRange(i.due_date) && matchProp(i));
+    // A deposit is held for the tenant: receiving one is not income and returning
+    // one is not an operating expense. Both are shown separately below.
+    const allPayments = store.payments.filter(p => inRange(p.payment_date) && matchProp(p));
+    const allExpenses = store.expenses.filter(e => inRange(e.date) && matchProp(e));
+    const payments = store.incomePayments(allPayments);
+    const expenses = store.operatingExpenses(allExpenses);
+    const depositsIn = allPayments.filter(p => store.isDepositPayment(p)).reduce((s, p) => s + Number(p.amount || 0), 0);
+    const depositsOut = allExpenses.filter(e => store.isDepositRefund(e)).reduce((s, e) => s + Number(e.amount || 0), 0);
+    // a void invoice was never owed and a draft not yet sent, so neither is
+    // "billed" — counting them understated the collection rate
+    const invoices = store.invoices.filter(i => inRange(i.due_date) && matchProp(i) &&
+                                                !['Void', 'Draft'].includes(i.status));
 
     const income = payments.reduce((s, p) => s + Number(p.amount || 0), 0);
-    const opex = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
     // Maintenance costs are written to the Expenses tab when a ticket is
-    // completed, so they are already in `expenses`. Adding them again here is
-    // exactly the double count this fixes.
-    const repairs = 0;
+    // completed, so they are already in `expenses` and are not added again.
+    const opex = expenses.reduce((s, e) => s + Number(e.amount || 0), 0);
     const billed = invoices.reduce((s, i) => s + Number(i.total || i.amount || 0), 0);
 
     // Collected against billed, both measured on the SAME invoices — the ones
@@ -77,19 +83,25 @@ export function reportsView() {
       el('div', { class: 'stat stat-ok' }, [el('span', { class: 'stat-label', text: 'Income collected' }),
         el('strong', { class: 'stat-value', text: money(income) })]),
       el('div', { class: 'stat stat-warn' }, [el('span', { class: 'stat-label', text: 'Operating expenses' }),
-        el('strong', { class: 'stat-value', text: money(opex + repairs) })]),
-      el('div', { class: 'stat' + (income - opex - repairs >= 0 ? ' stat-ok' : ' stat-danger') },
+        el('strong', { class: 'stat-value', text: money(opex) })]),
+      el('div', { class: 'stat' + (income - opex >= 0 ? ' stat-ok' : ' stat-danger') },
         [el('span', { class: 'stat-label', text: 'Net operating income' }),
-         el('strong', { class: 'stat-value', text: money(income - opex - repairs) })]),
+         el('strong', { class: 'stat-value', text: money(income - opex) })]),
       el('div', { class: 'stat' }, [el('span', { class: 'stat-label', text: 'Billed in period' }),
         el('strong', { class: 'stat-value', text: money(billed) })]),
       el('div', { class: 'stat', title: 'Paid against invoices due in this period' }, [
         el('span', { class: 'stat-label', text: 'Collection rate' }),
-        el('strong', { class: 'stat-value', text: collectionRate + '%' })])
+        el('strong', { class: 'stat-value', text: collectionRate + '%' })]),
+      el('div', { class: 'stat', title: 'Security deposits are held for tenants, so they are not income' }, [
+        el('span', { class: 'stat-label', text: 'Deposits in / returned' }),
+        el('strong', { class: 'stat-value', text: `${money(depositsIn, { compact: true })} / ${money(depositsOut, { compact: true })}` })])
     ]));
 
     body.append(el('div', { class: 'grid-2' }, [
-      panel('Cash flow by month', barChart(store.monthlySeries(12), { height: 240 })),
+      // the twelve months up to the end of the range, for the chosen property
+      panel('Cash flow by month', barChart(store.monthlySeries(12, {
+        end: new Date(state.to + 'T00:00:00'), match: matchProp
+      }), { height: 240 })),
       // Maintenance costs are expenses too — the headline figure and the P&L
       // column both include them, so leaving them out of this chart made the
       // same screen report two different totals for the same word.
@@ -104,10 +116,10 @@ export function reportsView() {
     const props = state.propertyId ? store.properties.filter(p => p.id === state.propertyId) : store.properties;
     const knownProperty = new Set(store.properties.map(p => p.id));
     const pnl = props.map(p => {
-      const inc = store.payments
+      const inc = store.incomePayments()
         .filter(x => x.property_id === p.id && inRange(x.payment_date))
         .reduce((s, x) => s + Number(x.amount || 0), 0);
-      const exp = store.expenses
+      const exp = store.operatingExpenses()
         .filter(x => x.property_id === p.id && inRange(x.date))
         .reduce((s, x) => s + Number(x.amount || 0), 0);
       const units = store.unitsOfProperty(p.id);
@@ -116,8 +128,11 @@ export function reportsView() {
       const due = store.invoices
         .filter(x => x.property_id === p.id && ['Unpaid', 'Partial', 'Overdue'].includes(x.status))
         .reduce((s, x) => s + Number(x.balance || 0), 0);
+      // gross yield per year: income over the range, scaled to twelve months,
+      // so a nine-month range is not read as a full year's return
+      const days = Math.max(1, (new Date(state.to) - new Date(state.from)) / 86400000 + 1);
       const yieldPct = Number(p.current_value) > 0
-        ? Math.round((inc / Number(p.current_value)) * 1000) / 10 : null;
+        ? Math.round((inc * (365 / days) / Number(p.current_value)) * 1000) / 10 : null;
       return { property: p, units: units.length, occ, inc, exp, net: inc - exp, due, yieldPct };
     });
 
@@ -128,8 +143,8 @@ export function reportsView() {
       const orphan = (rows, dateKey, field) => rows
         .filter(r => !knownProperty.has(r.property_id) && inRange(r[dateKey]))
         .reduce((s, r) => s + Number(r[field] || 0), 0);
-      const inc = orphan(store.payments, 'payment_date', 'amount');
-      const exp = orphan(store.expenses, 'date', 'amount');
+      const inc = orphan(store.incomePayments(), 'payment_date', 'amount');
+      const exp = orphan(store.operatingExpenses(), 'date', 'amount');
       const due = store.invoices
         .filter(i => !knownProperty.has(i.property_id) &&
                      ['Unpaid', 'Partial', 'Overdue'].includes(i.status))
@@ -141,7 +156,7 @@ export function reportsView() {
     }
 
     const pnlTable = el('table', { class: 'data-table' }, [
-      el('thead', {}, [el('tr', {}, ['Property', 'Units', 'Occupancy', 'Income', 'Expenses', 'Net', 'Outstanding', 'Yield']
+      el('thead', {}, [el('tr', {}, ['Property', 'Units', 'Occupancy', 'Income', 'Expenses', 'Net', 'Outstanding', 'Yield / yr']
         .map((h, i) => el('th', { class: i >= 3 ? 'num' : null, text: h })))]),
       el('tbody', {}, [
         ...pnl.map(r => el('tr', {}, [
@@ -199,7 +214,7 @@ export function reportsView() {
     const ageing = Object.entries(buckets).map(([label, value]) => ({ label, value }));
     const hasArrears = ageing.some(a => a.value > 0);
 
-    const arrears = store.arrears();
+    const arrears = store.arrears(matchProp);
     body.append(el('div', { class: 'grid-2' }, [
       panel('Arrears ageing', hasArrears
         ? rankedBars(ageing.map((a, i) => ({ ...a, tone: i >= 3 ? 'danger' : i >= 1 ? 'warn' : null })))
@@ -216,6 +231,80 @@ export function reportsView() {
             ])))
         : el('p', { class: 'muted', text: 'No debtors.' }))
     ]));
+
+    body.append(ownerStatementsPanel());
+  }
+
+  /** Per-owner results for the range — what a landlord managing for others sends each owner. */
+  function ownerStatementsPanel() {
+    const owners = [...new Set(store.properties.map(p => p.owner_name || 'Unassigned'))].sort();
+    const rowsFor = (owner) => store.properties
+      .filter(p => (p.owner_name || 'Unassigned') === owner)
+      .map(p => {
+        const inc = store.incomePayments().filter(x => x.property_id === p.id && inRange(x.payment_date))
+          .reduce((s, x) => s + Number(x.amount || 0), 0);
+        const exp = store.operatingExpenses().filter(x => x.property_id === p.id && inRange(x.date))
+          .reduce((s, x) => s + Number(x.amount || 0), 0);
+        const due = store.invoices.filter(i => i.property_id === p.id && ['Unpaid', 'Partial', 'Overdue'].includes(i.status))
+          .reduce((s, i) => s + Number(i.balance || 0), 0);
+        const held = store.leases.filter(l => l.property_id === p.id).reduce((s, l) => s + store.depositLedger(l).held, 0);
+        return { property: p, inc, exp, net: inc - exp, due, held };
+      });
+    const total = (rows, k) => rows.reduce((s, r) => s + r[k], 0);
+
+    const list = el('ul', { class: 'list' }, owners.map(owner => {
+      const rows = rowsFor(owner);
+      return el('li', { class: 'list-row' }, [
+        el('div', {}, [
+          el('strong', { text: owner }), el('br'),
+          el('small', { class: 'muted', text: `${rows.length} propert${rows.length === 1 ? 'y' : 'ies'} · net ${money(total(rows, 'net'))}` })
+        ]),
+        el('span', { class: 'list-meta' }, [
+          el('button', { class: 'btn btn-ghost btn-sm', onClick: () => openOwnerStatement(owner, rows) }, ['Statement']),
+          el('button', { class: 'btn btn-ghost btn-sm', onClick: () => downloadCsv(
+            `owner-${owner.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${state.from}-to-${state.to}.csv`, rows, [
+              { label: 'Property', value: r => r.property.name },
+              { label: 'Income', value: r => r.inc }, { label: 'Expenses', value: r => r.exp },
+              { label: 'Net', value: r => r.net }, { label: 'Outstanding', value: r => r.due },
+              { label: 'Deposits held', value: r => r.held }
+            ]) }, [icon('download', 14), ' CSV'])
+        ])
+      ]);
+    }));
+
+    function openOwnerStatement(owner, rows) {
+      const s = store.settings;
+      const cell = (v, cls) => el('td', { class: cls, text: v });
+      const doc = el('div', { class: 'invoice-doc', id: 'printable' }, [
+        el('div', { class: 'invoice-top' }, [
+          el('div', {}, [el('h2', { text: s.org_name || 'Property Management' }),
+                         s.gstin ? el('p', { class: 'muted', text: 'GSTIN ' + s.gstin }) : null]),
+          el('div', { class: 'invoice-meta' }, [
+            el('p', { class: 'doc-kind', text: 'Owner statement' }),
+            el('h3', { text: owner }),
+            el('p', { class: 'muted', text: `${date(state.from)} – ${date(state.to)}` })
+          ])
+        ]),
+        el('div', { class: 'table-scroll' }, [el('table', { class: 'invoice-table' }, [
+          el('thead', {}, [el('tr', {}, ['Property', 'Rent & charges collected', 'Expenses', 'Net', 'Owed by tenants', 'Deposits held']
+            .map((h, i) => el('th', { class: i ? 'num' : null, text: h })))]),
+          el('tbody', {}, [
+            ...rows.map(r => el('tr', {}, [cell(r.property.name), cell(money(r.inc), 'num'), cell(money(r.exp), 'num'),
+              cell(money(r.net), 'num'), cell(money(r.due), 'num'), cell(money(r.held), 'num')])),
+            el('tr', { class: 'total-row' }, [cell('Total'), cell(money(total(rows, 'inc')), 'num'),
+              cell(money(total(rows, 'exp')), 'num'), cell(money(total(rows, 'net')), 'num'),
+              cell(money(total(rows, 'due')), 'num'), cell(money(total(rows, 'held')), 'num')])
+          ])
+        ])]),
+        el('p', { class: 'muted', text: 'Security deposits are held on the tenants\' behalf and are not included in income.' }),
+        el('p', { class: 'invoice-foot muted', text: 'Generated by ' + (s.org_name || 'Property Manager') })
+      ]);
+      modal({ title: 'Owner statement · ' + owner, width: 820, body: doc,
+              actions: [{ label: 'Close' }, { label: 'Print / PDF', variant: 'btn-primary', onClick: () => printDocument() }] });
+    }
+
+    return panel('Owner statements', owners.length ? list : el('p', { class: 'muted', text: 'No properties.' }),
+                 { count: owners.length });
   }
 
   draw();

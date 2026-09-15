@@ -1,7 +1,9 @@
-import { el, icon, money, date, badge, daysBetween, today } from '../ui.js';
+import { el, icon, money, date, badge, daysBetween, today, isoDate } from '../ui.js';
 import { store } from '../store.js';
 import { navigate } from '../router.js';
 import { barChart, donut, rankedBars } from '../components/charts.js';
+import { openRenewLease } from './leases.js';
+import { refreshView } from '../router.js';
 
 /** A month-over-month change chip, or null when there's nothing to compare. */
 function delta(current, previous) {
@@ -39,8 +41,15 @@ export function dashboardView() {
   const wrap = el('div', { class: 'view' });
 
   // ── KPI row ─────────────────────────────────────────────────────────────
-  const last2 = store.monthlySeries(2);
-  const prevCollected = last2.length > 1 ? last2[0].income : 0;
+  // Month to date against the same days of last month — comparing a part month
+  // with a whole one read as a slump every morning of the 1st.
+  const now = new Date();
+  const lastStart = isoDate(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const lastSameDay = isoDate(new Date(now.getFullYear(), now.getMonth() - 1,
+    Math.min(now.getDate(), new Date(now.getFullYear(), now.getMonth(), 0).getDate())));
+  const prevCollected = store.incomePayments()
+    .filter(p => p.payment_date >= lastStart && p.payment_date <= lastSameDay)
+    .reduce((t, p) => t + Number(p.amount || 0), 0);
   const trend = delta(s.collected_this_month, prevCollected);
 
   wrap.append(el('div', { class: 'kpi-row' }, [
@@ -48,7 +57,7 @@ export function dashboardView() {
           sub: `${s.active_leases} active lease${s.active_leases === 1 ? '' : 's'}`, to: 'leases' }),
     kpi({ label: 'Collected this month', value: money(s.collected_this_month, { compact: true }),
           chip: trend,
-          sub: trend ? 'vs last month' : `${money(s.expenses_this_month, { compact: true })} spent`,
+          sub: trend ? 'vs this point last month' : `${money(s.expenses_this_month, { compact: true })} spent`,
           tone: 'ok', to: 'payments' }),
     kpi({ label: 'Outstanding', value: money(s.outstanding, { compact: true }),
           sub: s.overdue > 0 ? `${money(s.overdue, { compact: true })} overdue` : 'none overdue',
@@ -86,7 +95,11 @@ export function dashboardView() {
   const expiringBody = expiring.length
     ? el('ul', { class: 'list' }, expiring.slice(0, 8).map(l => {
         const days = daysBetween(today(), l.end_date);
-        return el('li', { class: 'list-row clickable', onClick: () => navigate('leases/' + l.id) }, [
+        // a lease about to end is a renewal to arrange, so that is what a click opens
+        const open = () => store.can('manager')
+          ? openRenewLease(l, { onDone: () => refreshView() })
+          : navigate('tenants/' + l.tenant_id);
+        return el('li', { class: 'list-row clickable', onClick: open, title: store.can('manager') ? 'Renew this lease' : null }, [
           el('div', {}, [
             el('strong', { text: store.label('tenants', l.tenant_id) }),
             el('small', { class: 'muted', text: ' · ' + store.label('units', l.unit_id) })

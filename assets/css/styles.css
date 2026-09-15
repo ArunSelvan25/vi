@@ -535,7 +535,7 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
   padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2);
 }
 .line-head, .line-row {
-  display: grid; grid-template-columns: minmax(0, 2.4fr) minmax(0, 1.2fr) 70px 110px 100px 32px;
+  display: grid; grid-template-columns: minmax(0, 2.4fr) minmax(0, 1.2fr) 70px 110px 70px 100px 32px;
   gap: var(--s2); align-items: center;
 }
 .line-head {
@@ -560,6 +560,35 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
   .line-totals { width: 100%; }
 }
 
+/* ── settlement, meters, statements ───────────────────────────────────── */
+.check { display: flex; align-items: center; gap: var(--s2); font-weight: 500; }
+.check input { width: 18px; height: 18px; accent-color: var(--brand); }
+.deduction-rows { display: flex; flex-direction: column; gap: var(--s2); margin-bottom: var(--s2); }
+.deduction-row { display: grid; grid-template-columns: minmax(0, 1fr) 130px 32px; gap: var(--s2); align-items: center; }
+.settle-summary {
+  border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s3); background: var(--surface-2, transparent);
+}
+.meter-table input { min-width: 90px; }
+.meter-table small { display: block; margin-top: 2px; }
+.meter-table tr.row-error td { background: var(--danger-weak); }
+.meter-foot { justify-content: space-between; align-items: center; }
+.doc-kind {
+  font-size: var(--t-xs); font-weight: 650; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+  margin: 0 0 var(--s1);
+}
+.doc-actions { margin: 0 0 var(--s3); align-items: center; }
+.invoice-pay { margin-top: var(--s3); }
+.receipt-body { margin: var(--s4) 0; }
+.statement-table td:nth-child(2) { white-space: normal; }
+.notice {
+  display: flex; gap: var(--s2); align-items: flex-start; padding: var(--s3); border-radius: var(--r-sm);
+  margin-bottom: var(--s4); line-height: 1.45;
+}
+.notice-warn { background: var(--warn-weak); color: var(--warn); }
+@media (max-width: 520px) {
+  .deduction-row { grid-template-columns: minmax(0, 1fr) 100px 32px; }
+}
+
 /* ── modal ────────────────────────────────────────────────────────────── */
 .backdrop {
   position: fixed; inset: 0; z-index: 100;
@@ -582,7 +611,7 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
 .modal-head h2 { font-size: var(--t-md); font-weight: 600; }
 .modal-body { padding: var(--s5) var(--s4); overflow-y: auto; }
 .modal-foot {
-  display: flex; justify-content: flex-end; gap: var(--s2); flex: none;
+  display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--s2); flex: none;
   padding: var(--s3) var(--s4); border-top: 1px solid var(--border); background: var(--surface-2);
 }
 
@@ -715,7 +744,7 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
     display: block; animation: none;
   }
   body.printing .modal { box-shadow: none; border: 0; max-height: none; animation: none; }
-  body.printing .modal-head, body.printing .modal-foot { display: none !important; }
+  body.printing .modal-head, body.printing .modal-foot, body.printing .doc-actions { display: none !important; }
   body.printing .invoice-doc { padding: var(--s6); }
 }
 

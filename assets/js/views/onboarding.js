@@ -15,7 +15,8 @@ export function setupView(onDone) {
   const phoneInput = el('input', { class: 'input', type: 'tel', placeholder: '+91 98800 11111',
                                    autocomplete: 'tel' });
   const emailInput = el('input', { class: 'input', type: 'email', placeholder: 'you@example.com (optional)' });
-  const passInput = el('input', { class: 'input', type: 'password', placeholder: 'At least 8 characters' });
+  const passInput = el('input', { class: 'input', type: 'password', placeholder: 'At least 10 characters',
+                                  autocomplete: 'new-password' });
   const keyInput = el('input', { class: 'input', type: 'password', placeholder: 'Setup key' });
 
   // Only shown if the deployment has a SETUP_KEY script property set.
@@ -63,10 +64,15 @@ export function setupView(onDone) {
       connectBtn.hidden = true;
       toast('Tables ready — now create your admin account', 'ok');
     } catch (err) {
-      // setup with no admin payload returns a validation error — that's expected,
-      // it means the tables exist but no user has been seeded yet.
-      if (/adminEmail/.test(err.message)) {
+      // On a sheet with no users yet, setup without admin details answers with
+      // a request for the admin's phone — or for the setup key, when one is
+      // configured. Either is the cue to show the form, not a failure. (This
+      // used to look for "adminEmail", which the server stopped sending when
+      // sign-in moved to phone numbers, so a fresh sheet could not be set up.)
+      const needsKey = /setup key/i.test(err.message);
+      if (/adminPhone|adminEmail/.test(err.message) || needsKey) {
         seedBox.hidden = false; finishBtn.hidden = false; connectBtn.hidden = true;
+        if (needsKey) keyField.hidden = false;
         return;
       }
       status.hidden = false;
@@ -120,7 +126,10 @@ export function setupView(onDone) {
   ]);
 }
 
-/** Email + password sign-in. */
+/**
+ * Phone + password sign-in. `onSignedIn` receives the workbook when the server
+ * sent it with the sign-in, so the app does not have to ask for it again.
+ */
 export function loginView(onSignedIn) {
   const phone = el('input', {
     class: 'input', type: 'tel', required: true, autocomplete: 'tel',
@@ -137,10 +146,11 @@ export function loginView(onSignedIn) {
       error.hidden = true;
       btn.disabled = true; btn.textContent = 'Signing in…';
       try {
-        const data = await api('login', { phone: phone.value.trim(), password: password.value });
+        const data = await api('login', { phone: phone.value.trim(), password: password.value,
+                                          withSnapshot: true });
         config.token = data.token;
         config.user = data.user;
-        onSignedIn();
+        onSignedIn(data.snapshot);
       } catch (err) {
         error.hidden = false; error.textContent = err.message;
         password.value = '';

@@ -15,7 +15,7 @@ spreadsheet you can open, filter and export at any time.
 ```
 GitHub Pages                Google Apps Script            Google Sheet
 ┌───────────────────┐       ┌────────────────────┐        ┌──────────────┐
-│  static SPA       │──────►│  Web App API       │───────►│  12 tabs     │
+│  static SPA       │──────►│  Web App API       │───────►│  13 tabs     │
 │  vanilla ES       │ HTTPS │  auth, billing,    │        │  = your DB   │
 │  modules, no deps │◄──────│  reminders, cron   │◄───────│              │
 └───────────────────┘       └────────────────────┘        └──────────────┘
@@ -37,6 +37,13 @@ Some things worth calling out:
 - **Idempotent rent generation** — one click raises every missing invoice for
   every active lease; periods already billed are skipped, so it's safe on a
   daily trigger.
+- **Accounting that holds up** — deposits are held money, not income; issued
+  invoices are voided, never deleted, and their numbers never reused; GST with
+  CGST/SGST/IGST and printed tax invoices.
+- **Move-out and renewal** — settle a deposit against arrears and deductions in
+  one step; renew a lease with the escalated rent and the deposit carried over.
+- **Tenant-friendly** — statements, receipts, WhatsApp sharing and UPI payment
+  links; reminders on a schedule, one email per tenant.
 - **Billing maths that holds up** — quarterly/half-yearly/annual cycles, grace
   days, compounding annual escalation, month-end leases that don't drift to the
   28th after February, and lease end dates that clip the final period.
@@ -121,9 +128,10 @@ npm run dev          # serves the app + a mock API on a free port
 npm test             # billing maths, then security, then a browser run
 ```
 
-`npm run dev` runs a faithful in-memory mock of the Apps Script API with sample
-data, so you can work on the UI without touching a real sheet. Sign in with
-`admin@example.com` / `password123`.
+`npm run dev` runs the **real** `apps-script/Code.gs` on an in-memory spreadsheet
+with sample data dated around today, so every business rule applies exactly as
+it will on Google — without touching a real sheet. Sign in with phone
+`9000012345` / password `password123`.
 
 The suite has these parts:
 
@@ -155,7 +163,8 @@ Google Sheets is a genuinely good database for a portfolio of this size and a
 genuinely bad one at scale. The whole workbook loads into the browser: fine into
 the low thousands of rows, slow beyond. There is no tenant portal, no payment
 gateway and no file upload (documents are links). Two people editing the same
-record within the same minute can overwrite each other.
+record cannot overwrite each other — the second save is refused — but screens
+do not update live.
 
 If you outgrow it, `store.js` and `api.js` are the only files that know where
 data comes from — swapping in a real API is a contained change.

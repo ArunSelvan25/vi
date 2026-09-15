@@ -4,7 +4,9 @@ import { store } from './store.js';
 import { start, navigate, parseHash } from './router.js';
 import { crudView } from './views/crud.js';
 import { dashboardView } from './views/dashboard.js';
-import { invoicesView } from './views/invoices.js';
+import { invoicesView, showReceipt } from './views/invoices.js';
+import { leasesView } from './views/leases.js';
+import { metersView } from './views/meters.js';
 import { propertyDetail, tenantDetail } from './views/details.js';
 import { reportsView } from './views/reports.js';
 import { settingsView } from './views/settings.js';
@@ -30,6 +32,7 @@ const NAV = [
   { group: 'Money', items: [
     { path: 'invoices', label: 'Invoices', icon: 'receipt' },
     { path: 'payments', label: 'Payments', icon: 'card' },
+    { path: 'meters', label: 'Meter readings', icon: 'gauge' },
     { path: 'expenses', label: 'Expenses', icon: 'wallet' },
     { path: 'reports', label: 'Reports', icon: 'chart' }
   ]},
@@ -43,7 +46,8 @@ const NAV = [
 const PAGE_TITLES = {
   dashboard: 'Dashboard', properties: 'Properties', units: 'Units', tenants: 'Tenants',
   leases: 'Leases', invoices: 'Invoices', payments: 'Payments', maintenance: 'Maintenance',
-  expenses: 'Expenses', documents: 'Documents', reports: 'Reports', settings: 'Settings'
+  expenses: 'Expenses', documents: 'Documents', reports: 'Reports', settings: 'Settings',
+  meters: 'Meter readings'
 };
 
 const root = document.getElementById('app');
@@ -187,9 +191,11 @@ function routeHandler(path) {
       onRowClick: (row) => navigate('properties/' + row.property_id) }),
     tenants: (ctx) => (ctx.id ? tenantDetail(ctx.id) : crudView('tenants', {
       onRowClick: (row) => navigate('tenants/' + row.id) })),
-    leases: () => crudView('leases', { filterKeys: ['status', 'frequency'] }),
+    leases: leasesView,
     invoices: invoicesView,
-    payments: () => crudView('payments', { filterKeys: ['method'] }),
+    payments: () => crudView('payments', { filterKeys: ['method'], onRowClick: (row) => showReceipt(row),
+      extraActions: [{ label: 'Receipt', icon: 'receipt', onClick: (row) => showReceipt(row) }] }),
+    meters: metersView,
     maintenance: () => crudView('maintenance', { filterKeys: ['status', 'priority', 'category'] }),
     expenses: () => crudView('expenses', { filterKeys: ['category'] }),
     documents: () => crudView('documents', { filterKeys: ['category', 'entity_type'] }),
@@ -210,7 +216,12 @@ function notFoundView() {
 
 function showScreen(node) { clear(root); layout = null; root.append(node); }
 
-async function boot() {
+/**
+ * @param snapshot the workbook, when sign-in already returned it. Only ever
+ *   the one from this sign-in: a store left over from an earlier session is
+ *   never reused, because the next account may be allowed to see less.
+ */
+async function boot(snapshot) {
   applyTheme();
 
   if (!config.apiUrl) {
@@ -218,7 +229,7 @@ async function boot() {
     return;
   }
   if (!config.token) {
-    showScreen(loginView(() => boot()));
+    showScreen(loginView((snap) => boot(snap)));
     return;
   }
 
@@ -231,9 +242,10 @@ async function boot() {
   mainEl.append(skeletonDashboard());
 
   try {
-    await store.load();
+    if (snapshot && Array.isArray(snapshot.properties)) store.apply(snapshot);
+    else await store.load();
   } catch (err) {
-    if (err.code === 'AUTH_REQUIRED') { showScreen(loginView(() => boot())); return; }
+    if (err.code === 'AUTH_REQUIRED') { showScreen(loginView((snap) => boot(snap))); return; }
     showScreen(el('div', { class: 'auth-screen' }, [
       el('div', { class: 'auth-card' }, [
         el('h2', { text: 'Could not load data' }),

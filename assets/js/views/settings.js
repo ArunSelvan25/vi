@@ -3,6 +3,8 @@ import { store } from '../store.js';
 import { api } from '../api.js';
 import { config } from '../config.js';
 import { openActionForm } from '../components/form.js';
+import { refreshView } from '../router.js';
+import { GSTIN_PATTERN } from '../schema.js';
 
 const SETTING_FIELDS = [
   { key: 'org_name', label: 'Organisation name', type: 'text' },
@@ -16,10 +18,20 @@ const SETTING_FIELDS = [
   { key: 'default_grace_days', label: 'Default grace days', type: 'number',
     help: 'Pre-filled on a new lease' },
   { key: 'default_late_fee', label: 'Default late fee', type: 'number',
-    help: 'Pre-filled on a new lease, and charged once an invoice is overdue' },
+    help: 'Pre-filled on a new lease. The lease\'s own late fee is what gets charged once its rent is overdue.' },
   { key: 'reminder_days_before', label: 'Remind this many days before due', type: 'number' },
+  { key: 'reminder_overdue_days', label: 'Remind on these days overdue', type: 'text',
+    help: 'Comma separated, e.g. 1, 7, 14, 30. One email per tenant lists everything they owe.' },
   { key: 'reminder_enabled', label: 'Scheduled reminders', type: 'select', options: ['true', 'false'],
-    help: 'Requires a daily trigger on dailyReminderJob in Apps Script' },
+    help: 'Needs the daily triggers: Property Manager → Install daily automation, in the spreadsheet' },
+  { key: 'gstin', label: 'Your GSTIN', type: 'text',
+    help: 'When set, invoices carrying GST print as tax invoices with CGST/SGST or IGST' },
+  { key: 'sac_code', label: 'SAC code', type: 'text', help: '997212 for renting non-residential property' },
+  { key: 'default_gst_rate', label: 'Default GST % on new invoice lines', type: 'number' },
+  { key: 'upi_id', label: 'UPI ID for payments', type: 'text',
+    help: 'e.g. business@okhdfc — shown on invoices and in reminders, with a Pay via UPI link' },
+  { key: 'whatsapp_country_code', label: 'Country code for WhatsApp', type: 'text',
+    help: 'Added to phone numbers stored without one. 91 for India.' },
   { key: 'lease_expiry_alert_days', label: 'Lease expiry alert window (days)', type: 'number' },
   { key: 'session_hours', label: 'Session length (hours)', type: 'number' }
 ];
@@ -71,13 +83,25 @@ export function settingsView() {
           onClick: async (e) => {
             e.target.disabled = true;
             try {
-              for (const f of SETTING_FIELDS) {
-                const v = controls[f.key].value;
-                if (String(store.settings[f.key] ?? '') !== String(v)) {
-                  await api('update', { table: 'Settings', id: f.key, data: { value: v } })
-                    .catch(async () => api('create', { table: 'Settings', data: { key: f.key, value: v } }));
-                }
+              // Saved side by side rather than one round trip after another,
+              // and a key is only created when the sheet says it is missing — a
+              // create after any failure (a dropped connection, say) appended a
+              // second row for a key that was already there.
+              const gstin = controls.gstin.value.replace(/\s+/g, '').toUpperCase();
+              if (gstin && !GSTIN_PATTERN.test(gstin)) {
+                throw new Error('Your GSTIN is not valid — 15 characters, starting with the state code.');
               }
+              controls.gstin.value = gstin;
+              const changed = SETTING_FIELDS.filter(f =>
+                String(store.settings[f.key] ?? '') !== String(controls[f.key].value));
+              await Promise.all(changed.map(f => {
+                const v = controls[f.key].value;
+                return api('update', { table: 'Settings', id: f.key, data: { value: v } })
+                  .catch(err => {
+                    if (!/not found/i.test(err.message)) throw err;
+                    return api('create', { table: 'Settings', data: { key: f.key, value: v } });
+                  });
+              }));
               await store.refresh();
               toast('Settings saved', 'ok');
             } catch (err) { toast(err.message, 'danger'); }
@@ -108,11 +132,19 @@ export function settingsView() {
         title: 'Change password',
         submitLabel: 'Update password',
         fields: [
-          { key: 'current', label: 'Current password', type: 'text', required: true },
-          { key: 'next', label: 'New password', type: 'text', required: true, help: 'At least 8 characters' }
+          { key: 'current', label: 'Current password', type: 'password', required: true,
+            autocomplete: 'current-password' },
+          { key: 'next', label: 'New password', type: 'password', required: true,
+            autocomplete: 'new-password', help: 'At least 10 characters, not only numbers' }
         ],
         onSubmit: async (data, close) => {
-          await api('changePassword', data);
+          const res = await api('changePassword', data);
+          // the change ends every earlier session, this one included; the
+          // server sends a replacement so saving does not sign you out
+          if (res && res.token) {
+            config.token = res.token;
+            if (res.user) config.user = res.user;
+          }
           toast('Password updated', 'ok');
           close();
         }
@@ -145,7 +177,7 @@ export function settingsView() {
               title: 'Reset password · ' + (u.name || u.phone),
               submitLabel: 'Set password',
               fields: [{ key: 'password', label: 'New password', type: 'text', required: true,
-                         help: 'At least 8 characters. Share it securely; they can change it afterwards.' }],
+                         help: 'At least 10 characters. Share it securely; they can change it afterwards.' }],
               onSubmit: async (data, close) => {
                 await api('resetPassword', { id: u.id, password: data.password });
                 toast('Password reset', 'ok');
@@ -163,10 +195,13 @@ export function settingsView() {
                          help: 'Takes effect immediately, even on an open session.' }],
               onSubmit: async (data, close) => {
                 await api('setUserRole', { id: u.id, role: data.role });
+                close();
+                // your own role decides the whole shell, so rebuild it; anyone
+                // else's only changes this list
+                if (isMe) { location.reload(); return; }
                 await store.refresh();
                 toast('Role updated', 'ok');
-                close();
-                location.reload();
+                refreshView();
               }
             })
           }, ['Role']),
@@ -186,7 +221,7 @@ export function settingsView() {
                 await api('setUserActive', { id: u.id, active: !disabled });
                 await store.refresh();
                 toast(disabled ? 'User enabled' : 'User disabled', 'ok');
-                location.reload();
+                refreshView();
               } catch (err) { toast(err.message, 'danger'); }
             }
           }, [disabled ? 'Enable' : 'Disable'])
@@ -212,20 +247,33 @@ export function settingsView() {
               options: ['admin', 'manager', 'viewer'],
               help: 'viewer: read only · manager: day-to-day edits · admin: everything incl. delete' },
             { key: 'password', label: 'Temporary password', type: 'text', required: true,
-              help: 'At least 8 characters — share it securely and ask them to change it' }
+              help: 'At least 10 characters — share it securely and ask them to change it' }
           ],
           onSubmit: async (data, close) => {
             await api('createUser', data);
             await store.refresh();
             toast('User created', 'ok');
             close();
-            location.reload();
+            refreshView();
           }
         })
       }, [icon('plus', 15), ' Add user']) }));
   }
 
   // ── connection + maintenance ────────────────────────────────────────────
+  // A sheet and script in different time zones used to shift every date by a
+  // day. The backend now reads dates in the sheet's zone, but "today" (overdue,
+  // expiry) is still the script's, so say so when they differ.
+  const tz = store.timezones;
+  if (tz && tz.script && tz.sheet && tz.script !== tz.sheet) {
+    wrap.append(el('div', { class: 'notice notice-warn' }, [
+      icon('alert', 16),
+      el('span', { text: `The spreadsheet's time zone (${tz.sheet}) differs from the script's (${tz.script}). ` +
+        'Due dates and expiries change over at midnight in ' + tz.script + '. To avoid surprises, set both to the same zone: ' +
+        'File → Settings in the sheet, and Project Settings in Apps Script.' })
+    ]));
+  }
+
   wrap.append(panel('Connection', el('div', {}, [
     el('div', { class: 'kv-list' }, [
       el('div', { class: 'kv' }, [

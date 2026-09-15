@@ -104,6 +104,15 @@ ok('declares itself web-app capable', /name="apple-mobile-web-app-capable"/.test
 ok('references no absolute paths', !/(?:href|src)="\//.test(html),
    'an absolute path breaks the app under a GitHub Pages project subpath');
 
+// a preload for a file that has gone is a 404 on every launch; a module left
+// off the list is merely slower, but the list is only worth having if whole
+const preloads = [...html.matchAll(/<link rel="modulepreload" href="([^"]+)">/g)].map(m => './' + m[1]);
+const preloadMissing = preloads.filter(p => !exists(p.replace(/^\.\//, '')));
+ok('every modulepreload exists', preloads.length > 0 && preloadMissing.length === 0,
+   'missing: ' + preloadMissing.join(', '));
+const notPreloaded = jsFiles.filter(f => !preloads.includes(f));
+ok('every app module is preloaded', notPreloaded.length === 0, 'not preloaded: ' + notPreloaded.join(', '));
+
 console.log('\n— registration —');
 const app = read('assets/js/app.js');
 ok('app.js registers the worker', /registerServiceWorker\(\)/.test(app));

@@ -55,7 +55,12 @@ export function icon(name, size = 18) {
     moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>',
     sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/>',
     mail: '<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2ZM22 6l-10 7L2 6"/>',
-    bolt: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>'
+    bolt: '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8Z"/>',
+    whatsapp: '<path d="M3 21l1.7-4.9A8.5 8.5 0 1 1 8 19.4L3 21Z"/><path d="M9 9.5c.3 1.9 2.6 4.3 4.6 4.7l1.2-1.2 2 .9c-.2 1.2-1.3 2-2.5 1.8-3.5-.5-6.4-3.4-6.9-6.9C7.2 7.6 8 6.5 9.2 6.3l.9 2L9 9.5Z"/>',
+    renew: '<path d="M21 12a9 9 0 1 1-2.6-6.4M21 3v6h-6"/>',
+    ban: '<circle cx="12" cy="12" r="9"/><path d="M5.7 5.7l12.6 12.6"/>',
+    gauge: '<path d="M12 14l4-4M3.5 17a9 9 0 1 1 17 0"/>',
+    wallet2: '<path d="M3 7a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7ZM16 12h3"/>'
   };
   const svg = `<svg viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor"
     stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths[name] || ''}</svg>`;
@@ -270,6 +275,42 @@ export function downloadCsv(filename, rows, columns) {
   const a = el('a', { href: URL.createObjectURL(blob), download: filename });
   document.body.append(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+/** An http(s) URL as a string, or '' for anything else (javascript:, data:, junk). */
+export function safeUrl(value) {
+  try {
+    const u = new URL(String(value || '').trim());
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : '';
+  } catch { return ''; }
+}
+
+/**
+ * A WhatsApp "click to chat" link with the message filled in. Numbers stored
+ * without a country code get the organisation's (India's 91 by default), since
+ * wa.me needs the full international number.
+ */
+export function whatsappLink(phone, text, countryCode = '91') {
+  let digits = String(phone || '').replace(/[^0-9]/g, '').replace(/^0+/, '');
+  if (!digits) return '';
+  if (digits.length <= 10) digits = String(countryCode || '').replace(/[^0-9]/g, '') + digits;
+  return 'https://wa.me/' + digits + '?text=' + encodeURIComponent(text);
+}
+
+/** A UPI payment link (upi://pay) that opens the payer's UPI app with the amount filled in. */
+export function upiLink({ vpa, name, amount, note }) {
+  if (!vpa) return '';
+  const q = new URLSearchParams({ pa: vpa, pn: name || '', cu: 'INR' });
+  if (Number(amount) > 0) q.set('am', (Math.round(Number(amount) * 100) / 100).toFixed(2));
+  if (note) q.set('tn', String(note).slice(0, 80));
+  return 'upi://pay?' + q.toString();
+}
+
+/** Print the document inside a modal, and only it. */
+export function printDocument() {
+  document.body.classList.add('printing');
+  window.print();
+  setTimeout(() => document.body.classList.remove('printing'), 500);
 }
 
 export function spinner(label = 'Loading…') {

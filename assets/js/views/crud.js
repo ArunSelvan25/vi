@@ -17,7 +17,7 @@ function pluralise(word) {
  */
 export function crudView(entity, {
   extraActions = [], onRowClick, columns, filterKeys = ['status'], headerActions = [],
-  openForm
+  openForm, canDelete
 } = {}) {
   // entities with a richer editor (invoices and their line items) supply their own
   const open = openForm || ((row, opts) => openEntityForm(entity, row, opts));
@@ -42,7 +42,7 @@ export function crudView(entity, {
     },
     {
       label: 'Delete', icon: 'trash', danger: true,
-      visible: () => store.can('admin'),
+      visible: (row) => store.can('admin') && (!canDelete || canDelete(row)),
       onClick: async (row) => {
         const ok = await confirmDialog({
           title: `Delete ${def.singular.toLowerCase()} ${row.id}?`,

@@ -199,17 +199,21 @@ probe('an invoice with a payment against it cannot be deleted', () => {
   c('recordPayment', { invoice_id: inv.id, amount: 100, method: 'Cash' });
   const del = c('remove', { table: 'Invoices', id: inv.id });
   if (del.ok) return 'deleted, orphaning the payment record';
-  return /payment/i.test(del.error) ? null : 'unhelpful message: ' + del.error;
+  return /payment|void/i.test(del.error) ? null : 'unhelpful message: ' + del.error;
 });
 
-probe('an invoice with no payments can still be deleted', () => {
-  const { box, c } = portfolio();
+probe('an issued invoice is voided, never deleted — a draft can be deleted', () => {
+  const { box, c, tenant } = portfolio();
   c('generateInvoices', { upto: box.today() });
-  const inv = box.readTable('Invoices')[0];
-  const del = c('remove', { table: 'Invoices', id: inv.id });
-  if (!del.ok) return 'blocked without reason: ' + del.error;
-  return box.readTable('InvoiceItems').filter(i => i.invoice_id === inv.id).length
-    ? 'line items orphaned' : null;
+  const issued = box.readTable('Invoices').find(i => i.type === 'Rent');
+  const del = c('remove', { table: 'Invoices', id: issued.id });
+  if (del.ok) return 'an issued invoice was deleted, leaving a gap in the numbering';
+  if (!/void/i.test(del.error)) return 'the refusal does not point to voiding: ' + del.error;
+  const draft = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01', status: 'Draft' },
+    items: [{ description: 'Draft line', category: 'Other', quantity: 1, unit_amount: 10 }] }).data.invoice;
+  const gone = c('remove', { table: 'Invoices', id: draft.id });
+  if (!gone.ok) return 'a draft could not be deleted: ' + gone.error;
+  return box.readTable('InvoiceItems').filter(i => i.invoice_id === draft.id).length ? 'line items orphaned' : null;
 });
 
 probe('a payment never pushes any balance negative', () => {
@@ -262,9 +266,8 @@ probe('the block explains what is in the way', () => {
 });
 
 probe('deleting is allowed once the dependents are gone', () => {
-  const { box, c, tenant, lease } = portfolio();
-  // a lease with a deposit raises an invoice, which itself blocks the lease
-  box.readTable('Invoices').forEach(i => c('remove', { table: 'Invoices', id: i.id }));
+  // no deposit, so no invoice is raised to hold the lease in place
+  const { box, c, tenant, lease } = portfolio({ deposit_amount: 0 });
   const leaseGone = c('remove', { table: 'Leases', id: lease.data.row.id });
   if (!leaseGone.ok) return 'the lease could not be removed: ' + leaseGone.error;
   const del = c('remove', { table: 'Tenants', id: tenant.id });
@@ -788,11 +791,12 @@ probe('deleting an invoice deletes its lines', () => {
   const { box, admin } = bootedSandbox();
   const t = box.handle('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } }, admin).data.row;
   const inv = box.handle('saveInvoice', {
-    data: { tenant_id: t.id, due_date: '2030-01-10' },
+    data: { tenant_id: t.id, due_date: '2030-01-10', status: 'Draft' },
     items: [{ description: 'Rent', category: 'Rent', quantity: 1, unit_amount: 1 },
             { description: 'Water', category: 'Water', quantity: 1, unit_amount: 1 }]
   }, admin).data.invoice;
-  box.handle('remove', { table: 'Invoices', id: inv.id }, admin);
+  const del = box.handle('remove', { table: 'Invoices', id: inv.id }, admin);
+  if (!del.ok) return 'the draft could not be deleted: ' + del.error;
   const left = box.readTable('InvoiceItems').filter(i => i.invoice_id === inv.id).length;
   return left ? left + ' orphan line item(s) left behind' : null;
 });
@@ -1113,6 +1117,761 @@ probe('a manager cannot reset anyone\'s password', () => {
   return box.handle('resetPassword', { id: adminId, password: 'takenover1' }, mgr).ok
     ? 'a manager reset the administrator password — full takeover'
     : null;
+});
+
+console.log('\n— rent is billed once, however the invoice is edited —');
+
+/** A running monthly lease that has three periods due, generated. */
+function billedLease(leaseExtra = {}) {
+  const { box, admin } = bootedSandbox();
+  const c = (a, p, tok = admin) => box.handle(a, p, tok);
+  const Y = Number(box.today().slice(0, 4));
+  const prop = c('create', { table: 'Properties', data: { name: 'P' } }).data.row;
+  const unit = c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } }).data.row;
+  const tenant = c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } }).data.row;
+  const lease = c('create', { table: 'Leases', data: {
+    property_id: prop.id, unit_id: unit.id, tenant_id: tenant.id,
+    start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
+    rent_amount: 10000, frequency: 'Monthly', grace_days: 5, ...leaseExtra } }).data.row;
+  return { box, admin, c, prop, unit, tenant, lease };
+}
+
+const editLines = (box, inv, extra = []) => ({
+  id: inv.id,
+  data: { tenant_id: inv.tenant_id, property_id: inv.property_id, unit_id: inv.unit_id,
+          lease_id: inv.lease_id, due_date: inv.due_date, issue_date: inv.issue_date,
+          period_start: inv.period_start, period_end: inv.period_end, tax: 0, notes: '' },
+  items: [...box.readTable('InvoiceItems').filter(i => i.invoice_id === inv.id)
+            .map(i => ({ id: i.id, description: i.description, category: i.category,
+                         quantity: i.quantity, unit_amount: i.unit_amount })), ...extra]
+});
+
+probe('adding an electricity line to a rent invoice does not get that month billed again', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const rent = box.readTable('Invoices').find(i => i.type === 'Rent');
+  const saved = c('saveInvoice', editLines(box, rent,
+    [{ description: 'EB 142 units', category: 'Electricity', quantity: 142, unit_amount: 8.5 }]));
+  if (!saved.ok) return 'edit failed: ' + saved.error;
+  if (saved.data.invoice.type !== 'Rent') return 'the rent invoice was relabelled ' + saved.data.invoice.type;
+  const again = c('generateInvoices', { upto: box.today() });
+  return again.data.created ? again.data.created + ' invoice(s) raised again for periods already billed' : null;
+});
+
+probe('a rent invoice already relabelled "Mixed" still counts as billed', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const rent = box.readTable('Invoices').find(i => i.type === 'Rent');
+  // what an earlier build left in the sheet
+  c('update', { table: 'Invoices', id: rent.id, data: { type: 'Mixed' } });
+  const again = c('generateInvoices', { upto: box.today() });
+  return again.data.created ? 'billed ' + rent.period_start + ' a second time' : null;
+});
+
+probe('an ad-hoc invoice is still relabelled when its lines change', () => {
+  const { box, c, tenant } = billedLease();
+  const made = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-10' },
+    items: [{ description: 'EB bill', category: 'Electricity', quantity: 1, unit_amount: 900 }] }).data.invoice;
+  const edited = c('saveInvoice', editLines(box, made,
+    [{ description: 'Water', category: 'Water', quantity: 1, unit_amount: 300 }])).data.invoice;
+  return edited.type === 'Mixed' ? null : 'type stayed ' + edited.type;
+});
+
+probe('a void invoice cannot be edited back into arrears', () => {
+  const { box, c, tenant } = billedLease();
+  const inv = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01' },
+    items: [{ description: 'Parking', category: 'Parking', quantity: 1, unit_amount: 500 }] }).data.invoice;
+  c('update', { table: 'Invoices', id: inv.id, data: { status: 'Void' } });
+  const r = c('saveInvoice', editLines(box, inv));
+  if (r.ok) return 'a void invoice was edited';
+  const after = box.readTable('Invoices').find(i => i.id === inv.id);
+  return after.status === 'Void' && Number(after.balance) === 0 ? null : `status ${after.status}, balance ${after.balance}`;
+});
+
+probe('a nightly run bills a lease whose stored status has not caught up', () => {
+  const { box } = billedLease();
+  const tab = box.__tabs.get('Leases');
+  tab.rows[0][tab.headers.indexOf('status')] = 'Upcoming';
+  box.invalidateAll();
+  const r = box.generateInvoices({ upto: box.today() }, { role: 'admin', name: 'trigger' });
+  return r.created ? null : 'no invoices for a lease that has been running since last year';
+});
+
+probe('generating a year of rent writes each tab once', () => {
+  const { box, c } = billedLease();
+  let appends = 0, blocks = 0;
+  // count the writes that reach the two billing tabs, however the script opens them
+  const book = box.SpreadsheetApp.getActiveSpreadsheet();
+  box.SpreadsheetApp.getActiveSpreadsheet = () => ({
+    insertSheet: book.insertSheet,
+    getSheetByName(name) {
+      const sh = book.getSheetByName(name);
+      if (!sh || !['Invoices', 'InvoiceItems'].includes(name)) return sh;
+      return { ...sh,
+        appendRow(v) { appends++; return sh.appendRow(v); },
+        getRange(...a) {
+          const r = sh.getRange(...a), set = r.setValues;
+          r.setValues = function (v) { blocks++; return set.call(this, v); };
+          return r;
+        } };
+    }
+  });
+  const r = c('generateInvoices', { upto: box.today() });
+  box.SpreadsheetApp.getActiveSpreadsheet = () => book;
+  if (r.data.created < 12) return 'expected a year of periods, got ' + r.data.created;
+  const items = box.readTable('InvoiceItems');
+  if (items.length !== r.data.created) return r.data.created + ' invoices but ' + items.length + ' lines';
+  const ids = new Set(box.readTable('Invoices').map(i => i.id));
+  if (ids.size !== r.data.created) return 'invoice ids are not unique';
+  if (items.some(i => !ids.has(i.invoice_id))) return 'a line points at an invoice that does not exist';
+  return appends === 0 && blocks === 2 ? null : `${appends} appendRow and ${blocks} block writes`;
+});
+
+probe('a block write past the end of the sheet grows it first', () => {
+  const { box, c } = billedLease();
+  box.__tabs.get('Invoices').maxRows = 3;
+  box.__tabs.get('InvoiceItems').maxRows = 3;
+  const r = c('generateInvoices', { upto: box.today() });
+  return r.ok ? null : 'generation failed: ' + r.error;
+});
+
+probe('the late fee is not charged on a security deposit', () => {
+  const { box, c } = billedLease({ deposit_amount: 50000, late_fee: 500 });
+  c('bootstrap', {});
+  const dep = box.readTable('Invoices').find(i => i.type === 'Deposit');
+  if (dep.status !== 'Overdue') return 'test set-up: deposit is ' + dep.status;
+  return box.readTable('InvoiceItems').some(i => i.invoice_id === dep.id && i.category === 'Late Fee')
+    ? 'a late fee was added to the deposit invoice' : null;
+});
+
+probe('the late fee is still charged on overdue rent', () => {
+  const { box, c } = billedLease({ late_fee: 500 });
+  c('generateInvoices', { upto: box.today() });
+  c('bootstrap', {});
+  return box.readTable('InvoiceItems').some(i => i.category === 'Late Fee')
+    ? null : 'no late fee on any overdue rent invoice';
+});
+
+console.log('\n— a payment entered on the Payments page —');
+probe('settles the invoice it is against', () => {
+  const { box, c, tenant } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const r = c('create', { table: 'Payments', data: {
+    payment_date: box.today(), tenant_id: tenant.id, invoice_id: inv.id, amount: Number(inv.balance), method: 'UPI' } });
+  if (!r.ok) return 'refused: ' + r.error;
+  const after = box.readTable('Invoices').find(i => i.id === inv.id);
+  return after.status === 'Paid' && Number(after.balance) === 0
+    ? null : `invoice is ${after.status} with balance ${after.balance}`;
+});
+
+probe('cannot be more than the invoice still owes', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const r = c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 999999 } });
+  return r.ok ? 'an overpayment was accepted' : null;
+});
+
+probe('cannot be taken on a void invoice', () => {
+  const { box, c, tenant } = billedLease();
+  const inv = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01' },
+    items: [{ description: 'Parking', category: 'Parking', quantity: 1, unit_amount: 500 }] }).data.invoice;
+  c('update', { table: 'Invoices', id: inv.id, data: { status: 'Void' } });
+  return c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 100 } }).ok
+    ? 'a payment was recorded on a void invoice' : null;
+});
+
+probe('editing its amount re-prices the invoice', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const pay = c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 4000 } }).data.row;
+  const up = c('update', { table: 'Payments', id: pay.id, data: { amount: 10000 } });
+  if (!up.ok) return 'raising it to the full balance was refused: ' + up.error;
+  const after = box.readTable('Invoices').find(i => i.id === inv.id);
+  if (after.status !== 'Paid') return 'invoice is ' + after.status + ' with balance ' + after.balance;
+  const notes = c('update', { table: 'Payments', id: pay.id, data: { notes: 'cheque cleared' } });
+  return notes.ok ? null : 'editing only the notes of a settled payment was refused: ' + notes.error;
+});
+
+probe('moving it to another invoice puts the first one back', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const [a, b] = box.readTable('Invoices');
+  const pay = c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: a.id, amount: 10000 } }).data.row;
+  c('update', { table: 'Payments', id: pay.id, data: { invoice_id: b.id } });
+  const inv = (id) => box.readTable('Invoices').find(i => i.id === id);
+  if (Number(inv(a.id).balance) !== 10000) return 'the first invoice still shows ' + inv(a.id).balance + ' owed';
+  return inv(b.id).status === 'Paid' ? null : 'the second invoice is ' + inv(b.id).status;
+});
+
+probe('takes its tenant and property from the invoice', () => {
+  const { box, c, prop, tenant } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const row = c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 10 } }).data.row;
+  return row.tenant_id === tenant.id && row.property_id === prop.id
+    ? null : `tenant ${row.tenant_id}, property ${row.property_id}`;
+});
+
+probe('money on account, with no invoice, is still accepted', () => {
+  const { box, c, tenant } = billedLease();
+  return c('create', { table: 'Payments', data: { payment_date: box.today(), tenant_id: tenant.id, amount: 2500 } }).ok
+    ? null : 'a payment without an invoice was refused';
+});
+
+probe('voiding a payment recomputes its invoice once', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const p = c('recordPayment', { invoice_id: inv.id, amount: 1000 }).data.payment;
+  let n = 0; const real = box.applyInvoiceTotals;
+  box.applyInvoiceTotals = function () { n++; return real.apply(this, arguments); };
+  const r = c('voidPayment', { id: p.id });
+  box.applyInvoiceTotals = real;
+  if (!r.ok || Number(r.data.invoice.balance) !== 10000) return 'void did not restore the invoice: ' + JSON.stringify(r);
+  return n === 1 ? null : `recomputed ${n} times`;
+});
+
+console.log('\n— deposits —');
+probe('a deposit nobody has paid cannot be refunded', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 50000 });
+  const r = c('update', { table: 'Leases', id: lease.id, data: { deposit_status: 'Refunded' } });
+  if (r.ok) return 'marked refunded, booking ' + box.readTable('Expenses').filter(e => e.category === 'Deposit Refund').map(e => e.amount) + ' out';
+  return box.readTable('Leases')[0].deposit_status === 'Pending' ? null : 'the lease was changed anyway';
+});
+
+probe('a refund books what was actually received', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 50000 });
+  const dep = box.readTable('Invoices').find(i => i.type === 'Deposit');
+  c('recordPayment', { invoice_id: dep.id, amount: 30000 });
+  const r = c('update', { table: 'Leases', id: lease.id, data: { deposit_status: 'Refunded' } });
+  if (!r.ok) return 'refused after a part payment: ' + r.error;
+  const exp = box.readTable('Expenses').filter(e => e.category === 'Deposit Refund');
+  return exp.length === 1 && Number(exp[0].amount) === 30000 ? null : 'refund booked as ' + exp.map(e => e.amount);
+});
+
+probe('adding a deposit to an existing lease invoices it', () => {
+  const { box, c, lease } = billedLease();
+  c('update', { table: 'Leases', id: lease.id, data: { deposit_amount: 40000 } });
+  const dep = box.readTable('Invoices').filter(i => i.type === 'Deposit');
+  if (dep.length !== 1 || Number(dep[0].total) !== 40000) return dep.length + ' deposit invoice(s)';
+  c('update', { table: 'Leases', id: lease.id, data: { deposit_amount: 45000 } });
+  return box.readTable('Invoices').filter(i => i.type === 'Deposit').length === 1
+    ? null : 'changing the amount raised a second deposit invoice';
+});
+
+probe('a deposit recorded as already held raises no invoice', () => {
+  const { box, c, lease } = billedLease();
+  c('update', { table: 'Leases', id: lease.id, data: { deposit_amount: 40000, deposit_status: 'Held' } });
+  return box.readTable('Invoices').some(i => i.type === 'Deposit')
+    ? 'billed a deposit the lease says was collected' : null;
+});
+
+console.log('\n— sheet and session hygiene —');
+probe('text that looks like a formula is stored as text', () => {
+  const { box, c } = billedLease();
+  const payload = '=JOIN(",",Users!F2:G9)';
+  const t = c('create', { table: 'Tenants', data: { full_name: 'X', phone: '9222222222', notes: payload } }).data.row;
+  c('update', { table: 'Tenants', id: t.id, data: { occupation: '=1+1' } });
+  c('update', { table: 'Tenants', id: t.id, data: { alt_phone: '9333333333' } });
+  if (box.__formulas.length) return 'Sheets would have run: ' + box.__formulas.join(' | ');
+  const back = box.readTable('Tenants').find(r => r.id === t.id);
+  return back.notes === payload && back.occupation === '=1+1' ? null : 'the text did not read back as typed';
+});
+
+probe('a create cannot choose its own id', () => {
+  const { box, c, tenant } = billedLease();
+  const r = c('create', { table: 'Tenants', data: { id: tenant.id, full_name: 'Impostor', phone: '9333333333' } });
+  return r.data.row.id !== tenant.id && box.readTable('Tenants').filter(t => t.id === tenant.id).length === 1
+    ? null : 'two tenants now share ' + tenant.id;
+});
+
+probe('no user write hands back a password hash', () => {
+  const { box, admin } = bootedSandbox();
+  const made = box.handle('createUser', { name: 'M', phone: '9000000004', role: 'manager', password: 'manager-pass-1234' }, admin);
+  const up = box.handle('update', { table: 'Users', id: made.data.row.id, data: { name: 'Manager' } }, admin);
+  const leaked = [made.data.row, up.data.row].filter(r => 'salt' in r || 'password_hash' in r);
+  return leaked.length ? leaked.length + ' response(s) carried salt/password_hash' : null;
+});
+
+probe('changing your password keeps you signed in, and ends your other sessions', () => {
+  const { box, admin } = bootedSandbox();
+  const other = box.handle('login', { phone: '9000000001', password: 'correct-horse' }, '').data.token;
+  const r = box.handle('changePassword', { current: 'correct-horse', next: 'brand-new-pass-99' }, admin);
+  if (!r.ok || !r.data.token) return 'no replacement session: ' + JSON.stringify(r);
+  if (!box.handle('bootstrap', {}, r.data.token).ok) return 'the replacement session is refused';
+  if (box.handle('bootstrap', {}, other).ok) return 'a session from before the change still works';
+  return box.handle('bootstrap', {}, admin).ok ? 'the session it replaced still works' : null;
+});
+
+probe('signing in can return the workbook in the same response', () => {
+  const { box } = bootedSandbox();
+  const plain = box.handle('login', { phone: '9000000001', password: 'correct-horse' }, '');
+  if ('snapshot' in plain.data) return 'a snapshot was sent without being asked for';
+  const r = box.handle('login', { phone: '9000000001', password: 'correct-horse', withSnapshot: true }, '');
+  if (!r.ok || !r.data.snapshot || !Array.isArray(r.data.snapshot.properties)) return 'no snapshot: ' + JSON.stringify(r).slice(0, 200);
+  if (JSON.stringify(r.data.snapshot).includes('password_hash')) return 'the snapshot carries password hashes';
+  return r.data.snapshot.user.id === r.data.user.id ? null : 'snapshot built for a different user';
+});
+
+probe('a failed sign-in never returns a snapshot', () => {
+  const { box } = bootedSandbox();
+  const r = box.handle('login', { phone: '9000000001', password: 'wrong-password', withSnapshot: true }, '');
+  return r.ok || r.data ? 'failed sign-in returned data' : null;
+});
+
+probe('the audit log keeps numbering from its last row', () => {
+  const { box, c } = billedLease();
+  const ids = box.readTable('ActivityLog').map(r => r.id);
+  if (new Set(ids).size !== ids.length) return 'duplicate audit ids: ' + ids.join(',');
+  const nums = ids.map(i => parseInt(i.split('-')[1], 10));
+  return nums.every((n, i) => i === 0 || n === nums[i - 1] + 1) ? null : 'ids out of sequence: ' + ids.join(',');
+});
+
+probe('menu functions work from a time-driven trigger, where there is no UI', () => {
+  const { box, c } = billedLease();
+  box.SpreadsheetApp.getUi = () => { throw new Error('Cannot call SpreadsheetApp.getUi() from this context.'); };
+  const quiet = box.console; box.console = { log() {} };
+  try {
+    box.menuGenerate(); box.menuRefresh(); box.menuReminders();
+  } catch (e) { return 'threw: ' + e.message; }
+  finally { box.console = quiet; }
+  return box.readTable('Invoices').some(i => i.type === 'Rent') ? null : 'menuGenerate raised no invoices';
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Second review: concurrency, money, speed, features, security policy
+// ════════════════════════════════════════════════════════════════════════════
+
+const shift = (iso, days) => {
+  const d = new Date(iso + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+const rowOf = (box, table, id) => box.readTable(table).find(r => r.id === id);
+
+console.log('\n— two people saving the same record —');
+probe('a save made on top of someone else\'s change is refused, and changes nothing', () => {
+  const { box, c, tenant } = billedLease();
+  const opened = rowOf(box, 'Tenants', tenant.id);
+  if (!opened._v) return 'rows carry no version';
+  c('update', { table: 'Tenants', id: tenant.id, data: { occupation: 'Doctor' }, expected_version: opened._v });
+  const stale = c('update', { table: 'Tenants', id: tenant.id, data: { occupation: 'Pilot' }, expected_version: opened._v });
+  if (stale.ok) return 'the second save overwrote the first';
+  if (!/^CONFLICT: /.test(stale.error)) return 'not reported as a conflict: ' + stale.error;
+  return rowOf(box, 'Tenants', tenant.id).occupation === 'Doctor' ? null : 'the refused save still wrote';
+});
+
+probe('the version handed back with a save is the one the next save needs', () => {
+  const { box, c, tenant } = billedLease();
+  const first = c('update', { table: 'Tenants', id: tenant.id, data: { occupation: 'A' },
+                              expected_version: rowOf(box, 'Tenants', tenant.id)._v });
+  if (!first.ok || !first.data.row._v) return 'no version returned: ' + JSON.stringify(first).slice(0, 160);
+  const second = c('update', { table: 'Tenants', id: tenant.id, data: { occupation: 'B' }, expected_version: first.data.row._v });
+  return second.ok ? null : 'a save on the returned version was refused: ' + second.error;
+});
+
+probe('an invoice edited on a stale copy is refused', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  c('recordPayment', { invoice_id: inv.id, amount: 100 });
+  const r = c('saveInvoice', { ...editLines(box, inv), expected_version: inv._v });
+  return r.ok ? 'saved over a payment recorded after the editor opened' : (/CONFLICT/.test(r.error) ? null : r.error);
+});
+
+probe('a payment\'s balance check happens while the write lock is held', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  const seen = [];
+  const real = box.readTable;
+  box.readTable = function (name) { if (name === 'Invoices') seen.push(box.__lock.held); return real.apply(this, arguments); };
+  c('recordPayment', { invoice_id: inv.id, amount: 100 });
+  box.readTable = real;
+  return seen.length && seen.every(Boolean) ? null : 'invoices read outside the lock: ' + JSON.stringify(seen);
+});
+
+probe('one save takes the lock once, however much it sets off', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 1000 });
+  const before = box.__lock.acquisitions;
+  c('update', { table: 'Leases', id: lease.id, data: { notes: 'touched', deposit_amount: 2000 } });
+  const taken = box.__lock.acquisitions - before;
+  return taken === 1 ? null : `the lock was taken ${taken} times`;
+});
+
+console.log('\n— invoice numbers and voiding —');
+probe('an invoice number is never issued twice, even after the newest is deleted', () => {
+  const { box, c, tenant } = billedLease();
+  const draft = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01', status: 'Draft' },
+    items: [{ description: 'x', category: 'Other', quantity: 1, unit_amount: 1 }] }).data.invoice;
+  c('remove', { table: 'Invoices', id: draft.id });
+  const next = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01' },
+    items: [{ description: 'y', category: 'Other', quantity: 1, unit_amount: 1 }] }).data.invoice;
+  return next.id !== draft.id ? null : draft.id + ' was issued twice';
+});
+
+probe('voiding needs a reason, keeps the number and leaves nothing owed', () => {
+  const { box, c, tenant } = billedLease();
+  const inv = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2020-01-01' },
+    items: [{ description: 'Parking', category: 'Parking', quantity: 1, unit_amount: 500 }] }).data.invoice;
+  if (c('voidInvoice', { id: inv.id, reason: '' }).ok) return 'voided without a reason';
+  const r = c('voidInvoice', { id: inv.id, reason: 'raised twice' });
+  if (!r.ok) return 'void failed: ' + r.error;
+  const after = rowOf(box, 'Invoices', inv.id);
+  if (after.status !== 'Void' || Number(after.balance) !== 0) return `status ${after.status}, balance ${after.balance}`;
+  if (!/raised twice/.test(after.notes)) return 'the reason was not kept';
+  if (c('stats', {}).data.outstanding !== 0) return 'a void invoice still counts as outstanding';
+  return c('recordPayment', { invoice_id: inv.id, amount: 1 }).ok ? 'a void invoice took a payment' : null;
+});
+
+probe('an invoice holding money cannot be voided', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices')[0];
+  c('recordPayment', { invoice_id: inv.id, amount: 100 });
+  const r = c('voidInvoice', { id: inv.id, reason: 'x' });
+  if (r.ok) return 'voided with a payment against it';
+  return /received/.test(r.error) ? null : 'refused for the wrong reason: ' + r.error;
+});
+
+probe('a voided rent period is not billed again', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices').find(i => i.type === 'Rent');
+  const v = c('voidInvoice', { id: inv.id, reason: 'rent-free month' });
+  if (!v.ok) return 'could not void: ' + v.error;
+  return c('generateInvoices', { upto: box.today() }).data.created ? 'the voided month was billed again' : null;
+});
+
+probe('a draft is not payable and does not count as owed', () => {
+  const { c, tenant } = billedLease();
+  const d = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2020-01-01', status: 'Draft' },
+    items: [{ description: 'x', category: 'Other', quantity: 1, unit_amount: 900 }] }).data.invoice;
+  if (d.status !== 'Draft') return 'saved as ' + d.status;
+  if (c('recordPayment', { invoice_id: d.id, amount: 100 }).ok) return 'a draft took a payment';
+  if (c('stats', {}).data.outstanding !== 0) return 'a draft counts as outstanding';
+  const issued = c('saveInvoice', { id: d.id, data: { tenant_id: tenant.id, due_date: '2020-01-01', status: 'Unpaid' },
+    items: [{ description: 'x', category: 'Other', quantity: 1, unit_amount: 900 }] }).data.invoice;
+  return issued.status === 'Overdue' ? null : 'issuing a past-due draft left it ' + issued.status;
+});
+
+console.log('\n— GST —');
+function gstPortfolio(state, leaseGst = 18) {
+  const w = billedLease({ gst_rate: leaseGst });
+  w.c('update', { table: 'Settings', id: 'gstin', data: { value: '29ABCDE1234F1Z5' } });
+  w.c('update', { table: 'Properties', id: w.prop.id, data: { state } });
+  return w;
+}
+
+probe('rent on a lease with GST is taxed, split CGST + SGST within the state', () => {
+  const { box, c } = gstPortfolio('Karnataka');
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices').find(i => i.type === 'Rent');
+  const want = { amount: 10000, tax: 1800, total: 11800, cgst: 900, sgst: 900, igst: 0 };
+  const bad = Object.entries(want).filter(([k, v]) => Number(inv[k]) !== v);
+  if (bad.length) return 'got ' + bad.map(([k]) => k + '=' + inv[k]).join(', ');
+  return /^29-/.test(inv.place_of_supply) ? null : 'place of supply ' + inv.place_of_supply;
+});
+
+probe('a property in another state is charged IGST', () => {
+  const { box, c } = gstPortfolio('TN');
+  c('generateInvoices', { upto: box.today() });
+  const inv = box.readTable('Invoices').find(i => i.type === 'Rent');
+  return Number(inv.igst) === 1800 && Number(inv.cgst) === 0 && /^33-/.test(inv.place_of_supply)
+    ? null : `igst ${inv.igst}, cgst ${inv.cgst}, place ${inv.place_of_supply}`;
+});
+
+probe('each line carries its own rate, and a late fee is taxed like the rent', () => {
+  const { box, c, tenant } = gstPortfolio('KA', 18);
+  const inv = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01' }, items: [
+    { description: 'Rent', category: 'Rent', quantity: 1, unit_amount: 10000, tax_rate: 18 },
+    { description: 'EB', category: 'Electricity', quantity: 100, unit_amount: 8, tax_rate: 0 }
+  ] }).data.invoice;
+  if (Number(inv.tax) !== 1800 || Number(inv.total) !== 12600) return `tax ${inv.tax}, total ${inv.total}`;
+  c('update', { table: 'Leases', id: box.readTable('Leases')[0].id, data: { late_fee: 500 } });
+  c('generateInvoices', { upto: box.today() });
+  const fee = box.readTable('InvoiceItems').find(i => i.category === 'Late Fee');
+  return fee && Number(fee.tax_amount) === 90 ? null : 'late fee tax ' + (fee && fee.tax_amount);
+});
+
+probe('an invoice with no line rates keeps its typed tax', () => {
+  const { c, tenant } = billedLease();
+  const inv = c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-01', tax: 180 },
+    items: [{ description: 'Internet', category: 'Internet', quantity: 1, unit_amount: 1000 }] }).data.invoice;
+  return Number(inv.tax) === 180 && Number(inv.total) === 1180 && inv.cgst === '' ? null
+    : `tax ${inv.tax}, total ${inv.total}, cgst ${JSON.stringify(inv.cgst)}`;
+});
+
+probe('a GSTIN that is not one is refused, for the business and for a tenant', () => {
+  const { c, tenant } = billedLease();
+  const a = c('update', { table: 'Settings', id: 'gstin', data: { value: '29ABCDE1234' } });
+  const b = c('update', { table: 'Tenants', id: tenant.id, data: { gstin: 'not-a-gstin' } });
+  const ok = c('update', { table: 'Tenants', id: tenant.id, data: { gstin: '33abcde1234f1z5' } });
+  if (a.ok || b.ok) return 'an invalid GSTIN was saved';
+  return ok.ok && ok.data.row.gstin === '33ABCDE1234F1Z5' ? null : 'a valid GSTIN was not stored canonically';
+});
+
+console.log('\n— deposits are held money, not income —');
+probe('receiving or returning a deposit moves neither collected nor spent', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 50000, start_date: box_today_minus(10) });
+  const dep = box.readTable('Invoices').find(i => i.type === 'Deposit');
+  c('recordPayment', { invoice_id: dep.id, amount: 50000, payment_date: box.today() });
+  let s = c('stats', {}).data;
+  if (s.collected_this_month !== 0) return 'a deposit counted as collected: ' + s.collected_this_month;
+  if (s.deposits_held !== 50000) return 'deposits held ' + s.deposits_held;
+  c('update', { table: 'Leases', id: lease.id, data: { deposit_status: 'Refunded' } });
+  s = c('stats', {}).data;
+  if (s.expenses_this_month !== 0) return 'a refund counted as spend: ' + s.expenses_this_month;
+  return s.deposits_held === 0 ? null : 'still held after the refund: ' + s.deposits_held;
+});
+function box_today_minus(n) { return shift(new Date().toISOString().slice(0, 10), -n); }
+
+probe('a terminated lease whose deposit has not been returned still owes it', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 40000, deposit_status: 'Held' });
+  c('update', { table: 'Leases', id: lease.id, data: { status: 'Terminated' } });
+  return c('stats', {}).data.deposits_held === 40000 ? null : 'deposits held ' + c('stats', {}).data.deposits_held;
+});
+
+probe('move-out: the deposit pays arrears and deductions, and the rest is refunded', () => {
+  const { box, c, lease, tenant } = billedLease({ deposit_amount: 100000, deposit_status: 'Held' });
+  c('generateInvoices', { upto: box.today() });
+  const owed = box.readTable('Invoices').filter(i => i.type === 'Rent' && Number(i.balance) > 0)
+    .slice(1).map(i => i.id);
+  // leave one unpaid month; pay the rest so arrears are small
+  box.readTable('Invoices').filter(i => i.type === 'Rent' && owed.includes(i.id))
+    .forEach(i => c('recordPayment', { invoice_id: i.id, amount: Number(i.balance) }));
+  const arrears = box.readTable('Invoices').filter(i => Number(i.balance) > 0 && i.type !== 'Deposit')
+    .reduce((s, i) => s + Number(i.balance), 0);
+
+  const r = c('settleDeposit', { lease_id: lease.id, apply_to_arrears: true, end_lease: true,
+    move_out_date: box.today(), refund_method: 'UPI', refund_reference: 'UTR1',
+    deductions: [{ description: 'Repainting', amount: 7000 }, { description: 'Broken fan', amount: 1500 }] });
+  if (!r.ok) return 'settle failed: ' + r.error;
+  const problems = [];
+  const left = box.readTable('Invoices').filter(i => Number(i.balance) > 0 && i.type !== 'Deposit');
+  if (left.length) problems.push(left.length + ' invoice(s) still owed');
+  const ded = r.data.deduction_invoice;
+  if (!ded || ded.type !== 'Deposit Deduction' || Number(ded.total) !== 8500 || ded.status !== 'Paid') {
+    problems.push('deduction invoice ' + JSON.stringify(ded && { type: ded.type, total: ded.total, status: ded.status }));
+  }
+  const refund = 100000 - arrears - 8500;
+  if (r.data.refunded !== refund) problems.push(`refunded ${r.data.refunded}, expected ${refund}`);
+  const exp = box.readTable('Expenses').filter(e => e.category === 'Deposit Refund');
+  if (exp.length !== 1 || Number(exp[0].amount) !== refund) problems.push('refund expense ' + exp.map(e => e.amount));
+  const l = rowOf(box, 'Leases', lease.id);
+  if (l.deposit_status !== 'Partially Refunded') problems.push('deposit status ' + l.deposit_status);
+  if (l.status !== 'Terminated') problems.push('lease ' + l.status);
+  if (rowOf(box, 'Units', box.readTable('Units')[0].id).status !== 'Vacant') problems.push('unit not freed');
+  if (c('stats', {}).data.deposits_held !== 0) problems.push('still held ' + c('stats', {}).data.deposits_held);
+  if (c('settleDeposit', { lease_id: lease.id }).ok) problems.push('settled twice');
+  const adj = box.readTable('Payments').filter(p => p.method === 'Deposit Adjustment');
+  if (!adj.length || adj.some(p => p.tenant_id !== tenant.id)) problems.push('adjustments not recorded against the tenant');
+  return problems.length ? problems.join('; ') : null;
+});
+
+probe('deductions larger than the deposit leave the tenant owing the difference', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 5000, deposit_status: 'Held', start_date: box_today_minus(3) });
+  const r = c('settleDeposit', { lease_id: lease.id, deductions: [{ description: 'Flooring', amount: 8000 }] });
+  if (!r.ok) return r.error;
+  const inv = r.data.deduction_invoice;
+  return r.data.refunded === 0 && Number(inv.balance) === 3000 && rowOf(box, 'Leases', lease.id).deposit_status === 'Forfeited'
+    ? null : `refunded ${r.data.refunded}, still owed ${inv.balance}, status ${rowOf(box, 'Leases', lease.id).deposit_status}`;
+});
+
+probe('partial refunds cannot be typed into the lease form without the money', () => {
+  const { c, lease } = billedLease({ deposit_amount: 5000, deposit_status: 'Held' });
+  return c('update', { table: 'Leases', id: lease.id, data: { deposit_status: 'Partially Refunded' } }).ok
+    ? 'a partial refund was recorded with no amount' : null;
+});
+
+probe('changing the deposit re-prices its invoice, but never below what was paid', () => {
+  const { box, c, lease } = billedLease({ deposit_amount: 50000 });
+  const dep = () => box.readTable('Invoices').find(i => i.type === 'Deposit');
+  c('update', { table: 'Leases', id: lease.id, data: { deposit_amount: 60000 } });
+  if (Number(dep().total) !== 60000) return 'deposit invoice still ' + dep().total;
+  c('recordPayment', { invoice_id: dep().id, amount: 30000 });
+  if (c('update', { table: 'Leases', id: lease.id, data: { deposit_amount: 20000 } }).ok) return 'cut below the 30000 received';
+  return box.readTable('Invoices').filter(i => i.type === 'Deposit').length === 1 ? null : 'a second deposit invoice appeared';
+});
+
+console.log('\n— renewing a lease —');
+probe('a renewal starts the day after, at the escalated rent, and carries the deposit once', () => {
+  const Y = Number(new Date().toISOString().slice(0, 4));
+  const { box, c, lease } = billedLease({ start_date: (Y - 2) + '-01-01', end_date: shift(box_today_minus(0), 20),
+                                          escalation_pct: 10, deposit_amount: 30000, deposit_status: 'Held' });
+  if (c('renewLease', { id: lease.id, start_date: shift(box_today_minus(0), 5), end_date: (Y + 2) + '-12-31' }).ok) {
+    return 'a renewal overlapping the current lease was accepted';
+  }
+  const r = c('renewLease', { id: lease.id, end_date: (Y + 2) + '-12-31' });
+  if (!r.ok) return r.error;
+  const n = r.data.lease, old = rowOf(box, 'Leases', lease.id);
+  const problems = [];
+  if (n.start_date !== shift(old.end_date, 1)) problems.push('starts ' + n.start_date);
+  if (Number(n.rent_amount) !== 12100) problems.push('rent ' + n.rent_amount + ' (expected 10000 × 1.1²)');
+  if (n.renewed_from !== lease.id) problems.push('not linked to ' + lease.id);
+  if (n.deposit_status !== 'Held' || Number(n.deposit_amount) !== 30000) problems.push('new deposit ' + n.deposit_status + ' ' + n.deposit_amount);
+  if (old.deposit_status !== 'Transferred') problems.push('old deposit ' + old.deposit_status);
+  if (box.readTable('Invoices').some(i => i.type === 'Deposit')) problems.push('a carried deposit was billed again');
+  if (c('stats', {}).data.deposits_held !== 30000) problems.push('held ' + c('stats', {}).data.deposits_held);
+  if (c('renewLease', { id: lease.id, end_date: (Y + 3) + '-12-31' }).ok) problems.push('renewed twice');
+  return problems.length ? problems.join('; ') : null;
+});
+
+probe('the rent roll uses the rent in force after escalation', () => {
+  const Y = Number(new Date().toISOString().slice(0, 4));
+  const { c } = billedLease({ start_date: (Y - 2) + '-01-01', end_date: (Y + 2) + '-12-31', escalation_pct: 10 });
+  const roll = c('stats', {}).data.monthly_rent_roll;
+  return roll === 12100 ? null : 'rent roll ' + roll + ', expected 12100';
+});
+
+console.log('\n— reminders keep to a schedule —');
+function reminderWorld() {
+  const w = billedLease();
+  w.c('update', { table: 'Tenants', id: w.tenant.id, data: { email: 't@example.com' } });
+  const mails = [];
+  w.box.MailApp.sendEmail = (to, subject, body) => mails.push({ to, subject, body });
+  const raise = (due) => w.c('saveInvoice', { data: { tenant_id: w.tenant.id, due_date: due },
+    items: [{ description: 'Charge', category: 'Other', quantity: 1, unit_amount: 1000 }] }).data.invoice;
+  return { ...w, mails, raise };
+}
+
+probe('the daily job emails only on the scheduled days', () => {
+  const t = new Date().toISOString().slice(0, 10);
+  const cases = [[3, true], [4, false], [0, true], [-7, true], [-8, false], [-30, true]];
+  const wrong = [];
+  for (const [offset, expect] of cases) {
+    const { box, mails, raise } = reminderWorld();
+    raise(shift(box.today(), offset));
+    box.dailyReminderJob = box.dailyReminderJob;       // the job itself checks the setting
+    box.sendReminders({ role: 'admin', name: 'job' }, { scheduled: true });
+    if ((mails.length > 0) !== expect) wrong.push(`${offset} days: ${mails.length} sent`);
+  }
+  return wrong.length ? wrong.join('; ') : null;
+});
+
+probe('one tenant gets one email for all their invoices, and never twice in a day', () => {
+  const { box, c, mails, raise } = reminderWorld();
+  raise(shift(box.today(), -7)); raise(shift(box.today(), -7)); raise(shift(box.today(), -30));
+  c('sendReminders', {});
+  if (mails.length !== 1) return mails.length + ' emails';
+  if ((mails[0].body.match(/INV-/g) || []).length !== 3) return 'the email does not list all three invoices';
+  c('sendReminders', {});
+  return mails.length === 1 ? null : 'reminded again the same day';
+});
+
+console.log('\n— speed —');
+probe('only the first load of the day runs housekeeping', () => {
+  const { box, c } = billedLease();
+  c('generateInvoices', { upto: box.today() });
+  // as if a day had passed: nothing has refreshed today, and one invoice is stale
+  box.__props.delete('LAST_REFRESH');
+  const tab = box.__tabs.get('Invoices');
+  tab.rows[0][tab.headers.indexOf('status')] = 'Unpaid';
+  box.invalidateAll();
+  let runs = 0;
+  const real = box.refreshStatuses;
+  box.refreshStatuses = function () { runs++; return real.apply(this, arguments); };
+  c('bootstrap', {}); const first = runs;
+  c('bootstrap', {}); c('bootstrap', {});
+  box.refreshStatuses = real;
+  if (first !== 1) return 'the first load ran housekeeping ' + first + ' time(s)';
+  if (box.readTable('Invoices')[0].status !== 'Overdue') return 'the stale invoice was not fixed';
+  return runs === 1 ? null : `later loads ran it ${runs - 1} more time(s)`;
+});
+
+probe('a snapshot leaves out every tab that has not changed', () => {
+  const { c, tenant } = billedLease();
+  const full = c('bootstrap', {}).data;
+  const again = c('bootstrap', { known: full.hashes }).data;
+  if (again.unchanged.length !== Object.keys(full.hashes).length) return 'unchanged: ' + again.unchanged.join(',');
+  if ('invoices' in again) return 'an unchanged tab was sent';
+  const write = c('update', { table: 'Tenants', id: tenant.id, data: { occupation: 'X' }, withSnapshot: true, known: full.hashes });
+  const snap = write.data.snapshot;
+  if (!Array.isArray(snap.tenants)) return 'the changed tab was left out';
+  return snap.unchanged.includes('invoices') && !('invoices' in snap) ? null : 'an unchanged tab was sent with the write';
+});
+
+probe('a change made directly in the sheet is picked up', () => {
+  const { box, c } = billedLease();
+  const full = c('bootstrap', {}).data;
+  const tab = box.__tabs.get('Tenants');
+  tab.rows[0][tab.headers.indexOf('occupation')] = 'Typed in the sheet';
+  const again = c('bootstrap', { known: full.hashes }).data;
+  return Array.isArray(again.tenants) && again.tenants[0].occupation === 'Typed in the sheet' ? null : 'the edit was missed';
+});
+
+probe('a deployment missing new columns gains them on first use', () => {
+  const { box, admin } = bootedSandbox();
+  const tab = box.__tabs.get('Tenants');
+  const col = tab.headers.indexOf('gstin');
+  tab.headers.splice(col, 1);
+  box.__tabs.get('Settings').rows = box.__tabs.get('Settings').rows.filter(r => r[0] !== 'upi_id');
+  box.__props.delete('SCHEMA_HASH');
+  const t = box.handle('create', { table: 'Tenants', data: { full_name: 'G', phone: '9', gstin: '29ABCDE1234F1Z5' } }, admin);
+  if (!t.ok) return t.error;
+  if (!box.__tabs.get('Tenants').headers.includes('gstin')) return 'the column was not added';
+  if (rowOf(box, 'Tenants', t.data.row.id).gstin !== '29ABCDE1234F1Z5') return 'the value was dropped';
+  return box.readSettings().upi_id !== undefined ? null : 'the new setting was not added';
+});
+
+console.log('\n— meter readings —');
+probe('a round of readings bills occupied units and records vacant ones', () => {
+  const { box, c, prop, unit, tenant } = billedLease();
+  const empty = c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'B' } }).data.row;
+  const r = c('billMeterReadings', { property_id: prop.id, category: 'Electricity', rate: 8.5,
+    reading_date: box.today(), due_date: shift(box.today(), 7), readings: [
+      { unit_id: unit.id, previous_reading: 1000, current_reading: 1142 },
+      { unit_id: empty.id, previous_reading: 50, current_reading: 60 }
+    ] });
+  if (!r.ok) return r.error;
+  const problems = [];
+  if (r.data.invoices.length !== 1) problems.push(r.data.invoices.length + ' invoices');
+  const inv = r.data.invoices[0];
+  if (inv && (inv.tenant_id !== tenant.id || Number(inv.total) !== 1207 || inv.type !== 'Electricity')) {
+    problems.push(`invoice ${inv.tenant_id} ${inv.total} ${inv.type}`);
+  }
+  const line = box.readTable('InvoiceItems').find(i => inv && i.invoice_id === inv.id);
+  if (!line || Number(line.quantity) !== 142 || !/1000 → 1142/.test(line.description)) problems.push('line ' + JSON.stringify(line));
+  const readings = box.readTable('MeterReadings');
+  if (readings.length !== 2) problems.push(readings.length + ' readings stored');
+  if (!readings.some(x => x.unit_id === empty.id && !x.invoice_id)) problems.push('the vacant reading was not kept');
+  if (c('remove', { table: 'Units', id: empty.id }).ok) problems.push('a unit with readings was deleted');
+  return problems.length ? problems.join('; ') : null;
+});
+
+probe('a reading lower than the last one is refused', () => {
+  const { box, c, prop, unit } = billedLease();
+  const r = c('billMeterReadings', { property_id: prop.id, category: 'Water', rate: 1, reading_date: box.today(),
+    readings: [{ unit_id: unit.id, previous_reading: 500, current_reading: 400 }] });
+  return r.ok ? 'accepted a meter running backwards' : (box.readTable('MeterReadings').length ? 'stored anyway' : null);
+});
+
+console.log('\n— records that point at a tenant —');
+probe('a tenant with maintenance tickets or documents cannot be deleted', () => {
+  const { box, admin } = bootedSandbox();
+  const c = (a, p) => box.handle(a, p, admin);
+  const prop = c('create', { table: 'Properties', data: { name: 'P' } }).data.row;
+  const t1 = c('create', { table: 'Tenants', data: { full_name: 'A', phone: '1' } }).data.row;
+  const t2 = c('create', { table: 'Tenants', data: { full_name: 'B', phone: '2' } }).data.row;
+  c('create', { table: 'Maintenance', data: { property_id: prop.id, tenant_id: t1.id, title: 'Leak' } });
+  c('create', { table: 'Documents', data: { entity_type: 'Tenant', entity_id: t2.id, title: 'ID', url: 'https://x' } });
+  const a = c('remove', { table: 'Tenants', id: t1.id }), b = c('remove', { table: 'Tenants', id: t2.id });
+  return a.ok || b.ok ? 'deleted a tenant other records point at' : null;
+});
+
+console.log('\n— time zones —');
+probe('dates survive a spreadsheet in a different time zone from the script', () => {
+  const { box, admin } = bootedSandbox({ scriptTz: 'Asia/Kolkata', sheetTz: 'Australia/Sydney' });
+  const c = (a, p) => box.handle(a, p, admin);
+  const t = c('create', { table: 'Tenants', data: { full_name: 'Z', phone: '9' } }).data.row;
+  const exp = c('create', { table: 'Expenses', data: { property_id: 'x', date: '2026-03-01', amount: 1, description: 'a' } }).data.row;
+  if (rowOf(box, 'Expenses', exp.id).date !== '2026-03-01') return 'read back as ' + rowOf(box, 'Expenses', exp.id).date;
+  for (let i = 0; i < 3; i++) c('update', { table: 'Expenses', id: exp.id, data: { description: 'edit ' + i } });
+  const after = rowOf(box, 'Expenses', exp.id).date;
+  if (after !== '2026-03-01') return 'the date drifted to ' + after + ' after three saves';
+  return c('bootstrap', {}).data.timezones.sheet === 'Australia/Sydney' ? null : 'time zones not reported';
 });
 
 console.log('\n' + '─'.repeat(60));

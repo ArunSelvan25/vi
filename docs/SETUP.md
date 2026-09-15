@@ -63,9 +63,9 @@ Your site lands at `https://<you>.github.io/<repo>/`.
 ## 5 · First run
 
 1. Open the site. The setup wizard asks for the Web App URL — paste it and press **Connect**.
-2. The script creates all 12 tabs and their headers.
+2. The script creates all 13 tabs and their headers.
 3. Create the first administrator: **name, phone number, and a password of at
-   least 8 characters**. The phone number is what you sign in with — email is
+   least 10 characters**. The phone number is what you sign in with — email is
    optional. Country code is optional too; `+91 98800 11111` and `9880011111`
    are treated as the same number.
 4. Sign in. You're live.
@@ -155,23 +155,54 @@ files in place.
 
 ---
 
-## Optional · Automatic rent reminders
+## Recommended · Daily automation
 
-1. In the Apps Script editor open **Triggers** (the clock icon) → **Add trigger**.
-2. Function: `dailyReminderJob` · Event source: **Time-driven** · **Day timer** ·
-   pick an hour (e.g. 8–9am).
-3. In the app: **Settings → Scheduled reminders → `true`**, and set how many days
-   before the due date to send.
+In the spreadsheet: **Property Manager → Install daily automation**. It adds two
+time-driven triggers, once (running it again changes nothing):
 
-Tenants with an email address get a reminder as their rent approaches, and a
-differently-worded note once it is overdue. Gmail's free quota is 100
-recipients/day, which is plenty for a private portfolio.
+| Trigger | When | What it does |
+|---|---|---|
+| `dailyMaintenanceJob` | ~5am | Marks invoices overdue, adds late fees, expires leases, updates occupancy |
+| `dailyReminderJob` | ~9am | Emails reminders — only if **Settings → Scheduled reminders** is `true` |
 
-## Optional · Nightly invoice generation
+Without the triggers the app still works: the first time anyone opens it each
+day does the housekeeping, and every other load that day is read-only.
 
-Add a second time-driven trigger on `menuGenerate` to raise rent invoices
+### Rent reminders
+
+Turn on **Settings → Scheduled reminders**. Reminders keep to a schedule rather
+than going out every day:
+
+- **Remind this many days before due** (default 3), and again on the due date;
+- **Remind on these days overdue** (default `1, 7, 14, 30`).
+
+Each tenant gets **one email listing everything they owe**, with your UPI ID if
+you set one, and no invoice is reminded about twice in a day — however often
+someone presses *Send reminders*. The button sends for everything due within
+the reminder window. Tenants without an email are skipped. Gmail's free quota is
+100 recipients/day.
+
+### Nightly invoice generation
+
+Add a time-driven trigger on `menuGenerate` to raise rent invoices
 automatically. It is safe to run daily — periods that already have an invoice
-are skipped.
+are skipped — and it goes by each lease's dates, so a lease that starts on a day
+nobody opens the app is still billed that night.
+
+## Optional · GST, UPI and WhatsApp
+
+In **Settings**:
+
+- **Your GSTIN** — invoices that carry GST print as *Tax invoice*, with your
+  GSTIN, the tenant's (set it on the tenant), the SAC code, the place of supply
+  and CGST + SGST or IGST. For renting property the place of supply is where the
+  property is, so fill in each property's **state** (name, `KA`, or `29`).
+- **GST on rent %** is set per lease (18 for commercial, 0 for a home) and is
+  added to rent invoices and late fees. Any invoice line can carry its own rate.
+- **UPI ID** — shown on invoices and reminders, with a *Pay via UPI* link that
+  opens the payer's UPI app on a phone.
+- **Country code for WhatsApp** — invoices, receipts and statements have a
+  *WhatsApp* button that opens a chat with the tenant, message filled in.
 
 ---
 
@@ -184,6 +215,10 @@ are skipped.
 | Changes to `Code.gs` have no effect | You created a new deployment instead of a **new version** of the existing one. |
 | *"Your session expired"* | Sessions last `session_hours` (default 12). Just sign in again. |
 | Setup says tables exist but you have no login | Someone already seeded a user. Recover it from the **Users** tab, or clear that tab and re-run setup. |
+| *"… was changed by someone else after you opened it"* | Another person saved the same record first. Close the form, open it again to see their change, and redo yours. |
+| *"Invoice … has been issued, so it cannot be deleted"* | Issued invoices keep their number. Use **Void** (with a reason) instead. Only drafts can be deleted. |
+| Settings shows a time-zone warning | The sheet and the script are in different zones. Set both to the same one (sheet: File → Settings; script: Project Settings). |
+| Every date is a day early | Only happens with an older `Code.gs` and a sheet in a different time zone. Update `Code.gs` (new version). |
 | Everything is slow | Google Sheets is the bottleneck. The app fetches everything in one call and caches it; press the refresh icon only when you need fresh data. |
 
 ## Security, honestly
@@ -201,7 +236,8 @@ signature. Password hashes and salts are never sent to the browser.
 | Guard | Behaviour |
 |---|---|
 | Setup takeover | `setup` refuses to create an admin once one exists, and performs **no writes at all** for an unauthenticated caller |
-| Brute force | 5 failed sign-ins per account, or 30 across all accounts, trigger a 15-minute lockout |
+| Brute force | After 4 wrong passwords a number is locked out, for 30 s, then 1 min, 2 min … up to 30 min per further failure. Someone else's failures never lock out a person typing the right password |
+| Password spraying | While failures across all accounts run unusually high (over 100 in 15 min), each targeted number locks after its first wrong guess |
 | Account enumeration | Unknown / disabled / wrong-password all return one identical message |
 | Timing | Password comparison is constant-time, and an unknown address still costs a hash |
 
@@ -275,7 +311,12 @@ type can match. One run of *Recover admin access* fixes it.
 - Sessions live in `localStorage` and last `session_hours` (default 12), but
   every request re-checks the account against the sheet, so disabling or
   demoting someone takes effect at once rather than when their token expires.
-- **Concurrent edits are last-write-wins.** Two people saving the same record in
-  the same minute will overwrite each other; the audit log shows what happened.
+- **Two people editing the same record:** the second save is refused with a
+  message, rather than silently overwriting the first. Every write also runs
+  under one script-wide lock, so two payments at the same moment cannot both
+  squeeze into one balance.
+- **New columns arrive by themselves.** After you update `Code.gs`, the first
+  signed-in request adds any columns and settings the new version needs; there
+  is no need to re-run setup.
 
 Do not use this to store payment card data.

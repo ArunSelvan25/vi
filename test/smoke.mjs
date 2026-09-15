@@ -53,6 +53,51 @@ await step('first run shows setup wizard', async () => {
   if (!/Connect your Google Sheet/.test(t)) throw new Error('got: ' + t);
 });
 
+await step('the wizard creates the first administrator on a fresh sheet', async () => {
+  // The wizard only accepts a real Apps Script URL, so answer for one here —
+  // with exactly what Code.gs says to an unconfigured sheet. The mock API
+  // always claims to be set up already, which is how this path broke unseen.
+  const FAKE = 'https://script.google.com/macros/s/TEST-DEPLOYMENT/exec';
+  const seen = [];
+  await page.setRequestInterception(true);
+  const answer = (req) => {
+    if (!req.url().startsWith(FAKE)) return req.continue();
+    if (req.method() === 'OPTIONS') throw new Error('the API call needed a CORS preflight');
+    const { action, payload } = JSON.parse(req.postData() || '{}');
+    seen.push(action);
+    const reply = action === 'ping' ? { ok: true, data: { service: 'vi-property-manager' } }
+      : action === 'setup' && !payload.adminPhone
+        ? { ok: false, error: 'Provide adminPhone — it is the sign-in credential' }
+        : action === 'setup' ? { ok: true, data: { adminCreated: true, alreadySeeded: false } }
+        : { ok: false, error: 'AUTH_REQUIRED' };
+    req.respond({ status: 200, contentType: 'application/json',
+                  headers: { 'Access-Control-Allow-Origin': '*' }, body: JSON.stringify(reply) });
+  };
+  page.on('request', answer);
+  try {
+    await page.type('.auth-card input[type=url]', FAKE);
+    await page.evaluate(() => [...document.querySelectorAll('.auth-card button')]
+      .find(b => /^Connect$/.test(b.textContent.trim())).click());
+    await page.waitForFunction(() => {
+      const btn = [...document.querySelectorAll('.auth-card button')].find(b => /Create admin/.test(b.textContent));
+      return btn && !btn.hidden;
+    }, { timeout: 5000 }).catch(async () => {
+      const shown = await page.$eval('.auth-card .form-error', e => e.hidden ? '(none)' : e.textContent);
+      throw new Error('the admin form never appeared; error shown: ' + shown);
+    });
+    await page.type('.auth-card input[type=tel]', '9880011111');
+    await page.type('.auth-card input[type=password]', 'first-admin-pass');
+    await page.evaluate(() => [...document.querySelectorAll('.auth-card button')]
+      .find(b => /Create admin/.test(b.textContent)).click());
+    await page.waitForFunction(() => /Sign in/.test(document.querySelector('.auth-card h2')?.textContent || ''),
+                               { timeout: 5000 });
+    if (seen.filter(a => a === 'setup').length !== 2) throw new Error('setup calls: ' + seen.join(','));
+  } finally {
+    page.off('request', answer);
+    await page.setRequestInterception(false);
+  }
+});
+
 // Seed the API URL the way the wizard would, then reload into the login screen.
 await page.evaluate(url => localStorage.setItem('vipm.apiUrl', url), BASE + '/api');
 await page.reload({ waitUntil: 'networkidle0' });
@@ -110,19 +155,22 @@ await step('charts render as SVG', async () => {
   if (donut < 2) throw new Error('no donut segments');
 });
 await step('cash-flow months align with their data (timezone regression)', async () => {
-  // Mock data: Jul income 28000, Aug expense 32000, Sep income 25000 + expense 6500.
   // A toISOString()-based month key shifts every bucket back one month in +offset zones.
   const series = await page.evaluate(async () => {
     const { store } = await import('/assets/js/store.js');
     return store.monthlySeries(6).map(m => ({ key: m.key, label: m.label, income: m.income, expense: m.expense }));
   });
-  const by = Object.fromEntries(series.map(m => [m.label, m]));
   console.log('    ' + series.map(m => `${m.label}(${m.key}) in=${m.income} out=${m.expense}`).join(' '));
-  if (by.Jul.income !== 28000) throw new Error('Jul income should be 28000, got ' + by.Jul.income);
-  if (by.Aug.expense !== 32000) throw new Error('Aug expense should be 32000, got ' + by.Aug.expense);
-  if (by.Sep.income !== 25000) throw new Error('Sep income should be 25000, got ' + by.Sep.income);
-  if (by.Sep.expense !== 6500) throw new Error('Sep expense should be 6500, got ' + by.Sep.expense);
-  if (by.Jul.key !== '2026-07') throw new Error('Jul bucket keyed as ' + by.Jul.key);
+  // the dev data is dated relative to today: rent paid two months ago, tax last
+  // month, a part payment and a repair this month
+  const [twoAgo, lastMonth, thisMonth] = series.slice(-3);
+  const now = new Date();
+  const keyOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  if (twoAgo.income !== 28000) throw new Error(twoAgo.label + ' income should be 28000, got ' + twoAgo.income);
+  if (lastMonth.expense !== 32000) throw new Error(lastMonth.label + ' expense should be 32000, got ' + lastMonth.expense);
+  if (thisMonth.income !== 25000) throw new Error(thisMonth.label + ' income should be 25000, got ' + thisMonth.income);
+  if (thisMonth.expense !== 6500) throw new Error(thisMonth.label + ' expense should be 6500, got ' + thisMonth.expense);
+  if (twoAgo.key !== keyOf(new Date(now.getFullYear(), now.getMonth() - 2, 1))) throw new Error('bucket keyed as ' + twoAgo.key);
 });
 
 await step('money formatting (sign, symbol, Indian grouping)', async () => {
@@ -504,6 +552,173 @@ await step('P&L table totals correctly', async () => {
   const cells = await page.$$eval('.total-row td', n => n.map(c => c.textContent));
   console.log('    totals row: ' + cells.join(' | '));
   if (cells.length !== 8) throw new Error('unexpected total row shape');
+});
+
+console.log('\n— money and leasing workflows —');
+
+const clickText = (selector, re) => page.evaluate((sel, src) => {
+  const btn = [...document.querySelectorAll(sel)].find(b => new RegExp(src, 'i').test(b.textContent));
+  if (!btn) return false;
+  btn.click();
+  return true;
+}, selector, re.source);
+const closeModal = async () => {
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 5000 });
+};
+const rowAction = (rowText, title) => page.evaluate((txt, t) => {
+  const row = [...document.querySelectorAll('.data-table tbody tr')].find(r => r.textContent.includes(txt));
+  const btn = row && row.querySelector(`.row-actions button[title="${t}"]`);
+  if (!btn) return false;
+  btn.click();
+  return true;
+}, rowText, title);
+
+await step('the invoice editor prices GST per line', async () => {
+  await go('invoices', 'Invoices');
+  await clickText('button', /New invoice/);
+  await page.waitForSelector('.line-editor', { timeout: 5000 });
+  const row = (await page.$$('.line-row'))[0];
+  const u = await row.$('.line-unit'); await u.click({ clickCount: 3 }); await u.type('10000');
+  const g = await row.$('.line-gst'); await g.click({ clickCount: 3 }); await g.type('18');
+  await new Promise(r => setTimeout(r, 150));
+  const totals = await page.$$eval('.line-totals .kv strong', n => n.map(x => x.textContent));
+  if (!/1,800/.test(totals[1]) || !/11,800/.test(totals[2])) throw new Error('totals: ' + totals.join(' | '));
+  if (!await clickText('.modal-foot .btn', /Save as draft/)) throw new Error('no Save as draft button');
+  await closeModal();
+});
+
+await step('an invoice can be shared on WhatsApp and paid by UPI', async () => {
+  await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    store.settings.upi_id = 'vilifestyle@okhdfc';
+  });
+  await page.evaluate(() => [...document.querySelectorAll('.data-table tbody tr')]
+    .find(r => /INV-00002/.test(r.textContent)).click());
+  await page.waitForSelector('.invoice-doc', { timeout: 5000 });
+  const links = await page.$$eval('.modal a', a => a.map(x => x.getAttribute('href')));
+  if (!links.some(h => /^https:\/\/wa\.me\/919880011111\?text=/.test(h))) throw new Error('no WhatsApp link: ' + links.join(' '));
+  if (!links.some(h => /^upi:\/\/pay\?pa=vilifestyle%40okhdfc.*am=28500\.00/.test(h))) throw new Error('no UPI link: ' + links.join(' '));
+  await closeModal();
+});
+
+await step('an issued invoice is voided with a reason, not deleted', async () => {
+  await go('invoices', 'Invoices');
+  if (await rowAction('INV-00002', 'Delete')) throw new Error('an issued invoice offers Delete');
+  if (!await rowAction('INV-00002', 'Void')) throw new Error('no Void action on INV-00002');
+  await page.waitForSelector('.modal textarea', { timeout: 5000 });
+  await page.type('.modal textarea', 'Raised in error');
+  await clickText('.modal-foot .btn', /Void invoice/);
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 8000 });
+  await new Promise(r => setTimeout(r, 300));
+  const row = await page.evaluate(() => [...document.querySelectorAll('.data-table tbody tr')]
+    .find(r => /INV-00002/.test(r.textContent))?.textContent);
+  if (!/Void/.test(row)) throw new Error('row reads: ' + row);
+});
+
+await step('meter readings bill the occupied units in one go', async () => {
+  await go('meters', 'Meter readings');
+  await page.waitForSelector('.meter-table', { timeout: 5000 });
+  const prev = await page.$eval('tr[data-unit="UNT-00001"] .meter-prev', e => e.value);
+  if (prev !== '10382') throw new Error('previous reading not carried over: ' + prev);
+  const rate = await page.$('.panel .form-grid input[type=number]');
+  await rate.type('8.5');
+  await page.type('tr[data-unit="UNT-00001"] .meter-cur', '10500');
+  await new Promise(r => setTimeout(r, 150));
+  const amount = await page.$eval('tr[data-unit="UNT-00001"] .meter-amount', e => e.textContent);
+  if (!/1,003/.test(amount)) throw new Error('amount shows ' + amount);
+  await clickText('button', /Save & bill/);
+  // billed once the new reading is in the store and the screen has redrawn
+  await page.waitForFunction(async () => {
+    const { store } = await import('/assets/js/store.js');
+    return store.meterReadings.length >= 2 && !document.querySelector('.meter-cur')?.value;
+  }, { timeout: 10000, polling: 200 });
+  const invoices = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    return store.invoices.filter(i => i.type === 'Electricity' && i.tenant_id === 'TNT-00001').map(i => i.total);
+  });
+  if (!invoices.includes(1003)) throw new Error('no electricity invoice: ' + JSON.stringify(invoices));
+});
+
+await step('an expiring lease is renewed from the dashboard, deposit carried over', async () => {
+  // the dashboard has no page heading for go() to wait on
+  await page.evaluate(() => { location.hash = '#/dashboard'; });
+  await page.waitForFunction(() => [...document.querySelectorAll('.panel')]
+    .find(p => /Leases expiring/.test(p.textContent))?.querySelector('.list-row'), { timeout: 5000 });
+  await page.evaluate(() => [...document.querySelectorAll('.panel')].find(p => /Leases expiring/.test(p.textContent))
+    .querySelector('.list-row').click());
+  await page.waitForSelector('.modal', { timeout: 5000 });
+  const title = await page.$eval('.modal h2', e => e.textContent);
+  if (!/Renew lease · LSE-00002/.test(title)) throw new Error('opened ' + title);
+  await clickText('.modal-foot .btn', /Renew lease/);
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 8000 });
+  const state = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    const n = store.leases.find(l => l.renewed_from === 'LSE-00002');
+    return { n: n && { status: n.deposit_status, amount: n.deposit_amount }, old: store.byId('leases', 'LSE-00002').deposit_status,
+             held: store.stats.deposits_held };
+  });
+  if (!state.n || state.n.status !== 'Held' || Number(state.n.amount) !== 450000) throw new Error(JSON.stringify(state));
+  if (state.old !== 'Transferred') throw new Error('old lease deposit ' + state.old);
+  if (state.held !== 600000) throw new Error('deposits held changed to ' + state.held);
+});
+
+await step('a deposit is settled at move-out: deductions, refund, lease ended', async () => {
+  await go('leases', 'Leases');
+  if (!await rowAction('LSE-00001', 'Settle deposit')) throw new Error('no Settle deposit action on LSE-00001');
+  await page.waitForSelector('.deduction-row', { timeout: 5000 });
+  await page.type('.deduction-row .ded-desc', 'Repainting');
+  await page.type('.deduction-row .ded-amount', '5000');
+  await new Promise(r => setTimeout(r, 150));
+  const summary = await page.$eval('.settle-summary', e => e.textContent);
+  if (!/Refund to tenant/.test(summary)) throw new Error('no summary: ' + summary);
+  await clickText('.modal-foot .btn', /Settle deposit/);
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 8000 });
+  const after = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    const l = store.byId('leases', 'LSE-00001');
+    return { status: l.status, deposit: l.deposit_status, held: store.depositLedger(l).held,
+             refund: store.expenses.filter(e => e.category === 'Deposit Refund' && e.reference === 'LSE-00001').map(e => e.amount) };
+  });
+  if (after.status !== 'Terminated' || after.held !== 0 || !after.refund.length) throw new Error(JSON.stringify(after));
+});
+
+await step('a tenant statement and a payment receipt open and print', async () => {
+  await page.evaluate(() => { location.hash = '#/tenants/TNT-00001'; });
+  await page.waitForSelector('.stat-row', { timeout: 5000 });
+  await clickText('.head-actions .btn', /Statement/);
+  await page.waitForSelector('.statement-table', { timeout: 5000 });
+  const txt = await page.$eval('.statement-table', e => e.textContent);
+  if (!/Opening balance/.test(txt) || !/Closing balance/.test(txt)) throw new Error('statement incomplete');
+  await closeModal();
+  await go('payments', 'Payments');
+  await page.evaluate(() => document.querySelector('.data-table tbody tr').click());
+  await page.waitForSelector('.receipt-body', { timeout: 5000 });
+  const kind = await page.$eval('.doc-kind', e => e.textContent);
+  if (!/receipt/i.test(kind)) throw new Error('opened ' + kind);
+  await closeModal();
+});
+
+await step('a save over someone else\'s change is refused, not silently lost', async () => {
+  await go('tenants', 'Tenants');
+  if (!await rowAction('Karthik', 'Edit')) throw new Error('no Edit action');
+  await page.waitForSelector('#f_occupation', { timeout: 5000 });
+  // someone else saves the same tenant while the form is open
+  await page.evaluate(async () => {
+    const res = await fetch('/api', { method: 'POST', body: JSON.stringify({
+      action: 'update', token: localStorage.getItem('vipm.token'),
+      payload: { table: 'Tenants', id: 'TNT-00002', data: { occupation: 'Architect' } } }) });
+    const body = await res.json();
+    if (!body.ok) throw new Error(body.error);
+  });
+  const occ = await page.$('#f_occupation');
+  await occ.click({ clickCount: 3 }); await occ.type('Chef');
+  await clickText('.modal-foot .btn', /Save changes/);
+  await page.waitForFunction(() => {
+    const e = document.querySelector('.entity-form .form-error');
+    return e && !e.hidden && /changed by someone else/.test(e.textContent);
+  }, { timeout: 8000 });
+  await closeModal();
 });
 
 console.log('\n— theme & responsive —');

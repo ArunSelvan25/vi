@@ -1,6 +1,6 @@
 import { el, modal, toast } from '../ui.js';
 import { store } from '../store.js';
-import { entities, formFields } from '../schema.js';
+import { entities, formFields, GSTIN_PATTERN } from '../schema.js';
 
 /** Build one input from a schema field. */
 function inputFor(field, value, form) {
@@ -27,10 +27,12 @@ function inputFor(field, value, form) {
     return select;
   }
 
-  const typeMap = { money: 'number', number: 'number', date: 'date', email: 'email', tel: 'tel', url: 'url' };
+  const typeMap = { money: 'number', number: 'number', date: 'date', email: 'email', tel: 'tel', url: 'url',
+                    password: 'password' };
   return el('input', {
     ...common,
     type: typeMap[field.type] || 'text',
+    autocomplete: field.autocomplete || null,
     step: field.type === 'money' ? '0.01' : (field.type === 'number' ? '1' : null),
     value: value ?? '',
     required: field.required || null
@@ -136,11 +138,22 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
             error.textContent = 'End date cannot be before the start date.';
             return;
           }
+          const badGstin = fields.find(f => f.pattern === 'gstin' && data[f.key] &&
+            !GSTIN_PATTERN.test(String(data[f.key]).replace(/\s+/g, '').toUpperCase()));
+          if (badGstin) {
+            error.hidden = false;
+            error.textContent = `${badGstin.label}: that is not a valid GSTIN (15 characters, starting with the state code).`;
+            controls[badGstin.key].focus();
+            return;
+          }
 
           btn.disabled = true;
           btn.textContent = 'Saving…';
           try {
-            const saved = isEdit ? await store.update(entity, row.id, data) : await store.create(entity, data);
+            // the version the form was opened on: a save over someone else's is refused
+            const saved = isEdit
+              ? await store.update(entity, row.id, data, { expectedVersion: row._v })
+              : await store.create(entity, data);
             toast(`${def.singular} ${isEdit ? 'updated' : 'created'}`, 'ok');
             close();
             onSaved?.(saved);

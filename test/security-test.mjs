@@ -93,12 +93,36 @@ check('a successful sign-in clears the failure counter', () => {
   assert(b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '').ok,
          'counter was not reset by the successful sign-in');
 });
-check('spraying many accounts trips the global limit', () => {
+check('failures on other accounts never lock out someone with the right password', () => {
+  // The old global limit let anyone lock the whole business out with 30 bad
+  // sign-ins. Nothing anyone else does may stop a correct sign-in.
   const b = makeSandbox();
   b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
-  for (let i = 0; i < 31; i++) b.handle('login', { phone: `90000${String(i).padStart(5, '0')}`, password: 'x' }, '');
-  const r = b.handle('login', { phone: '9111111111', password: 'x' }, '');
-  assert(/Too many/.test(r.error), 'global spray limit never tripped: ' + JSON.stringify(r));
+  for (let i = 0; i < 150; i++) b.handle('login', { phone: `90000${String(i).padStart(5, '0')}`, password: 'x' }, '');
+  const r = b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '');
+  assert(r.ok, 'a real user was locked out by strangers: ' + JSON.stringify(r));
+});
+check('while spraying is under way, each targeted account locks after one wrong guess', () => {
+  const b = makeSandbox();
+  b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  for (let i = 0; i < 101; i++) b.handle('login', { phone: `90000${String(i).padStart(5, '0')}`, password: 'x' }, '');
+  b.handle('login', { phone: '9111111111', password: 'guess-1' }, '');
+  const r = b.handle('login', { phone: '9111111111', password: 'guess-2' }, '');
+  assert(/Too many/.test(r.error), 'second guess during a spray was not throttled: ' + JSON.stringify(r));
+});
+check('each further failure locks the account for longer', () => {
+  const b = makeSandbox();
+  b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const waits = [];
+  for (let i = 0; i < 7; i++) {
+    b.handle('login', { phone: '9000000001', password: 'nope' + i }, '');
+    const state = JSON.parse(b.__cache.get(b.throttleKey('9000000001')));
+    waits.push(state.until ? state.until - Date.now() : 0);
+    b.__cache.set(b.throttleKey('9000000001'), JSON.stringify({ ...state, until: 0 }));   // let the next attempt through
+  }
+  const locked = waits.filter(w => w > 0);
+  assert(locked.length === 3, 'expected 3 lockouts after 4 free attempts, got ' + JSON.stringify(waits));
+  assert(locked[1] > locked[0] * 1.5 && locked[2] > locked[1] * 1.5, 'lockouts did not grow: ' + JSON.stringify(locked));
 });
 
 // ── finding 3: enumeration ──────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { el, icon, money, num, date, badge, debounce, downloadCsv, emptyState, isoDate } from '../ui.js';
+import { el, icon, money, num, date, badge, debounce, downloadCsv, emptyState, isoDate, safeUrl } from '../ui.js';
 import { store } from '../store.js';
 import { entities, tableFields } from '../schema.js';
 
@@ -15,6 +15,23 @@ export function cellValue(field, row) {
   if (field.type === 'date') return date(raw);
   if (field.type === 'number') return raw === '' || raw === undefined ? '—' : num(raw);
   return raw === '' || raw === null || raw === undefined ? '—' : String(raw);
+}
+
+/**
+ * What a cell shows on screen: its text, or for a link field an actual link.
+ * Documents are stored as links precisely so they can be opened, but the list
+ * only printed the address. Anything that is not http(s) stays plain text, so
+ * a `javascript:` value typed into a sheet can never become clickable.
+ */
+function cellContent(field, row) {
+  if (field.type === 'url') {
+    const href = safeUrl(row[field.key]);
+    if (href) {
+      return el('a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'link',
+                       onClick: (e) => e.stopPropagation() }, ['Open ↗']);
+    }
+  }
+  return cellValue(field, row);
 }
 
 function isStatusField(field) {
@@ -144,7 +161,7 @@ export function dataTable({
           onClick: onRowClick ? (e) => { if (!e.target.closest('.row-actions')) onRowClick(row); } : null
         });
         for (const c of cols) {
-          const content = isStatusField(c) ? badge(row[c.key]) : cellValue(c, row);
+          const content = isStatusField(c) ? badge(row[c.key]) : cellContent(c, row);
           tr.append(el('td', { class: c.type === 'money' || c.type === 'number' ? 'num' : null,
                                title: typeof content === 'string' ? content : null },
                       [content]));

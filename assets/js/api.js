@@ -47,6 +47,10 @@ export async function api(action, payload = {}, { signal } = {}) {
       config.clearSession();
       throw new ApiError('Your session expired. Please sign in again.', 'AUTH_REQUIRED');
     }
+    // someone else saved the same record first — the form says so and stays open
+    if (/^CONFLICT: /.test(body.error || '')) {
+      throw new ApiError(body.error.replace(/^CONFLICT: /, ''), 'CONFLICT');
+    }
     throw new ApiError(body.error || 'Unknown API error', 'API');
   }
   return body.data;

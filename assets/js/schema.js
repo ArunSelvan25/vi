@@ -16,8 +16,15 @@ export const STATUS_COLORS = {
   Unpaid: 'warn', Partial: 'warn', 'In Progress': 'warn', 'On Hold': 'warn', 'Under Maintenance': 'warn',
   Overdue: 'danger', Terminated: 'danger', Expired: 'danger', Urgent: 'danger', High: 'danger',
   Void: 'muted', Inactive: 'muted', Past: 'muted', Sold: 'muted',
-  Low: 'muted', Medium: 'info', Held: 'info', Refunded: 'ok', 'Partially Refunded': 'warn'
+  Low: 'muted', Medium: 'info', Held: 'info', Refunded: 'ok', 'Partially Refunded': 'warn',
+  Forfeited: 'muted', Transferred: 'muted', Pending: 'warn'
 };
+
+/** Utility meters that can be read and billed in bulk. */
+export const METER_CATEGORIES = ['Electricity', 'Water', 'Gas'];
+
+/** A GSTIN: 2-digit state code, PAN, entity number, Z, checksum. */
+export const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 
 /** Charge types available on an invoice line. */
 export const ITEM_CATEGORIES = [
@@ -101,6 +108,8 @@ export const entities = {
       { key: 'emergency_name', label: 'Emergency contact', type: 'text' },
       { key: 'emergency_phone', label: 'Emergency phone', type: 'tel' },
       { key: 'status', label: 'Status', type: 'select', table: true, options: ['Active', 'Prospect', 'Past'] },
+      { key: 'gstin', label: 'GSTIN (business tenants)', type: 'text', pattern: 'gstin',
+        help: 'Printed on their tax invoices. Leave blank for individuals.' },
       { key: 'notes', label: 'Notes', type: 'textarea' }
     ]
   },
@@ -121,11 +130,16 @@ export const entities = {
       { key: 'tenant_id', label: 'Tenant', type: 'ref', optionsFrom: 'tenants', required: true, table: true },
       { key: 'start_date', label: 'Start date', type: 'date', required: true, table: true },
       { key: 'end_date', label: 'End date', type: 'date', table: true },
-      { key: 'rent_amount', label: 'Rent per period', type: 'money', required: true, table: true },
+      // The backend bills rent_amount × months per period, so this must be the
+      // monthly figure: labelled "per period", a quarterly rent typed in here
+      // was billed three times over.
+      { key: 'rent_amount', label: 'Monthly rent', type: 'money', required: true, table: true,
+        help: 'Enter the rent for one month. Quarterly, half-yearly and yearly leases bill 3×, 6× or 12× this.' },
       { key: 'deposit_amount', label: 'Security deposit', type: 'money' },
       { key: 'deposit_status', label: 'Deposit status', type: 'select',
-        options: ['Pending', 'Held', 'Partially Refunded', 'Refunded'],
-        help: 'Set automatically: Pending until the deposit invoice is paid, then Held.' },
+        options: ['Pending', 'Held', 'Partially Refunded', 'Refunded', 'Forfeited', 'Transferred'],
+        help: 'Pending until the deposit invoice is paid, then Held. Choose Held for a deposit collected '
+            + 'outside the app. At move-out use "Settle deposit", which records deductions and the refund.' },
       { key: 'frequency', label: 'Billing frequency', type: 'select',
         options: ['Monthly', 'Quarterly', 'Half-Yearly', 'Yearly'] },
       // billing_day is kept as a column so existing values survive, but stays
@@ -139,6 +153,8 @@ export const entities = {
             + 'from the lease start date — a lease starting on the 5th bills on the 5th.' },
       { key: 'escalation_pct', label: 'Annual escalation %', type: 'number',
         help: 'Rent increases by this % on each lease anniversary' },
+      { key: 'gst_rate', label: 'GST on rent %', type: 'number',
+        help: 'Usually 18 for commercial property and 0 for a home. Added to every rent invoice and late fee.' },
       { key: 'status', label: 'Status', type: 'select', table: true,
         options: ['Active', 'Upcoming', 'Expired', 'Terminated'],
         help: 'Set from the dates automatically. Choose Terminated to end a lease early.' },
@@ -160,7 +176,8 @@ export const entities = {
       { key: 'unit_id', label: 'Unit', type: 'ref', optionsFrom: 'units', table: true, short: true },
       { key: 'lease_id', label: 'Lease', type: 'ref', optionsFrom: 'leases' },
       { key: 'type', label: 'Type', type: 'select', table: true,
-        options: ['Rent', 'Deposit', 'Utility', 'Late Fee', 'Maintenance', 'Other'] },
+        options: ['Rent', 'Deposit', 'Deposit Deduction', 'Electricity', 'Water', 'Gas', 'Mixed',
+                  'Late Fee', 'Maintenance', 'Other'] },
       { key: 'period_start', label: 'Period start', type: 'date' },
       { key: 'period_end', label: 'Period end', type: 'date' },
       { key: 'issue_date', label: 'Issue date', type: 'date' },
@@ -191,7 +208,7 @@ export const entities = {
       { key: 'property_id', label: 'Property', type: 'ref', optionsFrom: 'properties', table: true },
       { key: 'amount', label: 'Amount', type: 'money', required: true, table: true },
       { key: 'method', label: 'Method', type: 'select', table: true,
-        options: ['Cash', 'Bank Transfer', 'UPI', 'Card', 'Cheque', 'Other'] },
+        options: ['Cash', 'Bank Transfer', 'UPI', 'Card', 'Cheque', 'Deposit Adjustment', 'Other'] },
       { key: 'reference', label: 'Reference / txn no.', type: 'text', table: true },
       { key: 'received_by', label: 'Received by', type: 'text' },
       { key: 'notes', label: 'Notes', type: 'textarea' }
@@ -271,13 +288,36 @@ export const entities = {
       { key: 'category', label: 'Category', type: 'select', table: true,
         options: ['Lease Agreement', 'ID Proof', 'Insurance', 'Tax Receipt', 'Utility Bill',
                   'Inspection', 'NOC', 'Other'] },
-      { key: 'url', label: 'File link', type: 'url', required: true, help: 'Share a Google Drive / Dropbox link' },
+      { key: 'url', label: 'File link', type: 'url', required: true, table: true,
+        help: 'Share a Google Drive / Dropbox link' },
       { key: 'issue_date', label: 'Issued', type: 'date' },
       { key: 'expiry_date', label: 'Expires', type: 'date', table: true,
         help: 'Documents expiring within 60 days appear on the dashboard' },
       { key: 'notes', label: 'Notes', type: 'textarea' }
     ]
   }
+};
+
+// Meter readings are entered and billed in bulk from the Meter readings screen;
+// the definition drives that screen's history table and its CSV export.
+entities.meterReadings = {
+  table: 'MeterReadings',
+  title: 'Meter readings',
+  singular: 'Reading',
+  icon: 'bolt',
+  labelKey: 'id',
+  search: ['id', 'category'],
+  fields: [
+    { key: 'reading_date', label: 'Date', type: 'date', table: true },
+    { key: 'unit_id', label: 'Unit', type: 'ref', optionsFrom: 'units', table: true },
+    { key: 'category', label: 'Meter', type: 'select', table: true, options: METER_CATEGORIES },
+    { key: 'previous_reading', label: 'Previous', type: 'number', table: true },
+    { key: 'current_reading', label: 'Current', type: 'number', table: true },
+    { key: 'consumption', label: 'Units used', type: 'number', table: true },
+    { key: 'rate', label: 'Rate', type: 'money', table: true },
+    { key: 'amount', label: 'Amount', type: 'money', table: true },
+    { key: 'invoice_id', label: 'Invoice', type: 'ref', optionsFrom: 'invoices', table: true }
+  ]
 };
 
 /** Fields shown in the create/edit form. */

@@ -34,6 +34,10 @@
   when an invoice on that lease goes overdue.
 - **Annual escalation %** — rent compounds automatically on each lease
   anniversary, so a 3-year lease at 5% bills correctly without you touching it.
+  The rent roll, property and tenant pages show the rent in force today.
+- **Renew a lease** from the lease list, a tenant's page, or by clicking it in
+  the dashboard's *Leases expiring* list: it starts the day after, suggests this
+  year's escalated rent, and carries the deposit over so it is counted once.
 - Status maintained automatically from the dates: Upcoming → Active → Expired,
   plus manual Terminated. It updates the moment a lease is saved, not on the
   next page load.
@@ -65,23 +69,54 @@
 - **Part payments handled properly** — paid, balance and status (Unpaid →
   Partial → Paid) are recomputed on the server from the payment records, so the
   numbers can't drift out of sync.
-- Overdue detection runs on every load.
+- Overdue detection, late fees and lease expiry run once a day — on the daily
+  trigger, or on the first load of the day without one.
 - **A payment covering several months is spread automatically** across that
   tenant's outstanding invoices, oldest due first. More than the tenant owes in
   total is refused, so no balance can ever go negative and understate arrears.
-- **Refunding a deposit records the expense**, so the money leaving the business
-  appears in the P&L rather than the liability simply vanishing.
+- **Deposits are held money, not income.** Receiving a deposit does not count as
+  collected rent, and returning one is not an operating expense; the dashboard's
+  *Deposits held* is what is still owed back to tenants, worked out from the
+  records.
+- **Settle a deposit at move-out** in one step: apply it to the tenant's unpaid
+  invoices, charge deductions (repainting, damage) on a *Deposit Deduction*
+  invoice paid from the deposit, refund the rest, and optionally end the lease.
+  What is kept becomes income through the invoices it pays; deductions larger
+  than the deposit leave the tenant owing the difference.
+- **Changing a deposit re-prices its invoice**, never below what has been paid.
+- **Invoices are voided, not deleted.** An issued invoice keeps its number
+  forever; *Void* needs a reason and leaves nothing owed. Only drafts can be
+  deleted, and **an invoice number is never reused** — not even after the newest
+  one is removed.
+- **Drafts** — save an invoice as a draft, and issue it when ready. A draft is
+  not owed and cannot take a payment.
+- **GST** — a rate per invoice line and per lease; CGST + SGST within the state,
+  IGST across states, from the property's state and your GSTIN. Registered
+  businesses get a printed *Tax invoice*.
+- **Payments page** entries are checked and settle their invoice exactly like
+  payments recorded from the invoice.
+- **Printable receipts** for every payment, and **tenant statements** for any
+  date range — opening balance, each charge and payment, running and closing
+  balance, and the deposit position.
+- **WhatsApp and UPI** — share an invoice, receipt, statement or balance on
+  WhatsApp with the message written; *Pay via UPI* opens the tenant's UPI app
+  with the amount filled in.
 - **"Deposits held" means money actually received** — an unpaid deposit shows as
   outstanding, not as a liability you are holding.
 - **Deleting a payment puts the invoice back**, restoring its balance and status.
 - **Records other rows depend on cannot be deleted.** Deleting a tenant with a
   lease, a unit with a lease, or an invoice with a payment against it is refused
-  with a message naming what is in the way. Deleting an invoice does remove its
-  own line items, since they are part of it.
+  with a message naming what is in the way. So is deleting a tenant with
+  maintenance tickets or documents, or a unit with meter readings. Deleting a
+  draft invoice removes its own line items, since they are part of it.
 - **Printable invoice / receipt** — opens in the app, prints to paper or PDF via
   the browser, showing the payment history.
-- **Automated rent reminders by email** — a friendly note before the due date, a
-  firmer one after, sent from your own Gmail via a daily trigger.
+- **Automated rent reminders by email** on a schedule — N days before, on the
+  due date, and on chosen days overdue — one email per tenant listing everything
+  they owe, never repeated the same day.
+- **Meter readings** — read every electricity, water or gas meter in a property
+  on one screen. Previous readings carry over; occupied units are billed to their
+  tenant in one click; vacant units' readings are kept for the next tenant.
 
 ## Maintenance
 
@@ -111,8 +146,9 @@
 
 ## Dashboard
 
-- Six live KPIs: monthly rent roll, collected this month, outstanding (with
-  overdue split out), occupancy rate, open tickets, deposits held.
+- Six live KPIs: monthly rent roll (with escalation), collected this month
+  (compared with the same point last month), outstanding (with overdue split
+  out), occupancy rate, open tickets, deposits held.
 - 6-month cash-flow chart, income against expenses.
 - Occupancy donut.
 - Rent arrears ranked by size, with the oldest debt flagged.
@@ -130,6 +166,10 @@
 - **Arrears ageing** — not yet due / 1–30 / 31–60 / 61–90 / 90+ days.
 - Top debtors.
 - CSV export of the P&L, and of any table in the app.
+- The cash-flow chart and top debtors follow the date range and property filter;
+  yield is annualised, so a nine-month range is not read as a full year.
+- **Owner statements** — for each owner, per-property income, expenses, net,
+  arrears and deposits held for the range, printable or as CSV.
 
 ## Platform
 
@@ -170,6 +210,12 @@ Honest about what the current features do *not* do:
 - **A sold property's history stays in the reports** while dropping out of the
   dashboard headline figures. That is deliberate: past income and costs remain
   true.
+- **A late fee on an invoice raised already overdue** (other than by *Generate
+  rent*) is added at the next day's housekeeping, not the moment it is saved.
+- **Meter readings bill a separate invoice** per unit rather than adding a line
+  to that month's rent invoice.
+- **No QR code** for UPI on printed invoices — the UPI ID and a *Pay via UPI*
+  link are shown instead.
 
 ## Deliberately not included
 
@@ -178,8 +224,10 @@ Being straight about the boundaries of a free, static + Sheets stack:
 - **No tenant-facing portal or online rent collection.** There's no payment
   gateway; you record payments that happened elsewhere.
 - **No file uploads.** Documents are links, because Sheets is not a file store.
-- **No real-time multi-user sync.** Two people editing the same record in the
-  same minute can overwrite each other; the audit log will show it.
+- **No real-time multi-user sync.** Screens show data as of the last load or
+  save. Two people editing the same record cannot overwrite each other — the
+  second save is refused — but neither sees the other's change until they
+  refresh.
 - **Not built for thousands of units.** The whole workbook loads into the
   browser. It's comfortable into the low thousands of rows and slows after that.
 - **Not a substitute for accounting software** at tax time — export the CSVs.
