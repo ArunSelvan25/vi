@@ -43,10 +43,25 @@ export function reportsView() {
   ]);
 
   const body = el('div');
-  wrap.append(el('div', { class: 'view-head' }, [
-    el('div', {}, [el('h1', { text: 'Reports' }),
-      el('p', { class: 'muted', text: 'Income, expenses and portfolio performance' })])
-  ]), controls, body);
+  wrap.append(
+    el('div', { class: 'page-hero' }, [
+      el('div', { class: 'page-hero-copy' }, [
+        el('span', { class: 'eyebrow', text: 'Portfolio metrics' }),
+        el('h1', { text: 'Reports' }),
+        el('p', { class: 'muted', text: 'Income, expenses and portfolio performance in one operating view.' })
+      ]),
+      el('div', { class: 'page-meta' }, [
+        el('span', { class: 'page-pill page-pill-ok' }, ['Live data']),
+        el('span', { class: 'page-pill' }, ['Updated today'])
+      ])
+    ]),
+    el('div', { class: 'view-head' }, [
+      el('div', {}, [el('h1', { text: 'Reports' }),
+        el('p', { class: 'muted', text: 'Income, expenses and portfolio performance' })])
+    ]),
+    controls,
+    body
+  );
 
   function inRange(d) { return d && d >= state.from && d <= state.to; }
   function matchProp(r) { return !state.propertyId || r.property_id === state.propertyId; }

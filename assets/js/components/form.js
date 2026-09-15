@@ -27,11 +27,12 @@ function inputFor(field, value, form) {
     return select;
   }
 
-  const typeMap = { money: 'number', number: 'number', date: 'date', email: 'email', tel: 'tel', url: 'url',
+  const typeMap = { money: 'text', number: 'text', date: 'date', email: 'email', tel: 'tel', url: 'url',
                     password: 'password' };
   return el('input', {
     ...common,
     type: typeMap[field.type] || 'text',
+    inputmode: field.type === 'money' || field.type === 'number' ? 'decimal' : null,
     autocomplete: field.autocomplete || null,
     step: field.type === 'money' ? '0.01' : (field.type === 'number' ? '1' : null),
     value: value ?? '',

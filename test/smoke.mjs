@@ -621,7 +621,7 @@ await step('meter readings bill the occupied units in one go', async () => {
   await page.waitForSelector('.meter-table', { timeout: 5000 });
   const prev = await page.$eval('tr[data-unit="UNT-00001"] .meter-prev', e => e.value);
   if (prev !== '10382') throw new Error('previous reading not carried over: ' + prev);
-  const rate = await page.$('.panel .form-grid input[type=number]');
+  const rate = await page.$('.panel .form-grid .meter-rate');
   await rate.type('8.5');
   await page.type('tr[data-unit="UNT-00001"] .meter-cur', '10500');
   await new Promise(r => setTimeout(r, 150));

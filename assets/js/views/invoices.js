@@ -62,7 +62,7 @@ export function openInvoiceForm(invoice = null, { onSaved } = {}) {
   const issueInput = el('input', { class: 'input', type: 'date', value: invoice?.issue_date || today() });
   const fromInput = el('input', { class: 'input', type: 'date', value: invoice?.period_start || '' });
   const toInput = el('input', { class: 'input', type: 'date', value: invoice?.period_end || '' });
-  const flatTaxInput = el('input', { class: 'input', type: 'number', step: '0.01', value: legacyTax ? invoice.tax : '' });
+  const flatTaxInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01', value: legacyTax ? invoice.tax : '' });
   const notesInput = el('textarea', { class: 'input', rows: 2 }, [invoice?.notes || '']);
 
   const field = (label, control, help) => el('div', { class: 'field' }, [
@@ -93,11 +93,11 @@ export function openInvoiceForm(invoice = null, { onSaved } = {}) {
                                value: item.description || '' });
     const cat = select(ITEM_CATEGORIES.map(c => ({ value: c, label: c })),
                        item.category || 'Rent', { class: 'input line-cat' });
-    const qty = el('input', { class: 'input line-qty', type: 'number', step: '0.01',
+    const qty = el('input', { class: 'input line-qty', type: 'text', inputmode: 'decimal', step: '0.01',
                               value: item.quantity ?? 1 });
-    const unit = el('input', { class: 'input line-unit', type: 'number', step: '0.01',
+    const unit = el('input', { class: 'input line-unit', type: 'text', inputmode: 'decimal', step: '0.01',
                                value: item.unit_amount ?? '' });
-    const gst = el('input', { class: 'input line-gst', type: 'number', step: '0.01', min: '0', max: '100',
+    const gst = el('input', { class: 'input line-gst', type: 'text', inputmode: 'decimal', step: '0.01', min: '0', max: '100',
                               title: 'GST %', placeholder: 'GST %',
                               value: item.tax_rate !== undefined && item.tax_rate !== '' ? item.tax_rate : (item.id ? '' : (defaultRate || '')) });
     const amount = el('span', { class: 'line-amount num' });

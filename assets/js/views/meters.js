@@ -23,15 +23,25 @@ export function metersView() {
 
   const draw = () => {
     wrap.textContent = '';
-    wrap.append(el('div', { class: 'view-head' }, [
-      el('div', {}, [
-        el('h1', { text: 'Meter readings' }),
-        el('p', { class: 'muted', text: 'Read every meter in a property and bill the tenants in one go' })
+    wrap.append(
+      el('div', { class: 'page-hero' }, [
+        el('div', { class: 'page-hero-copy' }, [
+          el('span', { class: 'eyebrow', text: 'Utility billing' }),
+          el('h1', { text: 'Meter readings' }),
+          el('p', { class: 'muted', text: 'Read every meter in a property and bill the tenants in one go.' })
+        ]),
+        el('div', { class: 'page-meta' }, [
+          el('span', { class: 'page-pill page-pill-ok' }, ['Billing ready']),
+          el('button', { class: 'btn btn-ghost btn-sm', onClick: () => navigate('invoices') }, ['‹ Invoices'])
+        ])
       ]),
-      el('div', { class: 'head-actions' }, [
-        el('button', { class: 'btn btn-ghost', onClick: () => navigate('invoices') }, ['‹ Invoices'])
+      el('div', { class: 'view-head' }, [
+        el('div', {}, [
+          el('h1', { text: 'Meter readings' }),
+          el('p', { class: 'muted', text: 'Track consumption, verify usage, and send billing in one step' })
+        ])
       ])
-    ]));
+    );
 
     if (!store.can('manager')) {
       wrap.append(el('p', { class: 'muted', text: 'Only managers and administrators can bill readings.' }));
@@ -59,7 +69,7 @@ export function metersView() {
       store.options('properties').map(o => el('option', { value: o.value, selected: o.value === state.propertyId, text: o.label })));
     const categorySel = el('select', { class: 'input', onChange: (e) => { state.category = e.target.value; draw(); } },
       METER_CATEGORIES.map(c => el('option', { value: c, selected: c === state.category, text: c })));
-    const rate = el('input', { class: 'input', type: 'number', step: '0.01', min: '0', placeholder: 'e.g. 8.50' });
+    const rate = el('input', { class: 'input meter-rate', type: 'text', inputmode: 'decimal', step: '0.01', min: '0', placeholder: 'e.g. 8.50' });
     const readingDate = el('input', { class: 'input', type: 'date', value: today() });
     const due = (() => { const d = new Date(); d.setDate(d.getDate() + Number(store.settings.default_grace_days || 5)); return d; })();
     const dueDate = el('input', { class: 'input', type: 'date',
@@ -73,9 +83,9 @@ export function metersView() {
       const last = store.lastReading(u.id, state.category);
       const lease = store.activeLeaseForUnit(u.id);
       const tenant = lease ? store.byId('tenants', lease.tenant_id) : null;
-      const prev = el('input', { class: 'input meter-prev', type: 'number', step: '0.001',
+      const prev = el('input', { class: 'input meter-prev', type: 'text', inputmode: 'decimal', step: '0.001',
                                  value: last ? last.current_reading : '' });
-      const cur = el('input', { class: 'input meter-cur', type: 'number', step: '0.001', placeholder: 'Current' });
+      const cur = el('input', { class: 'input meter-cur', type: 'text', inputmode: 'decimal', step: '0.001', placeholder: 'Current' });
       const used = el('span', { class: 'num meter-used' });
       const amount = el('span', { class: 'num meter-amount' });
       const tr = el('tr', { dataset: { unit: u.id } }, [

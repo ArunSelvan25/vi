@@ -110,12 +110,12 @@ export function setupView(onDone) {
   return el('div', { class: 'auth-screen' }, [
     el('div', { class: 'auth-card auth-wide' }, [
       el('div', { class: 'brand brand-lg' }, [icon('building', 26), el('span', { text: 'Property Manager' })]),
-      el('h2', { text: 'Connect your Google Sheet' }),
-      el('p', { class: 'muted' }, [
-        'Deploy the Apps Script in ',
-        el('code', { text: 'apps-script/Code.gs' }),
-        ' as a Web App, then paste its URL below. Step-by-step instructions are in ',
-        el('code', { text: 'docs/SETUP.md' }), '.'
+      el('div', { class: 'auth-intro' }, [
+        el('span', { class: 'eyebrow', text: 'Secure setup' }),
+        el('h2', { text: 'Connect your Google Sheet' }),
+        el('p', { class: 'muted' }, [
+          'Your portfolio stays inside your own spreadsheet. Add the Apps Script web app URL below and we’ll connect the dashboard in minutes.'
+        ])
       ]),
       status,
       el('label', {}, ['Web App URL', urlInput]),
@@ -168,7 +168,10 @@ export function loginView(onSignedIn) {
   return el('div', { class: 'auth-screen' }, [
     el('div', { class: 'auth-card' }, [
       el('div', { class: 'brand brand-lg' }, [icon('building', 26), el('span', { text: 'Property Manager' })]),
-      el('h2', { text: 'Sign in' }),
+      el('div', { class: 'auth-intro' }, [
+        el('span', { class: 'eyebrow', text: 'Welcome back' }),
+        el('h2', { text: 'Sign in' })
+      ]),
       form,
       el('button', {
         class: 'link-btn',

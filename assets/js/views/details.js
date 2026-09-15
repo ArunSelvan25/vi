@@ -55,14 +55,24 @@ export function propertyDetail(id) {
 
   const wrap = el('div', { class: 'view' }, [
     backLink('properties', 'Properties'),
-    el('div', { class: 'view-head' }, [
-      el('div', {}, [
+    el('div', { class: 'page-hero' }, [
+      el('div', { class: 'page-hero-copy' }, [
+        el('span', { class: 'eyebrow', text: 'Property overview' }),
         el('h1', { text: property.name }),
         el('p', { class: 'muted', text: [property.address_line1, property.address_line2, property.city,
                                          property.state, property.postal_code].filter(Boolean).join(', ') })
       ]),
+      el('div', { class: 'page-meta' }, [
+        el('span', { class: 'page-pill page-pill-ok' }, ['Portfolio asset']),
+        badge(property.status)
+      ])
+    ]),
+    el('div', { class: 'view-head' }, [
+      el('div', {}, [
+        el('h1', { text: property.name }),
+        el('p', { class: 'muted', text: `Active operations for ${units.length} unit${units.length === 1 ? '' : 's'}` })
+      ]),
       el('div', { class: 'head-actions' }, [
-        badge(property.status),
         store.can('manager')
           ? el('button', { class: 'btn btn-ghost',
               onClick: () => openEntityForm('properties', property, { onSaved: () => refreshView() }) },
@@ -169,15 +179,25 @@ export function tenantDetail(id) {
 
   return el('div', { class: 'view' }, [
     backLink('tenants', 'Tenants'),
-    el('div', { class: 'view-head' }, [
-      el('div', {}, [
+    el('div', { class: 'page-hero' }, [
+      el('div', { class: 'page-hero-copy' }, [
+        el('span', { class: 'eyebrow', text: 'Tenant profile' }),
         el('h1', { text: tenant.full_name }),
         el('p', { class: 'muted', text: activeLease
           ? store.label('units', activeLease.unit_id) + ' · lease ' + activeLease.id
           : 'No active lease' })
       ]),
+      el('div', { class: 'page-meta' }, [
+        el('span', { class: 'page-pill page-pill-ok' }, ['Account active']),
+        badge(tenant.status)
+      ])
+    ]),
+    el('div', { class: 'view-head' }, [
+      el('div', {}, [
+        el('h1', { text: tenant.full_name }),
+        el('p', { class: 'muted', text: 'Current relationship and billing history' })
+      ]),
       el('div', { class: 'head-actions' }, [
-        badge(tenant.status),
         el('button', { class: 'btn btn-ghost', onClick: () => showStatement(tenant) },
            [icon('file', 16), ' Statement']),
         wa ? el('a', { class: 'btn btn-ghost', href: wa, target: '_blank', rel: 'noopener noreferrer' },

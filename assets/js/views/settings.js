@@ -50,10 +50,25 @@ export function settingsView() {
   const wrap = el('div', { class: 'view' });
   const user = config.user || {};
 
-  wrap.append(el('div', { class: 'view-head' }, [
-    el('div', {}, [el('h1', { text: 'Settings' }),
-      el('p', { class: 'muted', text: 'Signed in as ' + (user.name || user.phone) + ' · ' + user.role })])
-  ]));
+  wrap.append(
+    el('div', { class: 'page-hero' }, [
+      el('div', { class: 'page-hero-copy' }, [
+        el('span', { class: 'eyebrow', text: 'Control center' }),
+        el('h1', { text: 'Settings' }),
+        el('p', { class: 'muted', text: 'Signed in as ' + (user.name || user.phone) + ' · ' + user.role })
+      ]),
+      el('div', { class: 'page-meta' }, [
+        el('span', { class: 'page-pill page-pill-ok' }, ['Workspace ready']),
+        el('span', { class: 'page-pill' }, [user.role || 'User'])
+      ])
+    ]),
+    el('div', { class: 'view-head' }, [
+      el('div', {}, [
+        el('h1', { text: 'Settings' }),
+        el('p', { class: 'muted', text: 'Keep your organisation, billing, and team configuration aligned.' })
+      ])
+    ])
+  );
 
   // ── organisation settings ───────────────────────────────────────────────
   const controls = {};
@@ -65,7 +80,7 @@ export function settingsView() {
       control = el('select', { class: 'input' }, f.options.map(o =>
         el('option', { value: o, selected: String(value) === o, text: o })));
     } else {
-      control = el('input', { class: 'input', type: f.type === 'number' ? 'number' : 'text', value });
+      control = el('input', { class: 'input', type: 'text', inputmode: f.type === 'number' ? 'decimal' : null, value });
     }
     if (!store.can('admin')) control.setAttribute('disabled', '');
     controls[f.key] = control;

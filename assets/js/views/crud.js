@@ -58,11 +58,25 @@ export function crudView(entity, {
 
   function rerender() {
     wrap.textContent = '';
+    const recordCount = store[entity].length;
+    const quickMeta = [
+      el('span', { class: 'page-pill' }, [recordCount + ' record' + (recordCount === 1 ? '' : 's')]),
+      store.can('manager') ? el('span', { class: 'page-pill page-pill-ok' }, ['Ready to update']) : null
+    ];
+
     wrap.append(
+      el('div', { class: 'page-hero' }, [
+        el('div', { class: 'page-hero-copy' }, [
+          el('span', { class: 'eyebrow', text: def.title }),
+          el('h1', { text: def.title }),
+          el('p', { class: 'muted', text: `Manage your ${def.title.toLowerCase()} and keep day-to-day operations moving.` })
+        ]),
+        el('div', { class: 'page-meta', }, quickMeta)
+      ]),
       el('div', { class: 'view-head' }, [
         el('div', {}, [
           el('h1', { text: def.title }),
-          el('p', { class: 'muted', text: `${store[entity].length} record${store[entity].length === 1 ? '' : 's'}` })
+          el('p', { class: 'muted', text: `${recordCount} record${recordCount === 1 ? '' : 's'} in this workspace` })
         ]),
         el('div', { class: 'head-actions' }, [
           ...headerActions,

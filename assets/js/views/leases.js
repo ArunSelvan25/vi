@@ -41,7 +41,7 @@ export function openSettleDeposit(lease, { onDone } = {}) {
 
   const addDeduction = () => {
     const desc = el('input', { class: 'input ded-desc', placeholder: 'e.g. Repainting, broken fan' });
-    const amt = el('input', { class: 'input ded-amount', type: 'number', step: '0.01', min: '0', placeholder: 'Amount' });
+    const amt = el('input', { class: 'input ded-amount', type: 'text', inputmode: 'decimal', step: '0.01', min: '0', placeholder: 'Amount' });
     const row = el('div', { class: 'deduction-row' }, [
       desc, amt,
       el('button', { class: 'icon-btn danger', type: 'button', title: 'Remove',
@@ -160,9 +160,9 @@ export function openRenewLease(lease, { onDone } = {}) {
 
   const startInput = el('input', { class: 'input', type: 'date', value: start });
   const endInput = el('input', { class: 'input', type: 'date', value: endGuess });
-  const rentInput = el('input', { class: 'input', type: 'number', step: '0.01',
+  const rentInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01',
                                   value: round2(pct ? finalRent * (1 + pct / 100) : finalRent) });
-  const escInput = el('input', { class: 'input', type: 'number', step: '0.01', value: lease.escalation_pct ?? '' });
+  const escInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01', value: lease.escalation_pct ?? '' });
   const carry = el('input', { type: 'checkbox', checked: held > 0 || null, disabled: held > 0 ? null : true });
 
   const body = el('div', { class: 'stack' }, [

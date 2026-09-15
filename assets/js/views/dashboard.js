@@ -41,8 +41,6 @@ export function dashboardView() {
   const wrap = el('div', { class: 'view' });
 
   // ── KPI row ─────────────────────────────────────────────────────────────
-  // Month to date against the same days of last month — comparing a part month
-  // with a whole one read as a slump every morning of the 1st.
   const now = new Date();
   const lastStart = isoDate(new Date(now.getFullYear(), now.getMonth() - 1, 1));
   const lastSameDay = isoDate(new Date(now.getFullYear(), now.getMonth() - 1,
@@ -51,6 +49,32 @@ export function dashboardView() {
     .filter(p => p.payment_date >= lastStart && p.payment_date <= lastSameDay)
     .reduce((t, p) => t + Number(p.amount || 0), 0);
   const trend = delta(s.collected_this_month, prevCollected);
+
+  const priorityAlerts = [];
+  if (s.overdue > 0) {
+    priorityAlerts.push({ label: 'Overdue', value: money(s.overdue, { compact: true }), tone: 'danger', link: 'invoices' });
+  }
+  if (s.open_tickets > 0) {
+    priorityAlerts.push({ label: 'Open tickets', value: String(s.open_tickets), tone: 'warn', link: 'maintenance' });
+  }
+  if (s.vacant_units > 0) {
+    priorityAlerts.push({ label: 'Vacant units', value: String(s.vacant_units), tone: 'info', link: 'units' });
+  }
+  const summaryBadges = priorityAlerts.length
+    ? priorityAlerts.map(item => el('span', { class: 'summary-pill ' + item.tone }, [
+        item.label,
+        el('strong', { text: item.value })
+      ]))
+    : [el('span', { class: 'summary-pill ok' }, ['Portfolio stable', el('strong', { text: 'All clear' })])];
+
+  wrap.append(el('div', { class: 'summary-hero' }, [
+    el('div', { class: 'summary-copy' }, [
+      el('span', { class: 'eyebrow', text: 'Operations overview' }),
+      el('h1', { text: 'Portfolio health at a glance' }),
+      el('p', { class: 'muted', text: 'Today’s priorities, rent performance, and property health in one place.' })
+    ]),
+    el('div', { class: 'summary-badges' }, summaryBadges)
+  ]));
 
   wrap.append(el('div', { class: 'kpi-row' }, [
     kpi({ label: 'Monthly rent roll', value: money(s.monthly_rent_roll, { compact: true }),
@@ -69,6 +93,37 @@ export function dashboardView() {
           tone: s.open_tickets > 0 ? 'warn' : null, to: 'maintenance' }),
     kpi({ label: 'Deposits held', value: money(s.deposits_held, { compact: true }),
           sub: 'refundable', to: 'leases' })
+  ]));
+
+  const quickActions = [
+    { label: 'Add tenant', path: 'tenants', icon: 'users' },
+    { label: 'Create invoice', path: 'invoices', icon: 'receipt' },
+    { label: 'Renew lease', path: 'leases', icon: 'file' },
+    { label: 'Log payment', path: 'payments', icon: 'card' }
+  ];
+
+  const alertList = [];
+  if (s.overdue > 0) alertList.push('Overdue balances need follow-up');
+  if (s.open_tickets > 0) alertList.push('Maintenance work is pending review');
+  if (s.vacant_units > 0) alertList.push('Vacant units need more attention');
+  if (!alertList.length) alertList.push('Nothing urgent this week');
+
+  wrap.append(el('div', { class: 'priority-layout' }, [
+    panel('Priority actions', el('div', { class: 'alert-list' }, alertList.map(item =>
+      el('div', { class: 'alert-item' }, [
+        el('span', { class: 'alert-dot' }),
+        el('span', { text: item })
+      ]))
+    )),
+    panel('Quick actions', el('div', { class: 'action-grid' }, quickActions.map(action =>
+      el('button', {
+        class: 'action-card',
+        onClick: () => navigate(action.path)
+      }, [
+        el('span', { class: 'action-icon', text: action.label[0] }),
+        el('span', { class: 'action-label', text: action.label })
+      ])
+    )))
   ]));
 
   // ── charts ──────────────────────────────────────────────────────────────
@@ -95,7 +150,6 @@ export function dashboardView() {
   const expiringBody = expiring.length
     ? el('ul', { class: 'list' }, expiring.slice(0, 8).map(l => {
         const days = daysBetween(today(), l.end_date);
-        // a lease about to end is a renewal to arrange, so that is what a click opens
         const open = () => store.can('manager')
           ? openRenewLease(l, { onDone: () => refreshView() })
           : navigate('tenants/' + l.tenant_id);
@@ -163,7 +217,6 @@ export function dashboardView() {
     panel('Documents expiring', docBody, { count: docs.length || undefined })
   ]));
 
-  // ── vacant units, so nothing sits empty unnoticed ───────────────────────
   const vacant = store.units.filter(u => u.status === 'Vacant');
   if (vacant.length) {
     wrap.append(panel('Vacant units',
