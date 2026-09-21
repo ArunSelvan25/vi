@@ -1,0 +1,2428 @@
+/**
+ * VI Property & Tenancy Manager — Supabase backend
+ * ------------------------------------------------
+ * A port of apps-script/Code.gs onto Postgres. The actions, their payloads and
+ * their responses are unchanged, so the SPA only needs a different URL. The
+ * business rules are the same rules, in the same order, with the same error
+ * messages; the comments that explain *why* a rule exists travelled with it.
+ *
+ * What changed underneath:
+ *   Sheets tabs          → Postgres tables (schema.js, supabase/migrations)
+ *   LockService          → one advisory lock per request, inside a transaction
+ *   a failed request     → rolled back, instead of leaving half its writes
+ *   CacheService         → login_throttle table
+ *   Script Properties    → app_state table + function secrets
+ *   Utilities            → WebCrypto
+ *   MailApp              → an injected `sendEmail` (none configured yet)
+ *
+ * Plain JavaScript on purpose: the same module runs on Supabase's Deno runtime
+ * (index.ts) and under Node for the test suites (test/pg-harness.mjs).
+ */
+import { TABLES, keyOf } from './schema.js';
+import {
+  openRequest, assertTable, readTable, readTableTail, findRow, invalidate, reserveIds,
+  insertRow, insertRows, patchRow, removeRow, getState, setState, tableVersions, guarded
+} from './db.js';
+
+// ─────────────────────────────────────────────────────────── configuration ──
+
+export const DEFAULT_SETTINGS = {
+  org_name: 'VI Properties',
+  currency: 'INR',
+  currency_symbol: '₹',
+  locale: 'en-IN',
+  date_format: 'dd MMM yyyy',
+  invoice_prefix: 'INV',
+  default_late_fee: '0',
+  default_grace_days: '5',
+  reminder_days_before: '3',
+  reminder_enabled: 'false',
+  lease_expiry_alert_days: '45',
+  session_hours: '12',
+  reminder_overdue_days: '1,7,14,30',
+  gstin: '',
+  sac_code: '997212',
+  default_gst_rate: '0',
+  upi_id: '',
+  whatsapp_country_code: '91'
+};
+
+const ROLE_RANK = { viewer: 1, manager: 2, admin: 3 };
+
+/** How long a fresh deployment accepts an anonymous first-run bootstrap. */
+export const BOOTSTRAP_WINDOW_MS = 60 * 60 * 1000;
+
+/** Tables that need more than the default 'manager' to write. */
+const TABLE_MIN_ROLE = { Users: 'admin', Settings: 'admin', ActivityLog: 'admin' };
+
+/** Tables that need more than the default 'viewer' to read. */
+const TABLE_READ_ROLE = { Users: 'admin', ActivityLog: 'manager' };
+
+/** Columns that must never leave the server, whoever is asking. */
+const NEVER_RETURN = { Users: ['salt', 'password_hash'] };
+
+function minRoleFor(table) { return TABLE_MIN_ROLE[table] || 'manager'; }
+function readRoleFor(table) { return TABLE_READ_ROLE[table] || 'viewer'; }
+
+/** Rows on their way to a client, with secrets removed. */
+async function readTableForClient(r, table, user) {
+  requireRole(user, readRoleFor(table));
+  return (await readTable(r, table)).map(row => stripSecrets(table, row));
+}
+
+/**
+ * One row with the never-return columns removed. Every path that hands a row
+ * back to the browser goes through this — a created or updated user included.
+ */
+function stripSecrets(table, row) {
+  const hidden = NEVER_RETURN[table];
+  if (!hidden || !row) return row;
+  const safe = {};
+  Object.keys(row).forEach(k => { if (hidden.indexOf(k) < 0) safe[k] = row[k]; });
+  return safe;
+}
+
+const SYSTEM_ACTOR = { role: 'admin', phone: 'system', name: 'system' };
+
+function ok(data)  { return { ok: true, data: data || {} }; }
+function fail(msg) { return { ok: false, error: msg }; }
+
+const VERSION = '2.0.0';
+
+// ──────────────────────────────────────────────────────────────── factory ──
+
+/**
+ * @param {object} deps
+ * @param {Function} deps.sql         a postgres.js client (created with PG_TYPES)
+ * @param {string}   deps.authSecret  HMAC key for session tokens
+ * @param {string}   [deps.setupKey]  when set, required for the first-run bootstrap
+ * @param {string}   [deps.timeZone]  the zone "today" is measured in (the sheet's zone before)
+ * @param {Function} [deps.sendEmail] async (to, subject, body) — omit and reminders are off
+ * @param {number}   [deps.hashIterations] PBKDF2 rounds for new password hashes
+ */
+export function createBackend(deps) {
+  if (!deps || !deps.sql) throw new Error('createBackend needs a postgres client');
+  if (!deps.authSecret || String(deps.authSecret).length < 32) {
+    throw new Error('AUTH_SECRET must be set to a random value of at least 32 characters');
+  }
+  const env = {
+    sql: deps.sql,
+    authSecret: String(deps.authSecret),
+    setupKey: deps.setupKey ? String(deps.setupKey) : '',
+    tz: deps.timeZone || 'Asia/Kolkata',
+    sendEmail: deps.sendEmail || null,
+    hashIterations: deps.hashIterations || PBKDF2_ITERATIONS
+  };
+
+  /** Run `fn(r)` in one locked transaction. A throw rolls everything back. */
+  const run = (fn) => env.sql.begin(async (tx) => {
+    const r = await openRequest(tx, env.tz);
+    r.env = env;
+    return fn(r);
+  });
+
+  async function handle(action, payload, token) {
+    if (!action) return fail('No action supplied');
+    if (action === 'ping') return ok({ service: 'vi-property-manager', version: VERSION, time: nowIso(env.tz) });
+    try {
+      return await run(r => route(r, action, payload || {}, token || ''));
+    } catch (err) {
+      return fail(describeError(err));
+    }
+  }
+
+  return {
+    handle,
+    run,
+    env,
+    /** The scheduled jobs, for pg_cron (through the function) or a manual run. */
+    dailyMaintenanceJob: () => run(r => refreshStatuses(r, SYSTEM_ACTOR, false)),
+    dailyReminderJob: () => run(r => dailyReminderJob(r)),
+    /** Break-glass: make a phone number an active administrator (scripts/recover-admin.mjs). */
+    recoverAccess: (phone, password, name) => run(r => recoverAccess(r, phone, password, name))
+  };
+}
+
+/** What a caller is told when a request fails. */
+function describeError(err) {
+  if (!err) return 'Unknown error';
+  if (err.name !== 'PostgresError' || !err.code) return err.message || String(err);
+
+  const detail = String(err.detail || '');
+  switch (err.code) {
+    case '23P01':
+      return 'That unit is already let over those dates. Terminate or end that lease first.';
+    case '23503': {
+      const m = detail.match(/Key \((.+?)\)=\((.+?)\) is not present in table "(.+?)"/);
+      if (m) return humanise(m[1]) + ' ' + m[2] + ' does not exist.';
+      return 'Cannot delete that record — other records still reference it. Remove or reassign those first.';
+    }
+    case '23502': return humanise(err.column_name || 'A required value') + ' is required.';
+    case '23505':
+      if (/phone/.test(err.constraint_name || '')) return 'That phone number already belongs to another user';
+      return 'That record already exists.';
+    case '23514':
+      if (err.constraint_name === 'leases_check') return 'A lease cannot end before it starts.';
+      if (/meter_readings_check/.test(err.constraint_name || '')) return 'A reading cannot be lower than the previous one.';
+      return 'A value is not allowed (' + (err.constraint_name || 'check') + ').';
+    case '22P02': case '22003': case '22007': case '22008':
+      return 'A value is not in the right format or is out of range.';
+    case '40001': case '40P01': case '55P03':
+      return 'The server was busy. Nothing was saved — please try again.';
+    default:
+      console.error('database error', err.code, err.message, err.detail || '');
+      return 'The database refused that change (' + err.code + '). Nothing was saved.';
+  }
+}
+
+function humanise(column) {
+  const s = String(column).replace(/_id$/, '').replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+// ────────────────────────────────────────────────────────────────── router ──
+
+const READ_ONLY_ACTIONS = { ping: 1, login: 1, bootstrap: 1, list: 1, me: 1, stats: 1 };
+export { READ_ONLY_ACTIONS };
+
+async function route(r, action, payload, token) {
+  if (action === 'setup') return doSetup(r, payload, token);
+  if (action === 'login') return doLogin(r, payload);
+
+  const user = await requireAuth(r, token);
+
+  switch (action) {
+    case 'me':               return ok({ user, settings: await readSettings(r) });
+    case 'bootstrap':        return ok(await bootstrap(r, user, payload.known));
+    case 'list':             return ok({ rows: await readTableForClient(r, assertTable(payload.table), user) });
+    case 'create':
+    case 'update': {
+      const written = await writeRow(r, action, payload, user);
+      const table = payload.table;
+      const row = (await findRow(r, table, written[keyOf(table)])) || written;
+      return ok(await withSnapshot(r, payload, user, { row: stripSecrets(table, row) }));
+    }
+    case 'remove':           return ok(await withSnapshot(r, payload, user, { id: await deleteRow(r, payload.table, payload.id, user) }));
+    case 'saveInvoice':      return ok(await withSnapshot(r, payload, user, await saveInvoice(r, payload, user)));
+    case 'voidInvoice':      return ok(await withSnapshot(r, payload, user, await voidInvoice(r, payload, user)));
+    case 'recordPayment':    return ok(await withSnapshot(r, payload, user, await recordPayment(r, payload, user)));
+    case 'voidPayment':      return ok(await withSnapshot(r, payload, user, await voidPayment(r, payload.id, user)));
+    case 'generateInvoices': return ok(await withSnapshot(r, payload, user, await generateInvoices(r, payload, user)));
+    case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
+    case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
+    case 'billMeterReadings':return ok(await withSnapshot(r, payload, user, await billMeterReadings(r, payload, user)));
+    case 'refreshStatuses':  requireRole(user, 'manager'); return ok(await withSnapshot(r, payload, user, await refreshStatuses(r, user)));
+    case 'changePassword':   return ok(await changePassword(r, payload, user));
+    case 'createUser':       return ok({ row: await createUser(r, payload, user) });
+    case 'resetPassword':    return ok(await resetPassword(r, payload, user));
+    case 'setUserActive':    return ok({ row: await setUserActive(r, payload, user) });
+    case 'setUserRole':      return ok({ row: await setUserRole(r, payload, user) });
+    case 'sendReminders':    return ok(await withSnapshot(r, payload, user, await sendReminders(r, user, { scheduled: false })));
+    case 'stats':            return ok(await computeStats(r));
+    default: return fail('Unknown action: ' + action);
+  }
+}
+
+/**
+ * Attach the state the browser would otherwise come straight back for. A write
+ * that cascades cannot be applied to the client's cache from the response
+ * alone, so the snapshot rides along when asked for. Built through bootstrap(),
+ * so it obeys exactly the same role limits.
+ */
+async function withSnapshot(r, payload, user, data) {
+  if (payload && payload.withSnapshot) data.snapshot = await bootstrap(r, user, payload.known);
+  return data;
+}
+
+// ───────────────────────────────────────────────────────────── time ──────
+
+function partsIn(date, tz) {
+  const out = {};
+  new Intl.DateTimeFormat('en-GB', {
+    timeZone: tz, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(date).forEach(p => { if (p.type !== 'literal') out[p.type] = p.value; });
+  return out;
+}
+
+/** The current wall-clock time in the app's zone, yyyy-MM-ddTHH:mm:ss. */
+export function nowIso(tz) {
+  const p = partsIn(new Date(), tz);
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+}
+
+/** Today's date in the app's zone — what "overdue" and "expired" are measured against. */
+export function todayIn(tz) { return nowIso(tz).slice(0, 10); }
+
+const today = (r) => todayIn(r.tz);
+const now = (r) => nowIso(r.tz);
+
+// ───────────────────────────────────────────────────────────────── CRUD ────
+
+async function createRow(r, table, data, user, skipLog) {
+  assertTable(table);
+  requireRole(user, minRoleFor(table));
+  const row = { ...data };
+  if (!TABLES[table].key) row.id = data.id || (await reserveIds(r, table, 1, await prefixFor(r, table)))[0];
+  const saved = await insertRow(r, table, row);
+  if (!skipLog) await log(r, user, 'create', table, saved.id, data.name || data.full_name || '');
+  return saved;
+}
+
+/** Create many rows in one tab with a single write. */
+async function appendRows(r, table, list, user) {
+  assertTable(table);
+  requireRole(user, minRoleFor(table));
+  if (!list.length) return [];
+  const ids = await reserveIds(r, table, list.length, await prefixFor(r, table));
+  return insertRows(r, table, list.map((data, i) => ({ ...data, id: ids[i] })));
+}
+
+/** The id prefix; for invoices it is the one people see on paper, so it is configurable. */
+async function prefixFor(r, table) {
+  if (table === 'Invoices') {
+    const configured = String((await readSettings(r)).invoice_prefix || '').trim();
+    if (configured) return configured;
+  }
+  return TABLES[table].prefix || 'ROW';
+}
+
+/**
+ * @param expectedVersion the `_v` the caller last saw. When given and the row
+ *   has changed since, nothing is written and a CONFLICT error is thrown.
+ */
+async function updateRow(r, table, id, data, user, skipLog, expectedVersion) {
+  assertTable(table);
+  requireRole(user, minRoleFor(table));
+  if (table === 'Users' && (data.role !== undefined || data.active !== undefined)) {
+    await assertAdminRemains(r, id, data);
+  }
+  const row = await patchRow(r, table, id, data, expectedVersion);
+  if (!skipLog) await log(r, user, 'update', table, id, JSON.stringify(data).slice(0, 200));
+  return row;
+}
+
+/**
+ * Refuse any change that would leave the workspace with no way in. Without
+ * this an administrator can delete or demote the only admin account and nobody
+ * — including them — can ever sign in again.
+ */
+async function assertAdminRemains(r, userId, changes) {
+  const users = await readTable(r, 'Users');
+  let stillAdmin = 0;
+  for (const u of users) {
+    let role = u.role, active = String(u.active).toLowerCase() !== 'false';
+    if (String(u.id) === String(userId)) {
+      if (changes === null) continue;                       // being deleted
+      if (changes.role !== undefined) role = changes.role;
+      if (changes.active !== undefined) active = String(changes.active).toLowerCase() !== 'false';
+    }
+    if (role === 'admin' && active) stillAdmin++;
+  }
+  if (stillAdmin === 0) {
+    throw new Error('This is the only active administrator. Promote another user first.');
+  }
+}
+
+async function deleteRow(r, table, id, user) {
+  assertTable(table);
+  requireRole(user, 'admin');
+  if (table === 'Users') await assertAdminRemains(r, id, null);
+
+  // An issued invoice is a numbered document: it is voided, never deleted,
+  // so the number sequence has no unexplained gaps. A draft was never sent.
+  if (table === 'Invoices') {
+    const inv = await findRow(r, 'Invoices', id);
+    if (inv && String(inv.status) !== 'Draft') {
+      throw new Error('Invoice ' + id + ' has been issued, so it cannot be deleted. Void it instead — ' +
+                      'the number stays on record and nothing is owed on it.');
+    }
+  }
+
+  // Refuse to leave other rows pointing at something that no longer exists.
+  // An invoice's own line items are the one exception: they go with it
+  // (ON DELETE CASCADE).
+  await assertNoDependents(r, table, id);
+  if (table === 'Maintenance') {
+    for (const e of await readTable(r, 'Expenses')) {
+      if (String(e.reference) === String(id) && String(e.category) !== 'Deposit Refund') {
+        await deleteRow(r, 'Expenses', e.id, SYSTEM_ACTOR);
+      }
+    }
+  }
+
+  // remember what the deletion will invalidate, before the row is gone
+  let affectedInvoice = null;
+  if (table === 'Payments') {
+    const p = await findRow(r, 'Payments', id);
+    if (p) affectedInvoice = p.invoice_id;
+  }
+
+  await removeRow(r, table, id);
+  await log(r, user, 'delete', table, id, '');
+
+  // Deleting money received has to put the invoice back where it was, or the
+  // ledger keeps showing it as settled.
+  if (affectedInvoice) await applyInvoiceTotals(r, affectedInvoice, user);
+  // Removing a lease frees its unit.
+  if (table === 'Leases' || table === 'Units') await refreshStatuses(r, user, true);
+
+  return id;
+}
+
+// ── business rules ──────────────────────────────────────────────────────────
+
+/** Statuses a new record starts in, so none lands blank. */
+const CREATE_DEFAULTS = {
+  Properties:  { status: 'Active' },
+  Units:       { status: 'Vacant' },
+  Tenants:     { status: 'Active' },
+  Invoices:    { status: 'Unpaid' },
+  Maintenance: { status: 'Open', priority: 'Medium' },
+  Leases:      { frequency: 'Monthly', deposit_status: 'Pending' }
+};
+
+/** Rows in other tabs that point at this one. Deleting is blocked while any exist. */
+const DEPENDENTS = {
+  Properties: [['Units', 'property_id', 'unit'], ['Leases', 'property_id', 'lease'],
+               ['Invoices', 'property_id', 'invoice'], ['Expenses', 'property_id', 'expense'],
+               ['Maintenance', 'property_id', 'maintenance ticket'], ['Documents', 'entity_id', 'document'],
+               ['MeterReadings', 'property_id', 'meter reading']],
+  Units:      [['Leases', 'unit_id', 'lease'], ['Invoices', 'unit_id', 'invoice'],
+               ['Maintenance', 'unit_id', 'maintenance ticket'], ['Expenses', 'unit_id', 'expense'],
+               ['MeterReadings', 'unit_id', 'meter reading'], ['Documents', 'entity_id', 'document']],
+  Tenants:    [['Leases', 'tenant_id', 'lease'], ['Invoices', 'tenant_id', 'invoice'],
+               ['Payments', 'tenant_id', 'payment'], ['Maintenance', 'tenant_id', 'maintenance ticket'],
+               ['MeterReadings', 'tenant_id', 'meter reading'], ['Documents', 'entity_id', 'document']],
+  Leases:     [['Invoices', 'lease_id', 'invoice'], ['Payments', 'lease_id', 'payment'],
+               ['MeterReadings', 'lease_id', 'meter reading'],
+               ['Documents', 'entity_id', 'document'], ['Leases', 'renewed_from', 'renewal']],
+  Invoices:   [['Payments', 'invoice_id', 'payment']]
+};
+
+async function assertNoDependents(r, table, id) {
+  const refs = DEPENDENTS[table];
+  if (!refs) return;
+  const blocking = [];
+  let total = 0;
+  for (const [tab, key, noun] of refs) {
+    let n = 0;
+    (await readTable(r, tab)).forEach(row => { if (String(row[key]) === String(id)) n++; });
+    if (n) { blocking.push(n + ' ' + noun + (n === 1 ? '' : 's')); total += n; }
+  }
+  if (blocking.length) {
+    throw new Error('Cannot delete ' + id + ' — ' + blocking.join(' and ') +
+                    (total === 1 ? ' still references it. Remove or reassign it first.'
+                                 : ' still reference it. Remove or reassign those first.'));
+  }
+}
+
+/** Where a lease sits today. An explicit termination is never overridden. */
+function deriveLeaseStatus(r, startDate, endDate, currentStatus) {
+  if (String(currentStatus) === 'Terminated') return 'Terminated';
+  const t = today(r);
+  if (endDate && String(endDate) < t) return 'Expired';
+  if (startDate && String(startDate) > t) return 'Upcoming';
+  return 'Active';
+}
+
+/**
+ * A unit cannot be let to two tenants at once. Leases that have ended or been
+ * terminated are ignored; anything still live must not overlap the new dates.
+ * (The database enforces the same rule; this gives the friendlier message.)
+ */
+async function assertUnitIsFree(r, data, selfId) {
+  if (!data.unit_id) return;
+  if (['Terminated', 'Expired'].indexOf(String(data.status)) >= 0) return;
+
+  const start = String(data.start_date || '');
+  const end = String(data.end_date || '9999-12-31');
+  let clash = null;
+  for (const l of await readTable(r, 'Leases')) {
+    if (clash || String(l.id) === String(selfId)) continue;
+    if (String(l.unit_id) !== String(data.unit_id)) continue;
+    if (['Terminated', 'Expired'].indexOf(String(l.status)) >= 0) continue;
+    const s = String(l.start_date || '');
+    const e = String(l.end_date || '9999-12-31');
+    if (start <= e && s <= end) clash = l;
+  }
+  if (clash) {
+    throw new Error('That unit is already let on lease ' + clash.id + ' (' +
+                    (clash.start_date || '?') + ' to ' + (clash.end_date || 'open ended') +
+                    '). Terminate or end that lease first.');
+  }
+}
+
+/**
+ * Fill in the property a record belongs to when the form left it blank but it
+ * can be worked out from what was chosen, so the P&L adds up to its total.
+ */
+async function inferProperty(r, data) {
+  if (data.property_id) return data.property_id;
+  if (data.unit_id) {
+    const unit = await findRow(r, 'Units', data.unit_id);
+    if (unit && unit.property_id) return unit.property_id;
+  }
+  if (data.lease_id) {
+    const lease = await findRow(r, 'Leases', data.lease_id);
+    if (lease && lease.property_id) return lease.property_id;
+  }
+  return '';
+}
+
+/**
+ * create/update with the per-table rules the app promises: sensible starting
+ * statuses, invoice totals derived rather than typed, lease dates validated and
+ * occupancy kept in step.
+ */
+async function writeRow(r, op, payload, user) {
+  const table = assertTable(payload.table);
+  return writeRowLocked(r, op, table, payload, user);
+}
+
+async function writeRowLocked(r, op, table, payload, user) {
+  const data = { ...(payload.data || {}) };
+
+  // Ids are issued here, never taken from the browser.
+  if (op === 'create') delete data.id;
+
+  if (op === 'create' && CREATE_DEFAULTS[table]) {
+    const defaults = CREATE_DEFAULTS[table];
+    Object.keys(defaults).forEach(k => {
+      if (data[k] === '' || data[k] === null || data[k] === undefined) data[k] = defaults[k];
+    });
+  }
+
+  if (table === 'Tenants' && data.gstin !== undefined) data.gstin = assertGstin(data.gstin, 'The tenant\'s GSTIN');
+  if (table === 'Settings' && String(payload.id || data.key) === 'gstin' && data.value !== undefined) {
+    data.value = assertGstin(data.value, 'Your GSTIN');
+  }
+  if (table === 'Settings' && String(payload.id || data.key) === 'upi_id' && data.value !== undefined) {
+    data.value = assertUpiId(data.value);
+  }
+
+  if (table === 'Invoices') {
+    const amount = parseFloat(data.amount || 0) || 0;
+    const tax = parseFloat(data.tax || 0) || 0;
+    if (data.total === '' || data.total === null || data.total === undefined) {
+      data.total = round2(amount + tax);
+    }
+    if (op === 'create' || data.property_id !== undefined || data.unit_id !== undefined || data.lease_id !== undefined) {
+      data.property_id = await inferProperty(r, data);
+    }
+  }
+
+  if (table === 'Maintenance') {
+    if (op === 'create' && !data.reported_date) data.reported_date = today(r);
+    // A ticket closed without a completion date dates its cost by when it was
+    // reported, which can drop the spend into the wrong reporting period.
+    if (['Resolved', 'Closed'].indexOf(String(data.status)) >= 0 && !data.completed_date) {
+      data.completed_date = today(r);
+    }
+  }
+
+  if (table === 'Invoices' && op === 'update' && String(data.status) === 'Void') {
+    await assertVoidable(r, payload.id);
+  }
+  // nothing is owed on a void invoice — the database refuses one with a balance
+  if (table === 'Invoices' && String(data.status) === 'Void') data.balance = 0;
+
+  let before = null;
+  if (table === 'Leases') {
+    let merged = data;
+    if (op === 'update') {
+      // validate against the row as it will be, not just the fields that changed
+      before = await findRow(r, 'Leases', payload.id);
+      if (before) merged = { ...before, ...data };
+    }
+    if (merged.start_date && merged.end_date && String(merged.end_date) < String(merged.start_date)) {
+      throw new Error('A lease cannot end before it starts.');
+    }
+    data.status = deriveLeaseStatus(r, merged.start_date, merged.end_date, merged.status);
+    merged.status = data.status;
+    await assertUnitIsFree(r, merged, op === 'update' ? payload.id : null);
+    await assertDepositStatusChange(r, before, merged);
+    if (before) await assertDepositAmountChange(r, before, merged);
+  }
+
+  let paymentBefore = null;
+  if (table === 'Payments') {
+    if (op === 'update') paymentBefore = await findRow(r, 'Payments', payload.id);
+    await preparePayment(r, data, paymentBefore);
+  }
+
+  let row = op === 'create'
+    ? await createRow(r, table, data, user)
+    : await updateRow(r, table, payload.id, data, user, false, payload.expected_version);
+
+  // Recompute paid/balance/status from the payments so the figures can never
+  // be inconsistent with the money actually received.
+  if (table === 'Invoices' && String(row.status) !== 'Draft') {
+    row = (await applyInvoiceTotals(r, row.id, user)) || row;
+  }
+  // The same holds for a payment saved from the Payments page rather than from
+  // an invoice: the invoice it settles, and the one it was moved off, if any.
+  if (table === 'Payments') {
+    if (row.invoice_id) await applyInvoiceTotals(r, row.invoice_id, user);
+    if (paymentBefore && paymentBefore.invoice_id &&
+        String(paymentBefore.invoice_id) !== String(row.invoice_id)) {
+      await applyInvoiceTotals(r, paymentBefore.invoice_id, user);
+    }
+  }
+  // Occupancy is derived from leases, so it has to be re-derived as soon as one
+  // changes — not left until the next page load.
+  if (table === 'Leases' || table === 'Units') await refreshStatuses(r, user, true);
+
+  if (table === 'Leases') {
+    // Signing a lease with a deposit makes that deposit due, like the first
+    // rent — unless it is already marked as collected.
+    const collected = String(row.deposit_status) !== 'Pending' && String(row.deposit_status) !== '';
+    if (!collected && (op === 'create' || (before && !(num(before.deposit_amount) > 0)))) {
+      await raiseDepositInvoice(r, row, user);
+    }
+    // a changed deposit re-prices its invoice while nothing has been paid past it
+    if (before && num(before.deposit_amount) > 0 && round2(num(before.deposit_amount)) !== round2(num(row.deposit_amount))) {
+      await repriceDepositInvoice(r, row, user);
+    }
+  }
+
+  // A finished ticket's cost becomes an ordinary expense, so it is counted in
+  // exactly one place.
+  if (table === 'Maintenance') await recordMaintenanceExpense(r, row, user);
+
+  // Marking a deposit refunded from the lease form returns whatever is still
+  // held. Deductions go through settleDeposit instead.
+  if (table === 'Leases' && before && String(row.deposit_status) === 'Refunded' &&
+      String(before.deposit_status) !== 'Refunded') {
+    await recordDepositRefund(r, row, user);
+  }
+
+  return (await findRow(r, table, row[keyOf(table)])) || row;
+}
+
+function num(v) { return parseFloat(v || 0) || 0; }
+
+/**
+ * Raise the invoice for a lease's security deposit, once per lease. Billing it
+ * like rent means it shows up in outstanding until paid, and only then counts
+ * as held.
+ */
+async function raiseDepositInvoice(r, lease, user) {
+  const amount = round2(parseFloat(lease.deposit_amount || 0) || 0);
+  if (amount <= 0) return null;
+
+  const already = (await readTable(r, 'Invoices')).some(inv =>
+    String(inv.lease_id) === String(lease.id) && String(inv.type) === 'Deposit');
+  if (already) return null;
+
+  const invoice = await createRow(r, 'Invoices', {
+    lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id,
+    property_id: lease.property_id, type: 'Deposit',
+    issue_date: lease.start_date || today(r), due_date: lease.start_date || today(r),
+    amount, tax: 0, total: amount, amount_paid: 0, balance: amount,
+    status: 'Unpaid', notes: 'Security deposit for lease ' + lease.id
+  }, user, true);
+
+  await createRow(r, 'InvoiceItems', {
+    invoice_id: invoice.id, description: 'Security deposit',
+    category: 'Deposit', quantity: 1, unit_amount: amount, amount, notes: ''
+  }, user, true);
+
+  await log(r, user, 'deposit-invoiced', 'Invoices', invoice.id, 'lease ' + lease.id + ' · ' + amount);
+  // a lease entered after it began has a deposit that is already overdue
+  return (await applyInvoiceTotals(r, invoice.id, user)) || invoice;
+}
+
+/**
+ * Keep a lease's deposit_status in step with whether its deposit invoice has
+ * been paid, so "deposits held" only ever counts money actually received.
+ */
+async function syncDepositStatus(r, invoice) {
+  if (String(invoice.type) !== 'Deposit' || !invoice.lease_id) return;
+  const lease = await findRow(r, 'Leases', invoice.lease_id);
+  if (!lease) return;
+  if (DEPOSIT_SETTLED.indexOf(String(lease.deposit_status)) >= 0) return;
+
+  const want = String(invoice.status) === 'Paid' ? 'Held' : 'Pending';
+  if (String(lease.deposit_status) !== want) {
+    await updateRow(r, 'Leases', lease.id, { deposit_status: want }, SYSTEM_ACTOR, true);
+  }
+}
+
+/**
+ * Book a completed maintenance ticket's cost as an expense, linked back by
+ * `reference`, so re-saving the ticket updates the same row.
+ */
+const MAINTENANCE_EXPENSE_CATEGORY = { Cleaning: 'Cleaning', Security: 'Security', Other: 'Other' };
+
+async function recordMaintenanceExpense(r, ticket) {
+  const cost = round2(parseFloat(ticket.cost || 0) || 0);
+  const done = ['Resolved', 'Closed'].indexOf(String(ticket.status)) >= 0;
+
+  let existing = null;
+  (await readTable(r, 'Expenses')).forEach(e => {
+    if (String(e.reference) === String(ticket.id) && String(e.category) !== 'Deposit Refund') existing = e;
+  });
+
+  // not finished, or nothing spent: make sure no stale expense is left behind
+  if (!done || cost <= 0) {
+    if (existing) await deleteRow(r, 'Expenses', existing.id, SYSTEM_ACTOR);
+    return null;
+  }
+
+  const row = {
+    property_id: ticket.property_id, unit_id: ticket.unit_id,
+    date: ticket.completed_date || today(r),
+    category: MAINTENANCE_EXPENSE_CATEGORY[String(ticket.category)] || 'Repairs',
+    description: ticket.title + (ticket.vendor_name ? ' · ' + ticket.vendor_name : ''),
+    vendor: ticket.vendor_name || '', amount: cost, reference: ticket.id
+  };
+  return existing
+    ? updateRow(r, 'Expenses', existing.id, row, SYSTEM_ACTOR, true)
+    : createRow(r, 'Expenses', row, SYSTEM_ACTOR, true);
+}
+
+/**
+ * Validate a payment saved from the Payments page, and tie it to its invoice.
+ * A payment with no invoice is money on account and is left as entered.
+ */
+async function preparePayment(r, data, before) {
+  const invoiceId = data.invoice_id !== undefined ? data.invoice_id : (before ? before.invoice_id : '');
+  if (!invoiceId) return;
+
+  const invoice = await findRow(r, 'Invoices', invoiceId);
+  if (!invoice) throw new Error('Invoice ' + invoiceId + ' not found');
+
+  const amount = round2(parseFloat(data.amount !== undefined ? data.amount : (before ? before.amount : 0)) || 0);
+  if (!(amount > 0)) throw new Error('Payment amount must be greater than zero');
+
+  const alreadyOnIt = before && String(before.invoice_id) === String(invoiceId)
+    ? round2(parseFloat(before.amount || 0) || 0) : 0;
+  const changesMoney = !before || alreadyOnIt !== amount || String(before.invoice_id) !== String(invoiceId);
+  if (changesMoney) {
+    if (String(invoice.status) === 'Void') throw new Error('That invoice is void.');
+    if (String(invoice.status) === 'Draft') throw new Error(invoice.id + ' is still a draft. Issue it before taking payment.');
+    const room = round2((parseFloat(invoice.balance || 0) || 0) + alreadyOnIt);
+    if (amount > room + 0.009) {
+      throw new Error('That is more than the ' + room + ' still owed on ' + invoice.id +
+                      '. To spread a larger payment over several invoices, record it from the invoice.');
+    }
+  }
+
+  // the invoice decides whose money this is, as it does for recordPayment
+  data.tenant_id = invoice.tenant_id;
+  data.lease_id = invoice.lease_id;
+  data.property_id = invoice.property_id || await inferProperty(r, invoice);
+}
+
+// ── deposits ────────────────────────────────────────────────────────────────
+
+/** Deposit statuses the app sets itself, once money has moved. */
+const DEPOSIT_SETTLED = ['Refunded', 'Partially Refunded', 'Forfeited', 'Transferred'];
+
+/**
+ * Where a lease's security deposit stands, from the records rather than from
+ * its status field: received, applied at move-out, refunded, and still held.
+ * A deposit is money held for the tenant, not income.
+ */
+async function depositLedger(r, lease) {
+  let paid = 0, hasInvoice = false;
+  (await readTable(r, 'Invoices')).forEach(inv => {
+    if (String(inv.lease_id) === String(lease.id) && String(inv.type) === 'Deposit' && String(inv.status) !== 'Void') {
+      hasInvoice = true;
+      paid += num(inv.amount_paid);
+    }
+  });
+  const status = String(lease.deposit_status || '');
+  const received = paid > 0 ? paid : (status && status !== 'Pending' ? num(lease.deposit_amount) : 0);
+
+  let applied = 0, refunded = 0;
+  (await readTable(r, 'Payments')).forEach(p => {
+    if (String(p.method) === 'Deposit Adjustment' && String(p.reference) === String(lease.id)) applied += num(p.amount);
+  });
+  (await readTable(r, 'Expenses')).forEach(e => {
+    if (String(e.category) === 'Deposit Refund' && String(e.reference) === String(lease.id)) refunded += num(e.amount);
+  });
+
+  const held = status === 'Transferred' ? 0 : round2(received - applied - refunded);
+  return { received: round2(received), applied: round2(applied), refunded: round2(refunded),
+           held: Math.max(0, held), hasInvoice };
+}
+
+/** depositLedger for many leases in one pass over the tables — for the dashboard figures. */
+async function depositLedgers(r, leases) {
+  const paid = {}, applied = {}, refunded = {};
+  (await readTable(r, 'Invoices')).forEach(inv => {
+    if (String(inv.type) === 'Deposit' && String(inv.status) !== 'Void') paid[inv.lease_id] = (paid[inv.lease_id] || 0) + num(inv.amount_paid);
+  });
+  (await readTable(r, 'Payments')).forEach(p => {
+    if (String(p.method) === 'Deposit Adjustment') applied[p.reference] = (applied[p.reference] || 0) + num(p.amount);
+  });
+  (await readTable(r, 'Expenses')).forEach(e => {
+    if (String(e.category) === 'Deposit Refund') refunded[e.reference] = (refunded[e.reference] || 0) + num(e.amount);
+  });
+  const out = {};
+  leases.forEach(l => {
+    const status = String(l.deposit_status || '');
+    const received = paid[l.id] > 0 ? paid[l.id] : (status && status !== 'Pending' ? num(l.deposit_amount) : 0);
+    const held = status === 'Transferred' ? 0 : round2(received - (applied[l.id] || 0) - (refunded[l.id] || 0));
+    out[l.id] = { received: round2(received), held: Math.max(0, held) };
+  });
+  return out;
+}
+
+/**
+ * The statuses that record money leaving the deposit are written by
+ * settleDeposit and renewLease, which book the money that goes with them.
+ * Refunded stays allowed from the form — it returns the whole balance.
+ */
+async function assertDepositStatusChange(r, before, merged) {
+  const was = before ? String(before.deposit_status || '') : '';
+  const now_ = String(merged.deposit_status || '');
+  if (now_ === was) return;
+  if (['Partially Refunded', 'Forfeited', 'Transferred'].indexOf(now_) >= 0) {
+    throw new Error('Use "Settle deposit" on the lease to record deductions and refunds — ' +
+                    'it books the money as well as the status.');
+  }
+  if (now_ === 'Refunded' && before && (await depositLedger(r, before)).held <= 0) {
+    throw new Error('No deposit is held on ' + before.id + ', so there is nothing to refund. ' +
+                    'Record the deposit payment first, or mark it Held if it was collected outside the app.');
+  }
+}
+
+/** A deposit cannot be cut below what has already been paid against it. */
+async function assertDepositAmountChange(r, before, merged) {
+  if (round2(num(before.deposit_amount)) === round2(num(merged.deposit_amount))) return;
+  let paid = 0;
+  (await readTable(r, 'Invoices')).forEach(inv => {
+    if (String(inv.lease_id) === String(before.id) && String(inv.type) === 'Deposit' && String(inv.status) !== 'Void') {
+      paid += num(inv.amount_paid);
+    }
+  });
+  if (num(merged.deposit_amount) < paid - 0.009) {
+    throw new Error(round2(paid) + ' of the deposit has already been received on ' + before.id +
+                    ', so it cannot be reduced below that.');
+  }
+}
+
+/**
+ * Keep the Deposit invoice in step with the lease's deposit. It is re-priced
+ * rather than replaced, so its number and any part payment stay; a deposit
+ * taken away before anything was paid voids it.
+ */
+async function repriceDepositInvoice(r, lease, user) {
+  const amount = round2(num(lease.deposit_amount));
+  for (const inv of await readTable(r, 'Invoices')) {
+    if (String(inv.lease_id) !== String(lease.id) || String(inv.type) !== 'Deposit' || String(inv.status) === 'Void') continue;
+    if (amount <= 0 && num(inv.amount_paid) <= 0) {
+      await updateRow(r, 'Invoices', inv.id, { status: 'Void', balance: 0, notes: 'Deposit removed from lease ' + lease.id }, SYSTEM_ACTOR, true);
+      await applyInvoiceTotals(r, inv.id, user);
+      continue;
+    }
+    let line = null;
+    (await itemsOfInvoice(r, inv.id)).forEach(it => { if (String(it.category) === 'Deposit') line = it; });
+    if (line) {
+      await updateRow(r, 'InvoiceItems', line.id, { unit_amount: amount, amount, quantity: 1 }, SYSTEM_ACTOR, true);
+    }
+    await updateRow(r, 'Invoices', inv.id, { amount }, SYSTEM_ACTOR, true);
+    await applyInvoiceTotals(r, inv.id, user);
+    await log(r, user, 'deposit-repriced', 'Invoices', inv.id, 'lease ' + lease.id + ' · ' + amount);
+  }
+}
+
+/** Marking a deposit Refunded from the lease form pays back whatever is still held. */
+async function recordDepositRefund(r, lease, user) {
+  const amount = (await depositLedger(r, lease)).held;
+  if (amount <= 0) return null;
+  const tenant = await findRow(r, 'Tenants', lease.tenant_id);
+  return createRow(r, 'Expenses', {
+    property_id: lease.property_id, unit_id: lease.unit_id, date: today(r),
+    category: 'Deposit Refund',
+    description: 'Security deposit returned' + (tenant ? ' to ' + tenant.full_name : '') +
+                 ' · lease ' + lease.id,
+    amount, reference: lease.id
+  }, user, true);
+}
+
+/**
+ * Move-out: settle a lease's deposit in one step — apply it to arrears, charge
+ * deductions on a "Deposit Deduction" invoice paid from it, refund the rest,
+ * and optionally end the lease.
+ */
+async function settleDeposit(r, payload, user) {
+  requireRole(user, 'manager');
+  const lease = await findRow(r, 'Leases', payload.lease_id);
+  if (!lease) throw new Error('Lease ' + payload.lease_id + ' not found');
+  const ledger = await depositLedger(r, lease);
+  if (ledger.held <= 0.009) throw new Error('No deposit is held on ' + lease.id + ', so there is nothing to settle.');
+
+  const date = String(payload.settlement_date || today(r)).slice(0, 10);
+  let remaining = ledger.held;
+  const applied = [];
+
+  const adjust = async (invoice, amount, note) => {
+    await createRow(r, 'Payments', {
+      invoice_id: invoice.id, lease_id: invoice.lease_id || lease.id, tenant_id: invoice.tenant_id,
+      property_id: invoice.property_id || lease.property_id, payment_date: date,
+      amount: round2(amount), method: 'Deposit Adjustment', reference: lease.id,
+      received_by: user.name || user.phone || '', notes: note
+    }, user, true);
+    await applyInvoiceTotals(r, invoice.id, user);
+    applied.push({ invoice_id: invoice.id, amount: round2(amount) });
+    remaining = round2(remaining - amount);
+  };
+
+  if (payload.apply_to_arrears) {
+    const owing = (await readTable(r, 'Invoices'))
+      .filter(i => String(i.tenant_id) === String(lease.tenant_id) && String(i.type) !== 'Deposit' &&
+                   ['Unpaid', 'Partial', 'Overdue'].indexOf(String(i.status)) >= 0 && num(i.balance) > 0)
+      .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
+    for (const inv of owing) {
+      if (remaining <= 0.009) break;
+      await adjust(inv, Math.min(remaining, round2(num(inv.balance))), 'Settled from the security deposit of ' + lease.id);
+    }
+  }
+
+  let deductionInvoice = null;
+  const deductions = (payload.deductions || []).filter(d => String(d.description || '').trim() && num(d.amount) > 0);
+  if (deductions.length) {
+    deductionInvoice = (await saveInvoice(r, {
+      data: { tenant_id: lease.tenant_id, lease_id: lease.id, unit_id: lease.unit_id,
+              property_id: lease.property_id, type: 'Deposit Deduction',
+              issue_date: date, due_date: date,
+              notes: 'Deductions from the security deposit of ' + lease.id },
+      items: deductions.map(d => ({ description: String(d.description).trim(), category: d.category || 'Other',
+                                    quantity: 1, unit_amount: round2(num(d.amount)), tax_rate: 0 }))
+    }, user)).invoice;
+    if (remaining > 0.009) {
+      await adjust(deductionInvoice, Math.min(remaining, round2(num(deductionInvoice.balance))),
+                   'Deducted from the security deposit of ' + lease.id);
+    }
+    deductionInvoice = await findRow(r, 'Invoices', deductionInvoice.id);
+  }
+
+  const refund = remaining > 0.009 ? round2(remaining) : 0;
+  let refundRow = null;
+  if (refund > 0) {
+    const tenant = await findRow(r, 'Tenants', lease.tenant_id);
+    refundRow = await createRow(r, 'Expenses', {
+      property_id: lease.property_id, unit_id: lease.unit_id, date, category: 'Deposit Refund',
+      vendor: tenant ? tenant.full_name : '', payment_method: payload.refund_method || '',
+      description: 'Security deposit returned' + (tenant ? ' to ' + tenant.full_name : '') + ' · lease ' + lease.id +
+                   (payload.refund_reference ? ' · ref ' + payload.refund_reference : ''),
+      amount: refund, reference: lease.id
+    }, user, true);
+  }
+
+  const changes = {
+    deposit_status: refund >= ledger.held - 0.009 ? 'Refunded' : (refund > 0 ? 'Partially Refunded' : 'Forfeited')
+  };
+  if (payload.end_lease && ['Active', 'Upcoming'].indexOf(String(lease.status)) >= 0) {
+    changes.status = 'Terminated';
+    const moveOut = String(payload.move_out_date || date).slice(0, 10);
+    if (!lease.end_date || moveOut < String(lease.end_date)) changes.end_date = moveOut;
+  }
+  await updateRow(r, 'Leases', lease.id, changes, SYSTEM_ACTOR, true);
+  if (changes.status) await refreshStatuses(r, user, true);
+
+  await log(r, user, 'deposit-settled', 'Leases', lease.id,
+            'held ' + ledger.held + ' · applied ' + round2(ledger.held - remaining) + ' · refunded ' + refund);
+  return {
+    lease: await findRow(r, 'Leases', lease.id),
+    held: ledger.held, applied, refunded: refund,
+    deduction_invoice: deductionInvoice, refund: refundRow
+  };
+}
+
+/**
+ * Renew a lease: the next agreement for the same unit and tenant, starting the
+ * day after this one ends, at the escalated rent. The deposit can be carried
+ * over — the old lease is marked Transferred and the new one Held.
+ */
+async function renewLease(r, payload, user) {
+  requireRole(user, 'manager');
+  const old = await findRow(r, 'Leases', payload.id);
+  if (!old) throw new Error('Lease ' + payload.id + ' not found');
+  if (String(old.status) === 'Terminated') throw new Error(old.id + ' was terminated, so it cannot be renewed.');
+  if (!old.end_date) throw new Error(old.id + ' has no end date — it is still running, so there is nothing to renew.');
+
+  const start = String(payload.start_date || fmtDate(addDays(parseDate(old.end_date), 1))).slice(0, 10);
+  const end = String(payload.end_date || '').slice(0, 10);
+  if (!end) throw new Error('Choose when the renewed lease ends.');
+  if (start <= String(old.end_date)) {
+    throw new Error('The renewal must start after ' + old.id + ' ends on ' + old.end_date + '.');
+  }
+
+  const carry = payload.carry_deposit !== false;
+  const held = carry ? (await depositLedger(r, old)).held : 0;
+  const rent = payload.rent_amount !== undefined && payload.rent_amount !== ''
+    ? round2(num(payload.rent_amount)) : round2(currentMonthlyRent(r, old, old.end_date));
+
+  const renewed = await writeRowLocked(r, 'create', 'Leases', { table: 'Leases', data: {
+    property_id: old.property_id, unit_id: old.unit_id, tenant_id: old.tenant_id,
+    start_date: start, end_date: end, rent_amount: rent,
+    deposit_amount: carry ? held : num(payload.deposit_amount),
+    deposit_status: carry && held > 0 ? 'Held' : 'Pending',
+    frequency: payload.frequency || old.frequency, late_fee: old.late_fee, grace_days: old.grace_days,
+    escalation_pct: payload.escalation_pct !== undefined && payload.escalation_pct !== ''
+      ? payload.escalation_pct : old.escalation_pct,
+    gst_rate: old.gst_rate, renewed_from: old.id,
+    notes: 'Renewal of ' + old.id + (carry && held > 0 ? ' · deposit of ' + held + ' carried over' : '')
+  } }, user);
+
+  if (carry && held > 0) {
+    await updateRow(r, 'Leases', old.id, { deposit_status: 'Transferred' }, SYSTEM_ACTOR, true);
+  }
+  await log(r, user, 'lease-renewed', 'Leases', renewed.id, 'from ' + old.id + ' · rent ' + rent);
+  return { lease: await findRow(r, 'Leases', renewed.id), previous: await findRow(r, 'Leases', old.id) };
+}
+
+/** The monthly rent in force on a date, with annual escalation compounded from the lease start. */
+export function currentMonthlyRent(r, lease, onDate) {
+  const base = num(lease.rent_amount);
+  const pct = num(lease.escalation_pct);
+  const start = parseDate(lease.start_date), at = parseDate(onDate || today(r));
+  if (!pct || !start || !at || at < start) return round2(base);
+  const months = monthsBetween(start, at) - (at.getDate() < start.getDate() ? 1 : 0);
+  return round2(base * Math.pow(1 + pct / 100, Math.floor(Math.max(0, months) / 12)));
+}
+
+export function addDays(d, n) { const out = new Date(d.getTime()); out.setDate(out.getDate() + n); return out; }
+
+// ── invoices: voiding ───────────────────────────────────────────────────────
+
+async function assertVoidable(r, invoiceId) {
+  let received = 0;
+  (await readTable(r, 'Payments')).forEach(pay => {
+    if (String(pay.invoice_id) === String(invoiceId)) received += num(pay.amount);
+  });
+  if (received > 0) {
+    throw new Error('Cannot void ' + invoiceId + ' — ' + round2(received) +
+                    ' has already been received against it. Delete those payments first.');
+  }
+}
+
+/**
+ * Void an issued invoice. It keeps its number and stays on record, and
+ * nothing is owed on it. A voided rent invoice still counts as that period
+ * billed, so generating rent does not raise it again.
+ */
+async function voidInvoice(r, payload, user) {
+  requireRole(user, 'manager');
+  const inv = await findRow(r, 'Invoices', payload.id);
+  if (!inv) throw new Error('Invoice ' + payload.id + ' not found');
+  if (String(inv.status) === 'Void') throw new Error(inv.id + ' is already void.');
+  await assertVoidable(r, inv.id);
+  const reason = String(payload.reason || '').trim();
+  if (!reason) throw new Error('Give a reason for voiding ' + inv.id + ' — it is kept on the invoice.');
+  await updateRow(r, 'Invoices', inv.id, {
+    status: 'Void', balance: 0,
+    notes: (inv.notes ? inv.notes + ' · ' : '') + 'Voided ' + today(r) + ': ' + reason
+  }, user, true, payload.expected_version);
+  await applyInvoiceTotals(r, inv.id, user);
+  await log(r, user, 'void', 'Invoices', inv.id, reason.slice(0, 180));
+  return { invoice: await findRow(r, 'Invoices', inv.id) };
+}
+
+/** Append to the audit trail. Logging must never break a write. */
+async function log(r, user, action, entity, entityId, details) {
+  await guarded(r, async (sp) => {
+    const [id] = await reserveIds(sp, 'ActivityLog', 1, TABLES.ActivityLog.prefix);
+    await sp.tx`insert into activity_log (id, timestamp, actor, action, entity, entity_id, details) values (
+      ${id}, ${now(r)}, ${(user && (user.phone || user.email || user.name)) || 'system'},
+      ${action}, ${entity || null}, ${entityId || null}, ${details || null})`;
+  });
+  invalidate(r, 'ActivityLog');
+}
+
+// ────────────────────────────────────────────────────────────────── auth ────
+
+/**
+ * Reduce a phone number to a comparable form so that "+91 98800 11111",
+ * "098800 11111" and "9880011111" all resolve to the same account: digits only,
+ * the last ten. The database's app_users.phone_key uses the same rule.
+ */
+const LOCAL_PHONE_DIGITS = 10;
+
+export function normalisePhone(v) {
+  let digits = String(v == null ? '' : v).replace(/[^0-9]/g, '');
+  if (digits.length > LOCAL_PHONE_DIGITS) digits = digits.slice(-LOCAL_PHONE_DIGITS);
+  return digits;
+}
+
+/** Compares two strings in time independent of where they first differ. */
+export function constantTimeEquals(a, b) {
+  a = String(a); b = String(b);
+  let diff = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+  for (let i = 0; i < n; i++) diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  return diff === 0;
+}
+
+/**
+ * Sign-in throttling, per account: a few free attempts, then each failure
+ * locks the number out for twice as long as the last (30 s … 30 min), for six
+ * hours. While failures across all accounts run unusually high (spraying), the
+ * free attempts drop to none. Kept in login_throttle instead of CacheService.
+ */
+export const THROTTLE = { freeAttempts: 4, baseDelaySec: 30, maxDelaySec: 1800, windowSec: 21600,
+                          sprayThreshold: 100, sprayWindowSec: 900 };
+
+async function throttleRow(r, identifier, windowSec) {
+  const [row] = await r.tx`
+    select failures,
+           coalesce((extract(epoch from locked_until) * 1000)::bigint, 0) as until,
+           (extract(epoch from updated_at) * 1000)::bigint as at
+    from login_throttle where identifier = ${identifier}`;
+  if (!row || Date.now() - Number(row.at) > windowSec * 1000) return { n: 0, until: 0 };
+  return { n: Number(row.failures), until: Number(row.until) };
+}
+
+async function throttleCheck(r, identifier) {
+  const state = await throttleRow(r, identifier, THROTTLE.windowSec);
+  const wait = state.until - Date.now();
+  if (wait > 0) {
+    const minutes = Math.ceil(wait / 60000);
+    throw new Error('Too many failed sign-in attempts. Try again in ' +
+                    (minutes <= 1 ? 'a minute.' : minutes + ' minutes.'));
+  }
+}
+
+async function throttleWrite(r, identifier, n, until) {
+  await r.tx`insert into login_throttle (identifier, failures, locked_until, updated_at)
+             values (${identifier}, ${n}, ${until ? new Date(until).toISOString() : null}, now())
+             on conflict (identifier) do update
+               set failures = excluded.failures, locked_until = excluded.locked_until, updated_at = now()`;
+}
+
+async function throttleFail(r, identifier) {
+  const spray = (await throttleRow(r, '__global', THROTTLE.sprayWindowSec)).n + 1;
+  await throttleWrite(r, '__global', spray, 0);
+
+  const state = await throttleRow(r, identifier, THROTTLE.windowSec);
+  state.n++;
+  const free = spray > THROTTLE.sprayThreshold ? 0 : THROTTLE.freeAttempts;
+  if (state.n > free) {
+    const delay = Math.min(THROTTLE.baseDelaySec * Math.pow(2, state.n - free - 1), THROTTLE.maxDelaySec);
+    state.until = Date.now() + delay * 1000;
+  }
+  await throttleWrite(r, identifier, state.n, state.until);
+  // keep the table from growing without bound
+  await r.tx`delete from login_throttle where updated_at < now() - make_interval(secs => ${THROTTLE.windowSec})`;
+}
+
+async function throttleReset(r, identifier) {
+  await r.tx`delete from login_throttle where identifier = ${identifier}`;
+}
+
+// ── crypto ──────────────────────────────────────────────────────────────────
+
+const enc = new TextEncoder();
+
+function bytesToBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+const toBase64Url = (bytes) => bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function fromBase64Url(s) {
+  const b64 = s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function sha256(str) {
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(str)));
+}
+
+async function hmac(key, str) {
+  const k = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, enc.encode(str)));
+}
+
+export const uuid = () => crypto.randomUUID();
+
+/**
+ * Password hashing.
+ *
+ *   v3$<iterations>$<b64>  PBKDF2-SHA256 — what every password is stored as now
+ *   v2$<b64>               the Apps Script scheme: SHA-256 stretched 1,000 times
+ *   <b64>                  the original single round
+ *
+ * Apps Script had no PBKDF2, which is why v2 existed. The older forms are
+ * still verified, so nobody is locked out by the move, and each account is
+ * re-hashed as v3 the next time its password is used.
+ */
+export const PBKDF2_ITERATIONS = 600000;
+const V2_ITERATIONS = 1000;
+
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: enc.encode(salt), iterations }, key, 256);
+  return new Uint8Array(bits);
+}
+
+export async function hashPassword(password, salt, iterations) {
+  return 'v3$' + iterations + '$' + bytesToBase64(await pbkdf2(String(password), String(salt), iterations));
+}
+
+export async function hashPasswordV2(password, salt) {
+  let digest = await sha256(salt + '::' + password);
+  for (let i = 1; i < V2_ITERATIONS; i++) digest = await sha256(bytesToBase64(digest) + salt);
+  return 'v2$' + bytesToBase64(digest);
+}
+
+export async function hashPasswordLegacy(password, salt) {
+  return bytesToBase64(await sha256(salt + '::' + password));
+}
+
+/** True when `password` matches `stored`, under whichever scheme wrote it. */
+async function passwordMatches(password, salt, stored) {
+  stored = String(stored || '');
+  password = String(password);
+  if (stored.indexOf('v3$') === 0) {
+    const iterations = parseInt(stored.split('$')[1], 10);
+    if (!(iterations > 0)) return false;
+    return constantTimeEquals(await hashPassword(password, salt, iterations), stored);
+  }
+  if (stored.indexOf('v2$') === 0) return constantTimeEquals(await hashPasswordV2(password, salt), stored);
+  return constantTimeEquals(await hashPasswordLegacy(password, salt), stored);
+}
+
+/** True when a stored hash is weaker than what a new one would be. */
+function needsRehash(stored, iterations) {
+  stored = String(stored || '');
+  if (stored.indexOf('v3$') !== 0) return true;
+  return (parseInt(stored.split('$')[1], 10) || 0) < iterations;
+}
+
+/**
+ * Rules for a new password. Deliberately short: length is what actually
+ * matters, and long lists of character classes push people towards
+ * "Password1!" and a sticky note.
+ */
+const MIN_PASSWORD = 10;
+
+function assertPasswordAcceptable(password, phone) {
+  const pw = String(password || '');
+  if (pw.length < MIN_PASSWORD) {
+    throw new Error('Password must be at least ' + MIN_PASSWORD + ' characters.');
+  }
+  if (/^[0-9]+$/.test(pw)) throw new Error('Password cannot be only numbers.');
+  if (/^(.)\1+$/.test(pw)) throw new Error('Password cannot be the same character repeated.');
+  const digits = normalisePhone(phone);
+  if (digits && pw.replace(/[^0-9]/g, '').indexOf(digits) >= 0) {
+    throw new Error('Password cannot contain the phone number.');
+  }
+  return pw;
+}
+
+export async function signToken(secret, payload) {
+  const body = toBase64Url(enc.encode(JSON.stringify(payload)));
+  return body + '.' + toBase64Url(await hmac(secret, body));
+}
+
+async function verifyToken(secret, token) {
+  if (!token || typeof token !== 'string' || token.indexOf('.') < 0) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const expect = toBase64Url(await hmac(secret, parts[0]));
+  if (!constantTimeEquals(expect, parts[1])) return null;
+  let payload;
+  try { payload = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[0]))); }
+  catch (e) { return null; }
+  if (!payload || !payload.exp || payload.exp < Date.now()) return null;
+  return payload;
+}
+
+/**
+ * Verify the token, then re-check the account in the database: roles and the
+ * active flag can change mid-session, and a password change revokes every
+ * session minted before it.
+ */
+async function requireAuth(r, token) {
+  const payload = await verifyToken(r.env.authSecret, token);
+  if (!payload) throw new Error('AUTH_REQUIRED');
+
+  const current = await findRow(r, 'Users', payload.id);
+  if (!current) throw new Error('AUTH_REQUIRED');
+  if (String(current.active).toLowerCase() === 'false') throw new Error('AUTH_REQUIRED');
+
+  const changedAt = parseFloat(current.password_changed_at || 0) || 0;
+  if (changedAt && (!payload.iat || payload.iat < changedAt)) {
+    throw new Error('AUTH_REQUIRED');
+  }
+
+  return {
+    id: current.id, phone: current.phone, email: current.email,
+    name: current.name, role: current.role
+  };
+}
+
+function requireRole(user, min) {
+  if ((ROLE_RANK[user.role] || 0) < (ROLE_RANK[min] || 3)) {
+    throw new Error('Your role (' + user.role + ') cannot perform this action');
+  }
+}
+
+async function doLogin(r, payload) {
+  // Phone is the login credential; email is optional contact detail only.
+  const phone = normalisePhone(payload.phone || payload.identifier || '');
+  const password = String(payload.password || '');
+  if (!phone || !password) return fail('Phone number and password are required');
+
+  // One generic message for every failure mode, so a stranger cannot tell
+  // which numbers are registered.
+  const GENERIC = 'Invalid phone number or password';
+
+  try { await throttleCheck(r, phone); } catch (e) { return fail(e.message); }
+
+  const found = (await readTable(r, 'Users')).find(u => normalisePhone(u.phone) === phone) || null;
+
+  const disabled = found && String(found.active).toLowerCase() === 'false';
+  // Hash even when the number is unknown, so a missing account is not
+  // measurably faster to probe than a wrong password.
+  const matches = found
+    ? await passwordMatches(password, found.salt, found.password_hash)
+    : ((await hashPassword(password, 'no-such-user', r.env.hashIterations)) && false);
+
+  if (!found || disabled || !matches) {
+    await throttleFail(r, phone);
+    await log(r, { phone }, 'login-failed', 'Users', found ? found.id : '', disabled ? 'disabled' : '');
+    return fail(GENERIC);
+  }
+
+  await throttleReset(r, phone);
+
+  // Move an account onto the current hashing scheme the first time we can,
+  // now that we have the plaintext in hand.
+  if (needsRehash(found.password_hash, r.env.hashIterations)) {
+    const upgradeSalt = uuid();
+    await updateRow(r, 'Users', found.id, {
+      salt: upgradeSalt, password_hash: await hashPassword(password, upgradeSalt, r.env.hashIterations)
+    }, SYSTEM_ACTOR, true);
+    await log(r, SYSTEM_ACTOR, 'password-rehash', 'Users', found.id, 'upgraded to v3');
+  }
+
+  const session = await issueSession(r, found, Date.now());
+  await updateRow(r, 'Users', found.id, { last_login: now(r) }, { phone: found.phone, role: 'admin' }, true);
+  const data = { token: session.token, user: session.user, settings: await readSettings(r) };
+  // Signing in is always followed by a request for the whole workbook; answer
+  // both at once. Built through bootstrap(), so it obeys the same role limits.
+  if (payload.withSnapshot) data.snapshot = await bootstrap(r, session.user);
+  return ok(data);
+}
+
+/**
+ * A signed session for an account. `iat` must not be earlier than the
+ * account's password_changed_at, or requireAuth rejects the token.
+ */
+async function issueSession(r, account, at) {
+  const hours = parseFloat((await readSettings(r)).session_hours || '12') || 12;
+  const user = { id: account.id, phone: account.phone, email: account.email,
+                 name: account.name, role: account.role };
+  const token = await signToken(r.env.authSecret, {
+    id: user.id, phone: user.phone, email: user.email, name: user.name, role: user.role,
+    iat: at, exp: at + hours * 3600 * 1000
+  });
+  return { token, user };
+}
+
+async function changePassword(r, payload, user) {
+  const me = await findRow(r, 'Users', user.id);
+  if (!me) throw new Error('User not found');
+  if (!(await passwordMatches(payload.current || '', me.salt, me.password_hash))) {
+    throw new Error('Current password is incorrect');
+  }
+  assertPasswordAcceptable(payload.next, me.phone);
+  const salt = uuid();
+  const at = Date.now();
+  await updateRow(r, 'Users', me.id, {
+    salt, password_hash: await hashPassword(payload.next, salt, r.env.hashIterations),
+    password_changed_at: at
+  }, SYSTEM_ACTOR, true);
+  await log(r, user, 'password-change', 'Users', me.id, '');
+  // The change ends every session minted before it — including the one it was
+  // made from. Hand that one a replacement.
+  const session = await issueSession(r, me, at);
+  return { changed: true, token: session.token, user: session.user };
+}
+
+async function createUser(r, payload, user) {
+  requireRole(user, 'admin');
+  const phone = normalisePhone(payload.phone);
+  if (!phone) throw new Error('A phone number is required — it is the sign-in credential');
+  assertPasswordAcceptable(payload.password, payload.phone);
+
+  if ((await readTable(r, 'Users')).some(u => normalisePhone(u.phone) === phone)) {
+    throw new Error('That phone number already belongs to another user');
+  }
+  if (payload.role && !ROLE_RANK[payload.role]) throw new Error('Unknown role: ' + payload.role);
+
+  const salt = uuid();
+  return stripSecrets('Users', await createRow(r, 'Users', {
+    name: payload.name || '',
+    phone: String(payload.phone).trim(),
+    email: payload.email ? String(payload.email).trim().toLowerCase() : '',
+    role: payload.role || 'viewer',
+    salt, password_hash: await hashPassword(payload.password, salt, r.env.hashIterations),
+    password_changed_at: Date.now(), active: true
+  }, user));
+}
+
+// ───────────────────────────────────────────────────────────────── setup ────
+
+/** Add any default setting that is missing. Never overwrites one that exists. */
+async function ensureDefaultSettings(r) {
+  const settings = await readSettings(r);
+  for (const k of Object.keys(DEFAULT_SETTINGS)) {
+    if (settings[k] === undefined) await setSetting(r, k, DEFAULT_SETTINGS[k]);
+  }
+}
+
+/**
+ * Break-glass recovery, for when nobody can sign in. Run from a machine that
+ * holds the database URL (scripts/recover-admin.mjs) — never reachable from
+ * the public endpoint. Makes the phone number an active administrator with the
+ * given password, and clears any sign-in lockout.
+ */
+async function recoverAccess(r, phone, password, name) {
+  const normalised = normalisePhone(phone);
+  if (!normalised) throw new Error('A phone number is required');
+  assertPasswordAcceptable(password, phone);
+  await ensureDefaultSettings(r);
+
+  const actor = { role: 'admin', phone: 'owner', name: 'database owner' };
+  const users = await readTable(r, 'Users');
+  // the account with this number — or, for data carried over from the era of
+  // email sign-in, an account that has no phone yet
+  const target = users.find(u => normalisePhone(u.phone) === normalised) ||
+                 users.find(u => !normalisePhone(u.phone)) || null;
+
+  const salt = uuid();
+  const creds = {
+    phone: String(phone).trim(),
+    salt,
+    password_hash: await hashPassword(password, salt, r.env.hashIterations),
+    password_changed_at: Date.now(),
+    role: 'admin',
+    active: true
+  };
+
+  const result = target
+    ? await updateRow(r, 'Users', target.id, creds, actor, true)
+    : await createRow(r, 'Users', { ...creds, name: name || 'Administrator', email: '' }, actor, true);
+
+  await throttleReset(r, normalised);
+  await throttleReset(r, '__global');
+
+  await log(r, actor, 'recover-access', 'Users', result.id, 'via recover-admin script');
+  return { id: result.id, name: result.name, phone: result.phone, role: result.role };
+}
+
+/**
+ * Seed the first administrator.
+ *
+ * Authorisation, in order of precedence:
+ *   1. An admin session token — always allowed (fills in missing settings).
+ *   2. No users exist yet AND, if SETUP_KEY is configured, the caller supplies
+ *      it. Without a key, anonymous bootstrap is open only for an hour after
+ *      the deployment first answers, so a forgotten install cannot be claimed.
+ */
+async function doSetup(r, payload, token) {
+  let isAdmin = false;
+  try { isAdmin = (await requireAuth(r, token)).role === 'admin'; } catch (e) { isAdmin = false; }
+
+  const tables = Object.keys(TABLES);
+  if (!isAdmin) {
+    const existing = await readTable(r, 'Users');
+    if (existing.length > 0) {
+      // A new browser connecting to a configured workspace: acknowledge, but
+      // do not let an unauthenticated caller write anything.
+      return ok({ tables, adminCreated: false, alreadySeeded: true });
+    }
+    if (r.env.setupKey) {
+      if (!constantTimeEquals(String(payload.setupKey || ''), r.env.setupKey)) {
+        return fail('A setup key is required for this deployment.');
+      }
+    } else {
+      let firstSeen = parseFloat(await getState(r, 'FIRST_SEEN') || 0) || 0;
+      if (!firstSeen) { firstSeen = Date.now(); await setState(r, 'FIRST_SEEN', String(firstSeen)); }
+      if (Date.now() - firstSeen > BOOTSTRAP_WINDOW_MS) {
+        return fail('The first-run window for this deployment has closed. Create the ' +
+                    'administrator with scripts/recover-admin.mjs, or set a SETUP_KEY secret.');
+      }
+    }
+  }
+
+  await ensureDefaultSettings(r);
+
+  // seed the first admin (only when there are no users at all)
+  const users = await readTable(r, 'Users');
+  let created = null;
+  if (users.length === 0) {
+    const phone = normalisePhone(payload.adminPhone);
+    if (!phone) return fail('Provide adminPhone — it is the sign-in credential');
+    let password;
+    try { password = assertPasswordAcceptable(payload.adminPassword, payload.adminPhone); }
+    catch (e) { return fail(e.message); }
+    const salt = uuid();
+    created = await createRow(r, 'Users', {
+      name: payload.adminName || 'Administrator',
+      phone: String(payload.adminPhone).trim(),
+      email: payload.adminEmail ? String(payload.adminEmail).trim().toLowerCase() : '',
+      role: 'admin',
+      salt, password_hash: await hashPassword(password, salt, r.env.hashIterations),
+      password_changed_at: Date.now(), active: true
+    }, { phone: 'system', role: 'admin' });
+  }
+  return ok({ tables, adminCreated: !!created, alreadySeeded: users.length > 0 });
+}
+
+// ────────────────────────────────────────────────────────────── settings ────
+
+async function readSettings(r) {
+  const out = {};
+  (await readTable(r, 'Settings')).forEach(row => { if (row.key) out[String(row.key)] = row.value; });
+  return out;
+}
+
+async function setSetting(r, key, value) {
+  if (await findRow(r, 'Settings', key)) await patchRow(r, 'Settings', key, { value });
+  else await insertRow(r, 'Settings', { key, value });
+}
+
+// ───────────────────────────────────────────────────────────── bootstrap ────
+
+const COLLECTIONS = {
+  properties: 'Properties', units: 'Units', tenants: 'Tenants', leases: 'Leases',
+  invoices: 'Invoices', invoiceItems: 'InvoiceItems', payments: 'Payments',
+  maintenance: 'Maintenance', expenses: 'Expenses', documents: 'Documents',
+  meterReadings: 'MeterReadings'
+};
+
+/**
+ * One round-trip that hands the SPA everything it needs.
+ *
+ * @param known the table versions the browser already holds. A table whose
+ *   version still matches is left out and named in `unchanged`, so a save that
+ *   touched one table does not send back all eleven — and here, unlike on the
+ *   sheet, an unchanged table is not even read.
+ */
+async function bootstrap(r, user, known) {
+  await refreshIfStale(r, user);
+  known = known || {};
+  const versions = await tableVersions(r);
+  let instance = await getState(r, 'INSTANCE');
+  if (!instance) { instance = uuid().slice(0, 8); await setState(r, 'INSTANCE', instance); }
+
+  const out = {
+    user,
+    settings: await readSettings(r),
+    hashes: {},
+    unchanged: [],
+    timezones: { script: r.tz, sheet: r.tz },
+    users: (user.role === 'admin' ? (await readTable(r, 'Users')).map(scrubUser) : []),
+    activity: (ROLE_RANK[user.role] >= ROLE_RANK[readRoleFor('ActivityLog')]
+      ? (await readTableTail(r, 'ActivityLog', 200)).reverse() : []),
+    stats: await computeStats(r)
+  };
+  for (const key of Object.keys(COLLECTIONS)) {
+    const table = COLLECTIONS[key];
+    const hash = instance + '.' + (versions[TABLES[table].sql] || 0);
+    out.hashes[key] = hash;
+    if (known[key] && known[key] === hash) out.unchanged.push(key);
+    else out[key] = await readTable(r, table);
+  }
+  return out;
+}
+
+/** An administrator sets a new password for someone who has lost theirs. */
+async function resetPassword(r, payload, user) {
+  requireRole(user, 'admin');
+  const target = await findRow(r, 'Users', payload.id);
+  if (!target) throw new Error('User not found');
+  assertPasswordAcceptable(payload.password, target.phone);
+
+  const salt = uuid();
+  await updateRow(r, 'Users', target.id, {
+    salt, password_hash: await hashPassword(payload.password, salt, r.env.hashIterations),
+    password_changed_at: Date.now()
+  }, user, true);
+  await log(r, user, 'password-reset', 'Users', target.id, 'by ' + (user.phone || user.name));
+  return { reset: true, id: target.id };
+}
+
+/** Disable an account without deleting its history. Takes effect immediately. */
+async function setUserActive(r, payload, user) {
+  requireRole(user, 'admin');
+  const active = payload.active === true || String(payload.active).toLowerCase() === 'true';
+  const row = await updateRow(r, 'Users', payload.id, { active }, user);
+  await log(r, user, active ? 'user-enabled' : 'user-disabled', 'Users', payload.id, '');
+  return scrubUser(row);
+}
+
+async function setUserRole(r, payload, user) {
+  requireRole(user, 'admin');
+  if (!ROLE_RANK[payload.role]) throw new Error('Unknown role: ' + payload.role);
+  const row = await updateRow(r, 'Users', payload.id, { role: payload.role }, user);
+  await log(r, user, 'user-role-changed', 'Users', payload.id, payload.role);
+  return scrubUser(row);
+}
+
+function scrubUser(u) {
+  return {
+    id: u.id, name: u.name, phone: u.phone, email: u.email,
+    role: u.role, active: u.active, last_login: u.last_login
+  };
+}
+
+// ───────────────────────────────────────────────────── billing operations ──
+
+/**
+ * Create rent invoices for every active lease whose billing periods up to
+ * `upto` are not yet invoiced. Idempotent: re-running never double-bills.
+ */
+async function generateInvoices(r, payload, user) {
+  requireRole(user, 'manager');
+  const upto = payload.upto || today(r);
+  const leases = await readTable(r, 'Leases');
+  const invoices = await readTable(r, 'Invoices');
+
+  // A period counts as billed once any invoice for that lease and start date
+  // carries rent — not only one still typed "Rent".
+  const rentLine = {};
+  (await readTable(r, 'InvoiceItems')).forEach(it => {
+    if (String(it.category) === 'Rent') rentLine[it.invoice_id] = true;
+  });
+  const billed = {};
+  invoices.forEach(inv => {
+    if (inv.type === 'Rent' || (inv.lease_id && inv.period_start && rentLine[inv.id])) {
+      billed[inv.lease_id + '|' + inv.period_start] = true;
+    }
+  });
+
+  const t = today(r);
+  const headers = [], meta = [];
+  for (const lease of leases) {
+    // The stored status is only as fresh as the last refresh; go by the dates too.
+    if (String(lease.status) !== 'Active' &&
+        deriveLeaseStatus(r, lease.start_date, lease.end_date, lease.status) !== 'Active') continue;
+    for (const period of periodsFor(lease, upto)) {
+      const key = lease.id + '|' + period.start;
+      if (billed[key]) continue;
+      billed[key] = true;
+      const amount = round2(period.amount);
+      // GST on rent follows the lease (18% on commercial property, nothing on a home)
+      const rate = num(lease.gst_rate);
+      const gst = round2(amount * rate / 100);
+      const split = rate > 0 ? await gstSplit(r, lease, gst) : { cgst: '', sgst: '', igst: '', place_of_supply: '' };
+      headers.push({
+        lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id,
+        property_id: lease.property_id, type: 'Rent',
+        period_start: period.start, period_end: period.end,
+        issue_date: period.start, due_date: period.due,
+        amount, tax: gst, total: round2(amount + gst), amount_paid: 0, balance: round2(amount + gst),
+        cgst: split.cgst, sgst: split.sgst, igst: split.igst, place_of_supply: split.place_of_supply,
+        status: period.due < t ? 'Overdue' : 'Unpaid',
+        notes: period.prorated
+          ? 'Auto-generated part period — ' + period.days + ' of ' + period.fullDays + ' days'
+          : 'Auto-generated ' + lease.frequency + ' rent'
+      });
+      meta.push({ period, amount, rate, gst });
+    }
+  }
+
+  // two writes in total, however many periods are due
+  const created = await appendRows(r, 'Invoices', headers, user);
+  await appendRows(r, 'InvoiceItems', created.map((row, n) => {
+    const period = meta[n].period;
+    return {
+      invoice_id: row.id,
+      description: 'Rent · ' + period.start + ' to ' + period.end +
+                   (period.prorated ? ' (' + period.days + '/' + period.fullDays + ' days)' : ''),
+      category: 'Rent', quantity: 1, unit_amount: meta[n].amount, amount: meta[n].amount,
+      tax_rate: meta[n].rate || 0, tax_amount: meta[n].gst, notes: ''
+    };
+  }), user);
+
+  // what was raised already overdue gets its late fee now, not on tomorrow's first load
+  if (created.length) await applyLateFees(r, SYSTEM_ACTOR);
+
+  await log(r, user, 'generate-invoices', 'Invoices', '', created.length + ' created up to ' + upto);
+  return { created: created.length, invoices: created };
+}
+
+/** Whole days from a to b inclusive of both ends. */
+function daysInclusive(a, b) {
+  return Math.round((b.getTime() - a.getTime()) / 86400000) + 1;
+}
+
+/** Every billing period of a lease that has started on or before `upto`. */
+export function periodsFor(lease, upto) {
+  const out = [];
+  const start = parseDate(lease.start_date);
+  const end = lease.end_date ? parseDate(lease.end_date) : null;
+  const limit = parseDate(upto);
+  if (!start || !limit) return out;
+
+  const step = { Monthly: 1, Quarterly: 3, 'Half-Yearly': 6, Yearly: 12 }[lease.frequency || 'Monthly'] || 1;
+  const grace = parseInt(lease.grace_days || 0, 10) || 0;
+  const baseRent = parseFloat(lease.rent_amount || 0) || 0;
+  const escalation = parseFloat(lease.escalation_pct || 0) || 0;
+
+  // Each period is measured from the lease start rather than from the previous
+  // period, so a lease beginning on the 31st is not permanently pulled back to
+  // the 28th once it passes February.
+  for (let i = 0; i < 400; i++) {
+    const periodStart = addMonths(start, i * step);
+    if (periodStart > limit) break;
+    if (end && periodStart > end) break;
+
+    const fullEnd = addMonths(start, (i + 1) * step);
+    fullEnd.setDate(fullEnd.getDate() - 1);
+    const periodEnd = (end && fullEnd > end) ? new Date(end.getTime()) : fullEnd;
+
+    // rent escalates on each anniversary of the lease start
+    const years = Math.floor(monthsBetween(start, periodStart) / 12);
+    let amount = baseRent * step * Math.pow(1 + escalation / 100, years);
+
+    // A lease that ends part-way through a period is only charged for the days
+    // it actually covers.
+    const fullDays = daysInclusive(periodStart, fullEnd);
+    const actualDays = daysInclusive(periodStart, periodEnd);
+    const prorated = actualDays < fullDays;
+    if (prorated && fullDays > 0) amount = amount * (actualDays / fullDays);
+
+    const due = new Date(periodStart.getTime());
+    due.setDate(due.getDate() + grace);
+
+    out.push({
+      start: fmtDate(periodStart), end: fmtDate(periodEnd), due: fmtDate(due),
+      amount: round2(amount), prorated, days: actualDays, fullDays
+    });
+  }
+  return out;
+}
+
+/**
+ * Create or update an invoice together with its line items. The header's
+ * `amount` is always the sum of its lines; sending the full item list replaces
+ * what was there.
+ */
+async function saveInvoice(r, payload, user) {
+  requireRole(user, 'manager');
+  const data = { ...(payload.data || {}) };
+  const items = payload.items || [];
+  if (!items.length) throw new Error('An invoice needs at least one line item');
+
+  // price each line, then let the lines define the invoice total
+  let subtotal = 0, lineTax = 0, hasRates = false;
+  const priced = items.map(raw => {
+    const qty = raw.quantity === '' || raw.quantity === undefined ? 1 : (parseFloat(raw.quantity) || 0);
+    const unit = parseFloat(raw.unit_amount || 0) || 0;
+    const amount = round2(qty * unit);
+    const rate = num(raw.tax_rate);
+    if (rate < 0 || rate > 100) throw new Error('GST rate must be between 0 and 100%.');
+    const taxAmount = round2(amount * rate / 100);
+    if (rate > 0) hasRates = true;
+    subtotal += amount;
+    lineTax += taxAmount;
+    return {
+      id: raw.id || '',
+      description: String(raw.description || '').trim(),
+      category: raw.category || 'Other',
+      quantity: qty,
+      unit_amount: unit,
+      amount,
+      tax_rate: rate || 0,
+      tax_amount: taxAmount,
+      notes: raw.notes || ''
+    };
+  });
+
+  for (const it of priced) {
+    if (!it.description) throw new Error('Every line item needs a description');
+  }
+
+  // GST charged per line is the tax; an invoice with no rates keeps a flat tax
+  // typed on the header, as invoices made before line rates existed do
+  const tax = hasRates ? round2(lineTax) : num(data.tax);
+  data.tax = tax;
+  data.amount = round2(subtotal);
+  data.total = round2(subtotal + tax);
+
+  const prior = payload.id ? await findRow(r, 'Invoices', payload.id) : null;
+  if (payload.id && !prior) throw new Error('Invoices ' + payload.id + ' not found');
+  if (prior && String(prior.status) === 'Void') {
+    throw new Error(prior.id + ' is void, so it cannot be changed. Raise a new invoice instead.');
+  }
+  // An edit keeps the status it has; the one change an edit can make is
+  // issuing a draft. Paid, Overdue and the rest are worked out, never typed.
+  if (!prior) data.status = String(data.status) === 'Draft' ? 'Draft' : 'Unpaid';
+  else if (String(prior.status) === 'Draft' && data.status && String(data.status) !== 'Draft') data.status = 'Unpaid';
+  else delete data.status;
+
+  // a single-category invoice keeps that label; a mixed one says so — except
+  // that Rent and Deposit are what billing keys on, so they keep their type
+  const distinct = Object.keys(priced.reduce((m, it) => { m[it.category] = true; return m; }, {}));
+  const keepType = prior && ['Rent', 'Deposit', 'Deposit Deduction'].indexOf(String(prior.type)) >= 0;
+  if (!data.type) data.type = keepType ? prior.type : (distinct.length === 1 ? distinct[0] : 'Mixed');
+
+  data.property_id = await inferProperty(r, prior ? { ...prior, ...data } : data);
+
+  const invoice = payload.id
+    ? await updateRow(r, 'Invoices', payload.id, data, user, false, payload.expected_version)
+    : await createRow(r, 'Invoices', data, user);
+
+  // replace the line set: update what stayed, add what is new, drop the rest
+  const existing = await itemsOfInvoice(r, invoice.id);
+  const kept = {};
+  const added = [];
+  for (const it of priced) {
+    const row = { invoice_id: invoice.id, description: it.description, category: it.category,
+                  quantity: it.quantity, unit_amount: it.unit_amount, amount: it.amount,
+                  tax_rate: it.tax_rate, tax_amount: it.tax_amount, notes: it.notes };
+    if (it.id && existing.some(e => e.id === it.id)) {
+      await updateRow(r, 'InvoiceItems', it.id, row, user, true);
+      kept[it.id] = true;
+    } else {
+      added.push(row);
+    }
+  }
+  for (const e of existing) {
+    if (!kept[e.id]) await deleteRow(r, 'InvoiceItems', e.id, SYSTEM_ACTOR);
+  }
+  await appendRows(r, 'InvoiceItems', added, user);
+
+  const settled = (await applyInvoiceTotals(r, invoice.id, user)) || invoice;
+  await log(r, user, payload.id ? 'update' : 'create', 'Invoices', invoice.id,
+            priced.length + ' line item(s), total ' + data.total);
+  return { invoice: (await findRow(r, 'Invoices', settled.id)) || settled, items: await itemsOfInvoice(r, invoice.id) };
+}
+
+async function itemsOfInvoice(r, invoiceId) {
+  return (await readTable(r, 'InvoiceItems')).filter(it => it.invoice_id === invoiceId);
+}
+
+/**
+ * Record money received against an invoice. Anything beyond its balance is
+ * applied to the same tenant's other outstanding invoices, oldest due first,
+ * so no balance ever goes negative and nothing is silently absorbed.
+ */
+async function recordPayment(r, payload, user) {
+  requireRole(user, 'manager');
+  const invoiceId = payload.invoice_id;
+  const amount = parseFloat(payload.amount || 0);
+  if (!(amount > 0)) throw new Error('Payment amount must be greater than zero');
+
+  const invoices = await readTable(r, 'Invoices');
+  const invoice = invoices.find(i => i.id === invoiceId) || null;
+  if (!invoice) throw new Error('Invoice ' + invoiceId + ' not found');
+  if (String(invoice.status) === 'Void') throw new Error('That invoice is void.');
+  if (String(invoice.status) === 'Draft') throw new Error(invoice.id + ' is still a draft. Issue it before taking payment.');
+
+  const owed = round2(parseFloat(invoice.balance || 0) || 0);
+  if (owed <= 0) throw new Error('Invoice ' + invoice.id + ' is already settled.');
+
+  const overflow = round2(amount - owed);
+  const applyHere = Math.min(round2(amount), owed);
+  const spillTargets = [];
+  if (overflow > 0.009) {
+    let remaining = overflow;
+    const others = invoices
+      .filter(i => i.id !== invoice.id && i.tenant_id === invoice.tenant_id &&
+                   ['Unpaid', 'Partial', 'Overdue'].indexOf(String(i.status)) >= 0 &&
+                   (parseFloat(i.balance || 0) || 0) > 0)
+      .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
+    for (const other of others) {
+      if (remaining <= 0.009) break;
+      const take = Math.min(remaining, round2(parseFloat(other.balance || 0) || 0));
+      spillTargets.push({ invoice: other, amount: round2(take) });
+      remaining = round2(remaining - take);
+    }
+    if (remaining > 0.009) {
+      throw new Error('That is ' + remaining + ' more than ' +
+        (spillTargets.length ? 'every outstanding invoice for this tenant comes to.'
+                             : 'the ' + owed + ' owed on ' + invoice.id + '.') +
+        ' Reduce the amount or raise the invoice first.');
+    }
+  }
+
+  const payment = await createRow(r, 'Payments', {
+    invoice_id: invoice.id, lease_id: invoice.lease_id, tenant_id: invoice.tenant_id,
+    property_id: invoice.property_id || await inferProperty(r, invoice),
+    payment_date: payload.payment_date || today(r),
+    amount: round2(applyHere), method: payload.method || 'Cash', reference: payload.reference || '',
+    received_by: user.name || user.phone || user.email, notes: payload.notes || ''
+  }, user, true);
+
+  const updated = await applyInvoiceTotals(r, invoice.id, user);
+
+  const alsoSettled = [];
+  for (const target of spillTargets) {
+    await createRow(r, 'Payments', {
+      invoice_id: target.invoice.id, lease_id: target.invoice.lease_id,
+      tenant_id: target.invoice.tenant_id,
+      property_id: target.invoice.property_id || await inferProperty(r, target.invoice),
+      payment_date: payload.payment_date || today(r), amount: target.amount,
+      method: payload.method || 'Cash', reference: payload.reference || '',
+      received_by: user.name || user.phone || user.email,
+      notes: 'Applied from a payment made against ' + invoice.id
+    }, user, true);
+    alsoSettled.push(await applyInvoiceTotals(r, target.invoice.id, user));
+  }
+
+  await log(r, user, 'payment', 'Invoices', invoice.id,
+            round2(amount) + ' via ' + (payload.method || 'Cash') +
+            (alsoSettled.length ? ' (spread over ' + (alsoSettled.length + 1) + ' invoices)' : ''));
+  return { payment: (await findRow(r, 'Payments', payment.id)) || payment, invoice: updated, alsoSettled };
+}
+
+async function voidPayment(r, paymentId, user) {
+  requireRole(user, 'admin');
+  const target = await findRow(r, 'Payments', paymentId);
+  if (!target) throw new Error('Payment not found');
+  // deleteRow puts the invoice back
+  await deleteRow(r, 'Payments', paymentId, user);
+  return { voided: paymentId, invoice: target.invoice_id ? await findRow(r, 'Invoices', target.invoice_id) : null };
+}
+
+/** Recompute amount_paid / balance / status — and the GST split — for one invoice. */
+async function applyInvoiceTotals(r, invoiceId) {
+  const invoice = await findRow(r, 'Invoices', invoiceId);
+  if (!invoice) return null;
+
+  let paid = 0;
+  (await readTable(r, 'Payments')).forEach(p => {
+    if (p.invoice_id === invoiceId) paid += parseFloat(p.amount || 0) || 0;
+  });
+
+  // line items, when present, are the source of truth for what is owed
+  const lines = await itemsOfInvoice(r, invoiceId);
+  let amount = parseFloat(invoice.amount || 0) || 0;
+  let lineTax = 0, hasRates = false;
+  if (lines.length) {
+    amount = 0;
+    lines.forEach(it => {
+      amount += num(it.amount);
+      if (num(it.tax_rate) > 0) hasRates = true;
+      lineTax += num(it.tax_amount);
+    });
+    amount = round2(amount);
+  }
+  const tax = hasRates ? round2(lineTax) : num(invoice.tax);
+  const total = lines.length ? round2(amount + tax)
+                             : (parseFloat(invoice.total || invoice.amount || 0) || 0);
+  const isVoid = String(invoice.status) === 'Void';
+  // nothing is owed on a void invoice, so it must not read as a balance
+  const balance = isVoid ? 0 : round2(total - paid);
+  const t = today(r);
+  let status;
+  if (isVoid) status = 'Void';
+  // a draft stays a draft until it is issued, whatever its dates say
+  else if (String(invoice.status) === 'Draft') status = 'Draft';
+  else if (paid <= 0) status = (invoice.due_date && invoice.due_date < t) ? 'Overdue' : 'Unpaid';
+  else if (balance > 0.009) status = (invoice.due_date && invoice.due_date < t) ? 'Overdue' : 'Partial';
+  else status = 'Paid';
+
+  const changes = { amount, tax, total, amount_paid: round2(paid), balance, status };
+  const split = hasRates ? await gstSplit(r, invoice, tax) : { cgst: '', sgst: '', igst: '', place_of_supply: '' };
+  Object.assign(changes, split);
+
+  const saved = await updateRow(r, 'Invoices', invoiceId, changes, SYSTEM_ACTOR, true);
+  await syncDepositStatus(r, saved);
+  return saved;
+}
+
+// ── GST ─────────────────────────────────────────────────────────────────────
+
+/** GST state codes, by name and by the usual two-letter abbreviation. */
+const GST_STATES = {
+  '01': ['Jammu and Kashmir', 'JK'], '02': ['Himachal Pradesh', 'HP'], '03': ['Punjab', 'PB'],
+  '04': ['Chandigarh', 'CH'], '05': ['Uttarakhand', 'UK', 'UT'], '06': ['Haryana', 'HR'],
+  '07': ['Delhi', 'DL'], '08': ['Rajasthan', 'RJ'], '09': ['Uttar Pradesh', 'UP'], '10': ['Bihar', 'BR'],
+  '11': ['Sikkim', 'SK'], '12': ['Arunachal Pradesh', 'AR'], '13': ['Nagaland', 'NL'], '14': ['Manipur', 'MN'],
+  '15': ['Mizoram', 'MZ'], '16': ['Tripura', 'TR'], '17': ['Meghalaya', 'ML'], '18': ['Assam', 'AS'],
+  '19': ['West Bengal', 'WB'], '20': ['Jharkhand', 'JH'], '21': ['Odisha', 'OD', 'OR', 'Orissa'],
+  '22': ['Chhattisgarh', 'CG', 'CT'], '23': ['Madhya Pradesh', 'MP'], '24': ['Gujarat', 'GJ'],
+  '26': ['Dadra and Nagar Haveli and Daman and Diu', 'DN', 'DD'], '27': ['Maharashtra', 'MH'],
+  '29': ['Karnataka', 'KA'], '30': ['Goa', 'GA'], '31': ['Lakshadweep', 'LD'], '32': ['Kerala', 'KL'],
+  '33': ['Tamil Nadu', 'TN'], '34': ['Puducherry', 'PY', 'Pondicherry'], '35': ['Andaman and Nicobar Islands', 'AN'],
+  '36': ['Telangana', 'TS', 'TG'], '37': ['Andhra Pradesh', 'AP'], '38': ['Ladakh', 'LA']
+};
+
+/** A state's two-digit GST code from its name, abbreviation or code; '' when unknown. */
+function gstStateCode(value) {
+  let v = String(value || '').trim();
+  if (!v) return '';
+  if (/^\d{1,2}$/.test(v)) { v = String(parseInt(v, 10)).padStart(2, '0'); return GST_STATES[v] ? v : ''; }
+  const key = v.toLowerCase().replace(/&/g, 'and').replace(/[^a-z]/g, '');
+  for (const code of Object.keys(GST_STATES)) {
+    for (const name of GST_STATES[code]) {
+      if (name.toLowerCase().replace(/[^a-z]/g, '') === key) return code;
+    }
+  }
+  return '';
+}
+
+const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
+
+/** A GSTIN in canonical form, or '' — refusing anything that is not one. */
+function assertGstin(value, label) {
+  const v = String(value || '').replace(/\s+/g, '').toUpperCase();
+  if (!v) return '';
+  if (!GSTIN_PATTERN.test(v) || !GST_STATES[v.slice(0, 2)]) {
+    throw new Error(label + ' "' + value + '" is not a valid GSTIN — 15 characters, starting with the state code.');
+  }
+  return v;
+}
+
+function assertUpiId(value) {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  if (!/^[A-Za-z0-9.\-_]{2,256}@[A-Za-z][A-Za-z0-9]{1,63}$/.test(v)) {
+    throw new Error('"' + value + '" is not a UPI ID. It looks like name@bank.');
+  }
+  return v;
+}
+
+/**
+ * Split an invoice's GST into CGST + SGST (supplier and place of supply in the
+ * same state) or IGST (different states). For renting immovable property the
+ * place of supply is where the property is (IGST Act s.12(3)), then the
+ * tenant's GSTIN; unknown is treated as intra-state and left visibly blank.
+ */
+async function gstSplit(r, invoice, gst) {
+  gst = round2(gst);
+  const settings = await readSettings(r);
+  const supplier = /^[0-9]{2}/.test(String(settings.gstin || '')) ? String(settings.gstin).slice(0, 2) : '';
+  let place = '';
+  const property = invoice.property_id ? await findRow(r, 'Properties', invoice.property_id) : null;
+  if (property) place = gstStateCode(property.state);
+  if (!place && invoice.tenant_id) {
+    const tenant = await findRow(r, 'Tenants', invoice.tenant_id);
+    if (tenant && GSTIN_PATTERN.test(String(tenant.gstin || ''))) place = String(tenant.gstin).slice(0, 2);
+  }
+  const placeLabel = place ? place + '-' + GST_STATES[place][0] : '';
+  if (supplier && place && supplier !== place) {
+    return { cgst: 0, sgst: 0, igst: gst, place_of_supply: placeLabel };
+  }
+  const half = round2(gst / 2);
+  return { cgst: half, sgst: round2(gst - half), igst: 0, place_of_supply: placeLabel };
+}
+
+// ───────────────────────────────────────────────────────────── housekeeping ──
+
+/**
+ * Housekeeping: flips overdue invoices, expires leases, syncs unit occupancy
+ * and tenant status, charges late fees. The writes are made as SYSTEM, not as
+ * the caller — the app maintaining its own derived state.
+ */
+async function refreshStatuses(r, user, quiet) {
+  const result = await refreshStatusesLocked(r, user, quiet);
+  await setState(r, 'LAST_REFRESH', today(r));
+  return result;
+}
+
+/** Housekeeping, at most once a day on a read; the daily job normally beats it. */
+async function refreshIfStale(r, user) {
+  if (await getState(r, 'LAST_REFRESH') === today(r)) return;
+  await refreshStatuses(r, user, true);
+}
+
+async function refreshStatusesLocked(r, user, quiet) {
+  const t = today(r);
+  let changes = 0;
+  const sys = SYSTEM_ACTOR;
+
+  for (const inv of await readTable(r, 'Invoices')) {
+    if (['Paid', 'Void', 'Draft'].indexOf(String(inv.status)) >= 0) continue;
+    if (inv.due_date && String(inv.due_date) < t && String(inv.status) !== 'Overdue') {
+      await updateRow(r, 'Invoices', inv.id, { status: 'Overdue' }, sys, true); changes++;
+    }
+  }
+
+  const occupied = {};
+  for (const lease of await readTable(r, 'Leases')) {
+    const status = String(lease.status);
+    if (status === 'Terminated') continue;
+    if (lease.end_date && String(lease.end_date) < t && status !== 'Expired') {
+      await updateRow(r, 'Leases', lease.id, { status: 'Expired' }, sys, true); changes++;
+      continue;
+    }
+    if (lease.start_date && String(lease.start_date) > t && status !== 'Upcoming') {
+      await updateRow(r, 'Leases', lease.id, { status: 'Upcoming' }, sys, true); changes++;
+    }
+    if (String(lease.start_date) <= t && (!lease.end_date || String(lease.end_date) >= t)) {
+      if (status !== 'Active') { await updateRow(r, 'Leases', lease.id, { status: 'Active' }, sys, true); changes++; }
+      occupied[lease.unit_id] = true;
+    }
+  }
+
+  for (const unit of await readTable(r, 'Units')) {
+    if (String(unit.status) === 'Under Maintenance') continue;
+    const want = occupied[unit.id] ? 'Occupied' : 'Vacant';
+    if (String(unit.status) !== want) { await updateRow(r, 'Units', unit.id, { status: want }, sys, true); changes++; }
+  }
+
+  // A tenant is Active while they hold a live lease and Past once every lease
+  // has ended. Someone with no lease at all is left alone — a Prospect.
+  const live = {}, everLeased = {};
+  (await readTable(r, 'Leases')).forEach(l => {
+    if (!l.tenant_id) return;
+    everLeased[l.tenant_id] = true;
+    if (['Active', 'Upcoming'].indexOf(String(l.status)) >= 0) live[l.tenant_id] = true;
+  });
+  for (const tenant of await readTable(r, 'Tenants')) {
+    if (!everLeased[tenant.id]) continue;
+    const want = live[tenant.id] ? 'Active' : 'Past';
+    if (String(tenant.status) !== want) {
+      await updateRow(r, 'Tenants', tenant.id, { status: want }, sys, true); changes++;
+    }
+  }
+
+  changes += await applyLateFees(r, sys);
+  await pruneActivityLog(r);
+
+  if (!quiet) await log(r, user || sys, 'refresh-statuses', 'System', '', changes + ' rows updated');
+  return { changes };
+}
+
+/**
+ * Charge the lease's late fee on an invoice that has gone overdue — once per
+ * invoice, as an ordinary line item, and never on a security deposit.
+ */
+async function applyLateFees(r, actor) {
+  const leases = {};
+  (await readTable(r, 'Leases')).forEach(l => { leases[l.id] = l; });
+
+  const charged = {};
+  (await readTable(r, 'InvoiceItems')).forEach(it => {
+    if (String(it.category) === 'Late Fee') charged[it.invoice_id] = true;
+  });
+
+  let applied = 0;
+  for (const inv of await readTable(r, 'Invoices')) {
+    if (String(inv.status) !== 'Overdue') continue;
+    if (charged[inv.id]) continue;
+    if (String(inv.type) === 'Deposit') continue;
+    const lease = leases[inv.lease_id];
+    if (!lease) continue;
+    const fee = round2(parseFloat(lease.late_fee || 0) || 0);
+    if (fee <= 0) continue;
+
+    // a late fee on rent is taxed like the rent it is charged on
+    const rate = num(lease.gst_rate);
+    await createRow(r, 'InvoiceItems', {
+      invoice_id: inv.id, description: 'Late fee · payment overdue since ' + inv.due_date,
+      category: 'Late Fee', quantity: 1, unit_amount: fee, amount: fee,
+      tax_rate: rate || 0, tax_amount: round2(fee * rate / 100), notes: ''
+    }, actor, true);
+    await applyInvoiceTotals(r, inv.id, actor);
+    await log(r, actor, 'late-fee', 'Invoices', inv.id, String(fee));
+    applied++;
+  }
+  return applied;
+}
+
+/** Keep the audit trail to a workable size, trimming in batches. */
+export const ACTIVITY_LOG_KEEP = 5000;
+
+async function pruneActivityLog(r) {
+  const [{ n }] = await r.tx`select count(*)::int as n from activity_log`;
+  const excess = Number(n) - ACTIVITY_LOG_KEEP;
+  if (excess < 500) return 0;
+  await r.tx`delete from activity_log where seq in (select seq from activity_log order by seq limit ${excess})`;
+  invalidate(r, 'ActivityLog');
+  return excess;
+}
+
+// ───────────────────────────────────────────────────────────────── stats ────
+
+async function computeStats(r) {
+  // A sold or inactive property is no longer part of the portfolio.
+  const live = {};
+  let liveProperties = 0;
+  (await readTable(r, 'Properties')).forEach(p => {
+    const status = String(p.status || 'Active');
+    if (status !== 'Sold' && status !== 'Inactive') { live[p.id] = true; liveProperties++; }
+  });
+  const inPortfolio = (row) => !row.property_id || live[row.property_id];
+
+  const units = (await readTable(r, 'Units')).filter(inPortfolio);
+  const leases = (await readTable(r, 'Leases')).filter(inPortfolio);
+  const invoices = await readTable(r, 'Invoices');
+  const payments = await readTable(r, 'Payments');
+  const expenses = await readTable(r, 'Expenses');
+  const maintenance = (await readTable(r, 'Maintenance')).filter(inPortfolio);
+  const tenants = await readTable(r, 'Tenants');
+
+  const t = today(r);
+  const month = t.slice(0, 7);
+  // A deposit is money held for the tenant, not income, and returning it is not
+  // an operating expense — so neither moves "collected" or "spent".
+  const depositInvoice = {};
+  invoices.forEach(i => { if (String(i.type) === 'Deposit') depositInvoice[i.id] = true; });
+  const ledgers = await depositLedgers(r, leases);
+  const sum = (arr, field, test) => {
+    let total = 0;
+    arr.forEach(row => { if (!test || test(row)) total += parseFloat(row[field] || 0) || 0; });
+    return round2(total);
+  };
+
+  let occupied = 0;
+  units.forEach(u => { if (String(u.status) === 'Occupied') occupied++; });
+
+  return {
+    properties: liveProperties,
+    units: units.length,
+    occupied_units: occupied,
+    vacant_units: units.length - occupied,
+    occupancy_rate: units.length ? Math.round((occupied / units.length) * 1000) / 10 : 0,
+    active_leases: leases.filter(l => String(l.status) === 'Active').length,
+    tenants: tenants.filter(tn => String(tn.status) === 'Active').length,
+    // the rent actually in force, escalation included
+    monthly_rent_roll: round2(leases.reduce((acc, l) =>
+      String(l.status) === 'Active' ? acc + currentMonthlyRent(r, l, t) : acc, 0)),
+    outstanding: sum(invoices, 'balance', i => ['Unpaid', 'Partial', 'Overdue'].indexOf(String(i.status)) >= 0),
+    overdue: sum(invoices, 'balance', i => String(i.status) === 'Overdue'),
+    overdue_count: invoices.filter(i => String(i.status) === 'Overdue').length,
+    collected_this_month: sum(payments, 'amount', p =>
+      String(p.payment_date || '').slice(0, 7) === month && !depositInvoice[p.invoice_id] &&
+      String(p.method) !== 'Deposit Adjustment'),
+    expenses_this_month: sum(expenses, 'amount', e =>
+      String(e.date || '').slice(0, 7) === month && String(e.category) !== 'Deposit Refund'),
+    open_tickets: maintenance.filter(m => ['Open', 'In Progress', 'On Hold'].indexOf(String(m.status)) >= 0).length,
+    // what is still owed back to tenants, from the deposit ledger
+    deposits_held: round2(leases.reduce((acc, l) => acc + (ledgers[l.id] ? ledgers[l.id].held : 0), 0))
+  };
+}
+
+// ───────────────────────────────────────────────────────────── reminders ────
+
+/** The daily reminder run. Does nothing unless switched on and email is configured. */
+async function dailyReminderJob(r) {
+  const settings = await readSettings(r);
+  if (String(settings.reminder_enabled).toLowerCase() !== 'true') return { sent: 0, skipped: 0, invoices: 0 };
+  if (!r.env.sendEmail) return { sent: 0, skipped: 0, invoices: 0, disabled: 'no email provider configured' };
+  return sendReminders(r, { email: 'scheduler', role: 'admin', name: 'Scheduler' }, { scheduled: true });
+}
+
+/**
+ * The days an unpaid invoice is due a reminder on, from the settings: N days
+ * before it falls due, on the day itself, and on each listed day overdue.
+ */
+function reminderSchedule(settings) {
+  const before = parseInt(settings.reminder_days_before || '3', 10);
+  const overdue = String(settings.reminder_overdue_days || '1,7,14,30').split(/[,\s]+/)
+    .map(d => parseInt(d, 10))
+    .filter(d => d > 0);
+  return { before: isNaN(before) ? 3 : Math.max(0, before), overdue };
+}
+
+/** Whole days from `a` to `b` (yyyy-MM-dd), negative when b is earlier. */
+function daysFrom(a, b) {
+  const da = parseDate(a), db = parseDate(b);
+  if (!da || !db) return NaN;
+  return Math.round((db.getTime() - da.getTime()) / 86400000);
+}
+
+/**
+ * Email tenants about what they owe: one email per tenant listing all their
+ * invoices, on a schedule, never twice in a day for the same invoice.
+ *
+ * No email provider is configured yet, so the button reports that plainly
+ * instead of pretending to send.
+ */
+async function sendReminders(r, user, opts) {
+  requireRole(user, 'manager');
+  if (!r.env.sendEmail) {
+    throw new Error('Email reminders are not set up yet. Share invoices over WhatsApp from the invoice page instead.');
+  }
+  const scheduled = !!(opts && opts.scheduled);
+  const settings = await readSettings(r);
+  const schedule = reminderSchedule(settings);
+  const t = today(r);
+  const tenants = {};
+  (await readTable(r, 'Tenants')).forEach(tn => { tenants[tn.id] = tn; });
+
+  const byTenant = {}, order = [];
+  (await readTable(r, 'Invoices')).forEach(inv => {
+    if (['Unpaid', 'Partial', 'Overdue'].indexOf(String(inv.status)) < 0) return;
+    if (num(inv.balance) <= 0) return;
+    if (String(inv.last_reminded) === t) return;
+    const until = daysFrom(t, inv.due_date);
+    if (isNaN(until)) return;
+    const due = scheduled
+      ? (until === schedule.before || until === 0 || schedule.overdue.indexOf(-until) >= 0)
+      : until <= schedule.before;
+    if (!due) return;
+    if (!byTenant[inv.tenant_id]) { byTenant[inv.tenant_id] = []; order.push(inv.tenant_id); }
+    byTenant[inv.tenant_id].push(inv);
+  });
+
+  let sent = 0, skipped = 0, reminded = [];
+  const money = (v) => (settings.currency_symbol || '') + round2(v).toLocaleString('en-IN');
+  for (const tenantId of order) {
+    const tenant = tenants[tenantId];
+    const list = byTenant[tenantId].sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
+    // Email is optional on a tenant record; those tenants simply get no email.
+    if (!tenant || !String(tenant.email || '').trim()) { skipped++; continue; }
+
+    const overdue = list.some(inv => String(inv.due_date) < t);
+    const total = list.reduce((s, inv) => s + num(inv.balance), 0);
+    const lines = list.map(inv =>
+      '  ' + inv.id + ' · ' + (inv.type || 'Invoice') +
+      (inv.period_start ? ' · ' + inv.period_start + ' to ' + inv.period_end : '') +
+      ' · due ' + inv.due_date + ' · ' + money(inv.balance) +
+      (String(inv.due_date) < t ? ' (overdue)' : ''));
+    const subject = (overdue ? 'Payment overdue — ' : 'Payment due — ') + money(total) +
+                    ' · ' + (settings.org_name || 'Property Management');
+    const body =
+      'Hello ' + tenant.full_name + ',\n\n' +
+      (overdue ? 'Our records show an overdue balance on your account.\n\n'
+               : 'This is a friendly reminder that a payment is due shortly.\n\n') +
+      lines.join('\n') + '\n\n' +
+      'Total due: ' + money(total) + '\n' +
+      (settings.upi_id ? 'Pay by UPI to: ' + settings.upi_id + '\n' : '') +
+      '\nPlease disregard this note if payment is already on its way.\n\n' +
+      '— ' + (settings.org_name || 'Property Management');
+    try {
+      await r.env.sendEmail(tenant.email, subject, body);
+      sent++;
+      reminded = reminded.concat(list);
+    } catch (e) { skipped++; }
+  }
+
+  for (const inv of reminded) {
+    await updateRow(r, 'Invoices', inv.id, { last_reminded: t }, SYSTEM_ACTOR, true);
+  }
+  await log(r, user, 'send-reminders', 'Invoices', '', sent + ' sent, ' + skipped + ' skipped' + (scheduled ? ' (scheduled)' : ''));
+  return { sent, skipped, invoices: reminded.length };
+}
+
+// ───────────────────────────────────────────────────────── meter readings ──
+
+const METER_CATEGORIES = ['Electricity', 'Water', 'Gas'];
+
+/**
+ * Bill a round of meter readings for a property in one go. Each reading is
+ * stored, so the next round starts from it; a unit with a live lease on the
+ * reading date is invoiced for consumption × rate, a vacant one billed to nobody.
+ */
+async function billMeterReadings(r, payload, user) {
+  requireRole(user, 'manager');
+  const property = await findRow(r, 'Properties', payload.property_id);
+  if (!property) throw new Error('Choose the property these readings are for.');
+  const category = String(payload.category || '');
+  if (METER_CATEGORIES.indexOf(category) < 0) throw new Error('Meter type must be one of ' + METER_CATEGORIES.join(', ') + '.');
+  const rate = round2(num(payload.rate));
+  if (!(rate > 0)) throw new Error('Enter the rate per unit.');
+  const date = String(payload.reading_date || today(r)).slice(0, 10);
+  const due = String(payload.due_date || date).slice(0, 10);
+  const t = today(r);
+
+  const units = {};
+  (await readTable(r, 'Units')).forEach(u => { if (String(u.property_id) === String(property.id)) units[u.id] = u; });
+  const leases = await readTable(r, 'Leases');
+
+  const readings = [], headers = [], meta = [], skipped = [];
+  for (const reading of (payload.readings || [])) {
+    if (reading.current_reading === '' || reading.current_reading === undefined || reading.current_reading === null) continue;
+    const unit = units[reading.unit_id];
+    if (!unit) throw new Error('Unit ' + reading.unit_id + ' is not part of ' + property.name + '.');
+    const previous = num(reading.previous_reading), current = num(reading.current_reading);
+    if (current < previous) {
+      throw new Error(unit.unit_number + ': the reading ' + current + ' is lower than the previous ' + previous + '.');
+    }
+    const consumption = Math.round((current - previous) * 1000) / 1000;
+    const amount = round2(consumption * rate);
+    let lease = null;
+    leases.forEach(l => {
+      if (String(l.unit_id) !== String(unit.id) || String(l.status) === 'Terminated') return;
+      if (String(l.start_date) <= date && (!l.end_date || String(l.end_date) >= date)) lease = l;
+    });
+
+    const row = {
+      property_id: property.id, unit_id: unit.id, lease_id: lease ? lease.id : '',
+      tenant_id: lease ? lease.tenant_id : '', category, reading_date: date,
+      previous_reading: previous, current_reading: current, consumption,
+      rate, amount, invoice_id: '', notes: ''
+    };
+    readings.push(row);
+
+    if (!lease) { skipped.push({ unit_id: unit.id, reason: 'no tenant on ' + date }); continue; }
+    if (amount <= 0) { skipped.push({ unit_id: unit.id, reason: 'no consumption' }); continue; }
+    headers.push({
+      lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: unit.id, property_id: property.id,
+      type: category, period_start: payload.period_start || '', period_end: payload.period_end || date,
+      issue_date: date, due_date: due, amount, tax: 0, total: amount,
+      amount_paid: 0, balance: amount, status: due < t ? 'Overdue' : 'Unpaid',
+      notes: category + ' meter · ' + previous + ' → ' + current
+    });
+    meta.push({ reading: row, unit, consumption, previous, current });
+  }
+  if (!readings.length) throw new Error('Enter at least one current reading.');
+
+  const invoices = await appendRows(r, 'Invoices', headers, user);
+  await appendRows(r, 'InvoiceItems', invoices.map((inv, n) => {
+    const m = meta[n];
+    m.reading.invoice_id = inv.id;
+    return {
+      invoice_id: inv.id, category, quantity: m.consumption, unit_amount: rate,
+      amount: inv.amount, tax_rate: 0, tax_amount: 0, notes: '',
+      description: category + ' · ' + m.unit.unit_number + ' · ' + m.previous + ' → ' + m.current +
+                   ' = ' + m.consumption + ' units'
+    };
+  }), user);
+  await appendRows(r, 'MeterReadings', readings, user);
+
+  await log(r, user, 'meter-readings', 'MeterReadings', property.id,
+            category + ' · ' + readings.length + ' read, ' + invoices.length + ' billed');
+  return { readings: readings.length, invoices, skipped };
+}
+
+// ───────────────────────────────────────────────────────────── date utils ──
+// Calendar arithmetic on local-midnight Dates built from y/m/d components and
+// formatted back the same way, so the server's own zone never shifts a day.
+
+export function parseDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  const s = String(v).slice(0, 10);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) { const d = new Date(s); return isNaN(d.getTime()) ? null : d; }
+  return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
+}
+
+export function fmtDate(d) {
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+export function addMonths(d, n) {
+  const day = d.getDate();
+  const out = new Date(d.getFullYear(), d.getMonth() + n, 1);
+  const lastDay = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
+  out.setDate(Math.min(day, lastDay));
+  return out;
+}
+
+export function monthsBetween(a, b) {
+  return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
+}
+
+export function round2(n) { return Math.round((parseFloat(n) || 0) * 100) / 100; }
+
+/**
+ * Internals the test suites drive directly (test/pg-harness.mjs). Each takes
+ * the request context `r` that `backend.run(fn)` hands to `fn`.
+ */
+export const internals = {
+  readTable, findRow, readSettings, refreshStatuses, applyInvoiceTotals, generateInvoices, computeStats,
+  sendReminders, dailyReminderJob, periodsFor, today, deriveLeaseStatus, getState, setState
+};

@@ -2,20 +2,25 @@
   "name": "vi-property-manager",
   "version": "1.0.0",
   "private": true,
-  "description": "Property and tenancy management on Google Sheets, hosted free on GitHub Pages.",
+  "description": "Property and tenancy management on Supabase (Postgres), hosted free on GitHub Pages.",
   "type": "module",
   "scripts": {
     "dev": "node test/mock-server.mjs",
-    "test": "node test/gas-test.mjs && node test/security-test.mjs && node test/production-test.mjs && node test/pwa-test.mjs && node test/smoke.mjs && node test/responsive-test.mjs && node test/pwa-browser-test.mjs",
+    "test": "node test/gas-test.mjs && node test/security-test.mjs && node test/production-test.mjs && node test/pwa-test.mjs && node test/smoke.mjs && node test/responsive-test.mjs && node test/pwa-browser-test.mjs && npm run test:supabase",
     "test:backend": "node test/gas-test.mjs",
     "test:security": "node test/security-test.mjs",
     "test:production": "node test/production-test.mjs",
     "test:pwa": "node test/pwa-test.mjs",
     "test:ui": "node test/smoke.mjs",
     "test:pwa:ui": "node test/pwa-browser-test.mjs",
-    "test:responsive": "node test/responsive-test.mjs"
+    "test:responsive": "node test/responsive-test.mjs",
+    "test:supabase": "node test/supabase-billing-test.mjs && node test/supabase-security-test.mjs && node test/supabase-production-test.mjs && node test/supabase-http-test.mjs && node test/supabase-migration-test.mjs && npm run test:ui:supabase",
+    "db:test": "docker run --rm -d --name vipm-test-db -e POSTGRES_PASSWORD=pw -p 55432:5432 postgres:17-alpine",
+    "test:ui:supabase": "BACKEND=supabase node test/smoke.mjs",
+    "dev:supabase": "BACKEND=supabase node test/mock-server.mjs"
   },
   "devDependencies": {
+    "postgres": "^3.4.9",
     "puppeteer-core": "^23.11.1"
   }
 }

@@ -2,10 +2,20 @@ import { el, icon, toast } from '../ui.js';
 import { config } from '../config.js';
 import { api, ping } from '../api.js';
 
-/** First-run wizard: point the site at an Apps Script deployment and seed an admin. */
+/**
+ * The API URLs the wizard accepts: the Supabase Edge Function (and a local
+ * `supabase start`), or — until it is retired — the Apps Script Web App.
+ */
+const API_URL_PATTERNS = [
+  /^https:\/\/[a-z0-9-]+\.supabase\.co\/functions\/v1\/[A-Za-z0-9_-]+\/?$/,
+  /^http:\/\/(localhost|127\.0\.0\.1):\d+\/functions\/v1\/[A-Za-z0-9_-]+\/?$/,
+  /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/
+];
+
+/** First-run wizard: point the site at the backend and seed an admin. */
 export function setupView(onDone) {
   const urlInput = el('input', {
-    class: 'input', type: 'url', placeholder: 'https://script.google.com/macros/s/AKfy…/exec',
+    class: 'input', type: 'url', placeholder: 'https://<project>.supabase.co/functions/v1/api',
     value: config.apiUrl, autocomplete: 'off', spellcheck: 'false'
   });
   const status = el('p', { class: 'form-error', hidden: true });
@@ -23,12 +33,12 @@ export function setupView(onDone) {
   const keyField = el('label', { hidden: true }, [
     'Setup key',
     keyInput,
-    el('small', { class: 'help', text: 'This deployment requires the SETUP_KEY set in its Script Properties.' })
+    el('small', { class: 'help', text: 'This deployment requires the SETUP_KEY set among its secrets.' })
   ]);
 
   seedBox.append(el('div', { class: 'stack' }, [
     el('h3', { text: 'Create the first administrator' }),
-    el('p', { class: 'muted', text: 'This account is stored in the Users tab of your sheet. Only shown once — after this, sign in normally.' }),
+    el('p', { class: 'muted', text: 'Only shown once — after this, sign in normally.' }),
     el('label', {}, ['Name', nameInput]),
     el('label', {}, [
       'Phone number', phoneInput,
@@ -48,9 +58,10 @@ export function setupView(onDone) {
   async function connect() {
     const url = urlInput.value.trim();
     status.hidden = true;
-    if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/.test(url)) {
+    if (!API_URL_PATTERNS.some(re => re.test(url))) {
       status.hidden = false;
-      status.textContent = 'That does not look like an Apps Script Web App URL. It should end in /exec.';
+      status.textContent = 'That does not look like the API URL. It looks like ' +
+        'https://<project>.supabase.co/functions/v1/api.';
       return;
     }
     connectBtn.disabled = true; connectBtn.textContent = 'Connecting…';
@@ -112,13 +123,13 @@ export function setupView(onDone) {
       el('div', { class: 'brand brand-lg' }, [icon('building', 26), el('span', { text: 'Property Manager' })]),
       el('div', { class: 'auth-intro' }, [
         el('span', { class: 'eyebrow', text: 'Secure setup' }),
-        el('h2', { text: 'Connect your Google Sheet' }),
+        el('h2', { text: 'Connect your database' }),
         el('p', { class: 'muted' }, [
-          'Your portfolio stays inside your own spreadsheet. Add the Apps Script web app URL below and we’ll connect the dashboard in minutes.'
+          'Your portfolio lives in your own database. Paste the API URL from your Supabase project below and we’ll connect the dashboard.'
         ])
       ]),
       status,
-      el('label', {}, ['Web App URL', urlInput]),
+      el('label', {}, ['API URL', urlInput]),
       seedBox,
       connectBtn,
       finishBtn

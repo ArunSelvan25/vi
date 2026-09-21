@@ -476,6 +476,30 @@ check('bootstrap never returns password hashes', () => {
   assert(!/"salt"/.test(dump), 'salt leaked to the client');
 });
 
+console.log('\n— the migration export —');
+check('the export is off until the owner sets an EXPORT_KEY', () => {
+  const b = makeSandbox();
+  b.handle('setup', { adminPhone: '9880011111', adminPassword: 'correct-horse-battery' }, '');
+  const admin = b.handle('login', { phone: '9880011111', password: 'correct-horse-battery' }, '').data.token;
+  const r = b.handle('exportForMigration', { exportKey: '' }, admin);
+  assert(r.ok === false && /switched off/.test(r.error), JSON.stringify(r).slice(0, 200));
+});
+check('with a key set, it needs both the key and an administrator', () => {
+  const b = makeSandbox();
+  b.handle('setup', { adminPhone: '9880011111', adminPassword: 'correct-horse-battery' }, '');
+  const admin = b.handle('login', { phone: '9880011111', password: 'correct-horse-battery' }, '').data.token;
+  b.__props.set('EXPORT_KEY', 'owner-chosen-key');
+  b.handle('createUser', { name: 'M', phone: '9000000004', role: 'manager', password: 'manager-pass-1234' }, admin);
+  const mgr = b.handle('login', { phone: '9000000004', password: 'manager-pass-1234' }, '').data.token;
+  assert(!b.handle('exportForMigration', { exportKey: 'guess' }, admin).ok, 'a wrong key was accepted');
+  assert(!b.handle('exportForMigration', { exportKey: 'owner-chosen-key' }, mgr).ok, 'a manager could export');
+  assert(!b.handle('exportForMigration', { exportKey: 'owner-chosen-key' }, '').ok, 'exported with no session');
+  const r = b.handle('exportForMigration', { exportKey: 'owner-chosen-key' }, admin);
+  assert(r.ok && r.data.tables.Users.length === 2 && r.data.tables.Users[0].password_hash, 'the export is incomplete');
+  assert(r.data.stats && typeof r.data.stats.outstanding === 'number', 'no figures to reconcile against');
+  assert(b.readTable('ActivityLog').some(l => l.action === 'export-for-migration'), 'the export was not audited');
+});
+
 console.log('\n' + '─'.repeat(56));
 console.log(fail ? `${fail} FAILED, ${pass} passed` : `ALL ${pass} SECURITY CHECKS PASSED`);
 process.exit(fail ? 1 : 0);

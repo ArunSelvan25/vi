@@ -153,6 +153,7 @@ function makeSandbox({ scriptTz = 'Asia/Kolkata', sheetTz = 'Asia/Kolkata' } = {
     PropertiesService: {
       getScriptProperties: () => ({
         getProperty: k => (props.has(k) ? props.get(k) : null),
+        getProperties: () => Object.fromEntries(props),
         setProperty: (k, v) => props.set(k, String(v)),
         deleteProperty: k => props.delete(k)
       })

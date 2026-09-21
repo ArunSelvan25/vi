@@ -1,3 +1,9 @@
 node_modules/
 *.log
 .DS_Store
+
+# the migration export holds password hashes — never commit it
+sheet-export*.json
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/

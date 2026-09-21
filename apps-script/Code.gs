@@ -187,6 +187,7 @@ function handle(action, payload, token) {
       case 'setUserRole':      return ok({ row: setUserRole(payload, user) });
       case 'sendReminders':    return ok(withSnapshot(payload, user, sendReminders(user, { scheduled: false })));
       case 'stats':            return ok(computeStats());
+      case 'exportForMigration': return ok(exportForMigration(payload, user));
       default: return fail('Unknown action: ' + action);
     }
   } catch (err) {
@@ -2067,6 +2068,49 @@ function bootstrap(user, known) {
     else out[key] = readTable(COLLECTIONS[key]);
   });
   return out;
+}
+
+/**
+ * Everything in the workbook, for the move to Supabase
+ * (scripts/import-sheet.mjs). Unlike every other read, this includes password
+ * hashes — so existing users keep their passwords after the move — and so it
+ * is locked twice over: an administrator's session AND an EXPORT_KEY script
+ * property, which only someone who can edit the script can create. It is off
+ * until the owner sets one; delete it again once the data has moved.
+ *
+ * The headline figures ride along, so the import can prove the new database
+ * adds up to exactly what the sheet did.
+ */
+function exportForMigration(payload, user) {
+  requireRole(user, 'admin');
+  var props = PropertiesService.getScriptProperties();
+  var key = props.getProperty('EXPORT_KEY');
+  if (!key) {
+    throw new Error('Exporting is switched off. Add an EXPORT_KEY script property ' +
+                    '(Project Settings → Script properties) to allow it, and delete it afterwards.');
+  }
+  if (!constantTimeEquals(String(payload.exportKey || ''), key)) throw new Error('Wrong export key.');
+
+  refreshStatuses(user, true);
+  var sequences = {};
+  var all = props.getProperties();
+  Object.keys(all).forEach(function (k) {
+    if (/^SEQ_/.test(k)) sequences[k.slice(4)] = parseInt(all[k], 10) || 0;
+  });
+  var tables = {}, headers = {};
+  Object.keys(SCHEMA).forEach(function (name) {
+    headers[name] = headersOf(sheetFor(name), name);
+    tables[name] = readTable(name).map(function (row) {
+      var copy = {};
+      Object.keys(row).forEach(function (k) { if (k !== '_row' && k !== '_v') copy[k] = row[k]; });
+      return copy;
+    });
+  });
+  log(user, 'export-for-migration', 'System', '', 'all tabs');
+  return {
+    exported_at: nowIso(), today: today(), timezone: sheetTimeZone(), script_timezone: Session.getScriptTimeZone(),
+    sequences: sequences, headers: headers, tables: tables, stats: computeStats()
+  };
 }
 
 /** An administrator sets a new password for someone who has lost theirs. */

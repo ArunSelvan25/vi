@@ -1,0 +1,7 @@
+# Supabase CLI configuration (supabase link / db push / functions deploy).
+project_id = "vi-property-manager"
+
+[functions.api]
+# The app signs its own sessions; Supabase's JWT check would reject the SPA,
+# which calls the function without a Supabase key.
+verify_jwt = false

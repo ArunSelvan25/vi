@@ -14,6 +14,11 @@
  * the backend would put them — so opening the app changes nothing by itself.
  *
  * Sign in with phone 9000012345 / password password123.
+ *
+ * BACKEND=supabase runs the Supabase backend instead, on a throwaway Postgres
+ * database (see pg-harness.mjs; `npm run db:test` starts one), with the same
+ * sample data loaded through the real import (scripts/import-sheet.mjs). Every
+ * browser suite can be pointed at it: BACKEND=supabase npm run test:ui.
  */
 import http from 'http';
 import fs from 'fs';
@@ -28,7 +33,9 @@ const TYPES = { '.html':'text/html', '.js':'text/javascript', '.css':'text/css',
 // The browser under test runs in this machine's time zone, so the backend and
 // the sheet do too — otherwise "today" differs between them around midnight.
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-const box = makeSandbox({ scriptTz: TZ, sheetTz: TZ });
+const SUPABASE = process.env.BACKEND === 'supabase';
+const pg = SUPABASE ? await import('./pg-harness.mjs') : null;
+const box = SUPABASE ? await pg.makeSandbox({ timeZone: TZ }) : makeSandbox({ scriptTz: TZ, sheetTz: TZ });
 
 // ── dates relative to today ─────────────────────────────────────────────────
 const pad = (n) => String(n).padStart(2, '0');
@@ -43,9 +50,13 @@ const monthEnd = (offset) => iso(new Date(now.getFullYear(), now.getMonth() + of
 const inDays = (n) => { const d = new Date(now); d.setDate(d.getDate() + n); return iso(d); };
 
 // ── set up the workbook and its administrator, as the wizard would ──────────
-const setup = box.handle('setup', { adminPhone: '+91 90000 12345', adminPassword: 'password123',
-                                    adminName: 'Admin', adminEmail: 'admin@example.com' }, '');
-if (!setup.ok) throw new Error('dev server setup failed: ' + setup.error);
+// (on Postgres the data goes in first: the import only writes to an empty database)
+const createAdmin = async () => {
+  const setup = await box.handle('setup', { adminPhone: '+91 90000 12345', adminPassword: 'password123',
+                                            adminName: 'Admin', adminEmail: 'admin@example.com' }, '');
+  if (!setup.ok) throw new Error('dev server setup failed: ' + setup.error);
+};
+if (!SUPABASE) await createAdmin();
 
 const seed = {
   Properties: [
@@ -103,26 +114,40 @@ const seed = {
 
 // write the rows into the tabs exactly as a sheet with this data would hold them
 const stamp = iso(now) + 'T09:00:00';
-for (const [table, rows] of Object.entries(seed)) {
-  const sh = box.sheetFor(table);
-  const headers = box.headersOf(sh, table);
-  for (const row of rows) {
-    const full = { created_at: stamp, updated_at: stamp, ...row };
-    sh.appendRow(headers.map((h) => full[h] ?? ''));
+if (SUPABASE) {
+  const { importExport } = await import('../scripts/import-sheet.mjs');
+  const tables = {};
+  for (const [table, rows] of Object.entries(seed)) {
+    tables[table] = rows.map(row => ({ created_at: stamp, updated_at: stamp, ...row }));
   }
+  await importExport(box.sql, { tables, timezone: TZ }, { timeZone: TZ });
+  await createAdmin();
+  // drop the throwaway database when the tests stop the server
+  const stop = () => pg.closeAll().finally(() => process.exit(0));
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+} else {
+  for (const [table, rows] of Object.entries(seed)) {
+    const sh = box.sheetFor(table);
+    const headers = box.headersOf(sh, table);
+    for (const row of rows) {
+      const full = { created_at: stamp, updated_at: stamp, ...row };
+      sh.appendRow(headers.map((h) => full[h] ?? ''));
+    }
+  }
+  box.invalidateAll();
 }
-box.invalidateAll();
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
 function handler(req, res) {
   if (req.url.startsWith('/api')) {
     let body = '';
     req.on('data', c => body += c);
-    req.on('end', () => {
+    req.on('end', async () => {
       let parsed = {};
       try { parsed = JSON.parse(body); } catch {}
       let out;
-      try { out = box.handle(parsed.action, parsed.payload || {}, parsed.token || ''); }
+      try { out = await box.handle(parsed.action, parsed.payload || {}, parsed.token || ''); }
       catch (e) { out = { ok: false, error: 'dev server: ' + e.message }; }
       res.writeHead(200, { 'Content-Type':'application/json', 'Access-Control-Allow-Origin':'*' });
       res.end(JSON.stringify(out));

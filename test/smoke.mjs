@@ -50,14 +50,14 @@ await page.goto(BASE + '/index.html', { waitUntil: 'networkidle0' });
 await step('first run shows setup wizard', async () => {
   await page.waitForSelector('.auth-card', { timeout: 5000 });
   const t = await page.$eval('.auth-card h2', e => e.textContent);
-  if (!/Connect your Google Sheet/.test(t)) throw new Error('got: ' + t);
+  if (!/Connect your database/.test(t)) throw new Error('got: ' + t);
 });
 
 await step('the wizard creates the first administrator on a fresh sheet', async () => {
-  // The wizard only accepts a real Apps Script URL, so answer for one here —
-  // with exactly what Code.gs says to an unconfigured sheet. The mock API
-  // always claims to be set up already, which is how this path broke unseen.
-  const FAKE = 'https://script.google.com/macros/s/TEST-DEPLOYMENT/exec';
+  // The wizard only accepts a real API URL, so answer for one here — with
+  // exactly what the backend says to an empty database. The mock API always
+  // claims to be set up already, which is how this path broke unseen.
+  const FAKE = 'https://abcdefghijklmnop.supabase.co/functions/v1/api';
   const seen = [];
   await page.setRequestInterception(true);
   const answer = (req) => {

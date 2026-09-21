@@ -1,5 +1,10 @@
 # Property & Tenancy Manager
 
+> **Moving to Supabase.** A Postgres backend that replaces the Google Sheet is
+> built and tested; the switch-over steps are in
+> [docs/SUPABASE_MIGRATION.md](docs/SUPABASE_MIGRATION.md). Until then the app
+> runs on the sheet as described below.
+
 A complete property management application that runs on **GitHub Pages for free**
 and uses a **Google Sheet as its database**.
 

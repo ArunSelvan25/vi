@@ -1,11 +1,13 @@
 import { config } from './config.js';
 
 /**
- * Calls the Apps Script Web App.
+ * Calls the backend — the Supabase Edge Function (or, until it is retired, the
+ * Apps Script Web App; both speak the same actions).
  *
  * The body is sent as text/plain on purpose: that keeps the request a CORS
  * "simple request", so the browser never sends a preflight OPTIONS — which
- * Apps Script cannot answer. The payload is still JSON.
+ * Apps Script cannot answer, and which would cost a round trip on Supabase.
+ * The payload is still JSON.
  */
 export async function api(action, payload = {}, { signal } = {}) {
   const url = config.apiUrl;
@@ -23,7 +25,7 @@ export async function api(action, payload = {}, { signal } = {}) {
   } catch (err) {
     if (err.name === 'AbortError') throw err;
     throw new ApiError(
-      'Could not reach the API. Check the deployment URL and that access is set to "Anyone".',
+      'Could not reach the API. Check the URL and your connection.',
       'NETWORK'
     );
   }
@@ -35,9 +37,9 @@ export async function api(action, payload = {}, { signal } = {}) {
   try {
     body = JSON.parse(text);
   } catch {
-    // Apps Script serves an HTML error page when the deployment is misconfigured.
+    // A misconfigured deployment answers with an HTML error page.
     throw new ApiError(
-      'The API returned HTML instead of JSON — the Web App is probably not deployed with access "Anyone".',
+      'The API did not answer with JSON — check the URL, and that the function is deployed with JWT verification off.',
       'BAD_RESPONSE'
     );
   }
