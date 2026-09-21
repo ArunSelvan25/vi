@@ -46,7 +46,7 @@ export function crudView(entity, {
       onClick: async (row) => {
         const ok = await confirmDialog({
           title: `Delete ${def.singular.toLowerCase()} ${row.id}?`,
-          message: 'This removes the row from the Google Sheet permanently. Linked records are not deleted.',
+          message: 'This removes the record permanently. Linked records are not deleted.',
           confirmLabel: 'Delete'
         });
         if (!ok) return;

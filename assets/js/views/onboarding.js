@@ -2,14 +2,10 @@ import { el, icon, toast } from '../ui.js';
 import { config } from '../config.js';
 import { api, ping } from '../api.js';
 
-/**
- * The API URLs the wizard accepts: the Supabase Edge Function (and a local
- * `supabase start`), or — until it is retired — the Apps Script Web App.
- */
+/** The API URLs the wizard accepts: the Supabase Edge Function, and a local `supabase start`. */
 const API_URL_PATTERNS = [
   /^https:\/\/[a-z0-9-]+\.supabase\.co\/functions\/v1\/[A-Za-z0-9_-]+\/?$/,
-  /^http:\/\/(localhost|127\.0\.0\.1):\d+\/functions\/v1\/[A-Za-z0-9_-]+\/?$/,
-  /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec$/
+  /^http:\/\/(localhost|127\.0\.0\.1):\d+\/functions\/v1\/[A-Za-z0-9_-]+\/?$/
 ];
 
 /** First-run wizard: point the site at the backend and seed an admin. */
@@ -29,7 +25,7 @@ export function setupView(onDone) {
                                   autocomplete: 'new-password' });
   const keyInput = el('input', { class: 'input', type: 'password', placeholder: 'Setup key' });
 
-  // Only shown if the deployment has a SETUP_KEY script property set.
+  // Only shown if the deployment has a SETUP_KEY secret set.
   const keyField = el('label', { hidden: true }, [
     'Setup key',
     keyInput,
@@ -75,11 +71,9 @@ export function setupView(onDone) {
       connectBtn.hidden = true;
       toast('Tables ready — now create your admin account', 'ok');
     } catch (err) {
-      // On a sheet with no users yet, setup without admin details answers with
-      // a request for the admin's phone — or for the setup key, when one is
-      // configured. Either is the cue to show the form, not a failure. (This
-      // used to look for "adminEmail", which the server stopped sending when
-      // sign-in moved to phone numbers, so a fresh sheet could not be set up.)
+      // On a database with no users yet, setup without admin details answers
+      // with a request for the admin's phone — or for the setup key, when one
+      // is configured. Either is the cue to show the form, not a failure.
       const needsKey = /setup key/i.test(err.message);
       if (/adminPhone|adminEmail/.test(err.message) || needsKey) {
         seedBox.hidden = false; finishBtn.hidden = false; connectBtn.hidden = true;
@@ -138,7 +132,7 @@ export function setupView(onDone) {
 }
 
 /**
- * Phone + password sign-in. `onSignedIn` receives the workbook when the server
+ * Phone + password sign-in. `onSignedIn` receives all the data when the server
  * sent it with the sign-in, so the app does not have to ask for it again.
  */
 export function loginView(onSignedIn) {
@@ -187,7 +181,7 @@ export function loginView(onSignedIn) {
       el('button', {
         class: 'link-btn',
         onClick: () => { config.apiUrl = null; location.reload(); }
-      }, ['Connect a different sheet'])
+      }, ['Connect a different database'])
     ])
   ]);
 }

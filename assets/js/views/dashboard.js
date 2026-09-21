@@ -4,6 +4,7 @@ import { navigate } from '../router.js';
 import { barChart, donut, rankedBars } from '../components/charts.js';
 import { openRenewLease } from './leases.js';
 import { refreshView } from '../router.js';
+import { ref } from '../components/detail.js';
 
 /** A month-over-month change chip, or null when there's nothing to compare. */
 function delta(current, previous) {
@@ -52,7 +53,7 @@ export function dashboardView() {
 
   const priorityAlerts = [];
   if (s.overdue > 0) {
-    priorityAlerts.push({ label: 'Overdue', value: money(s.overdue, { compact: true }), tone: 'danger', link: 'invoices' });
+    priorityAlerts.push({ label: 'Overdue', value: money(s.overdue, { compact: true }), tone: 'danger', link: 'billing?show=overdue' });
   }
   if (s.open_tickets > 0) {
     priorityAlerts.push({ label: 'Open tickets', value: String(s.open_tickets), tone: 'warn', link: 'maintenance' });
@@ -82,10 +83,10 @@ export function dashboardView() {
     kpi({ label: 'Collected this month', value: money(s.collected_this_month, { compact: true }),
           chip: trend,
           sub: trend ? 'vs this point last month' : `${money(s.expenses_this_month, { compact: true })} spent`,
-          tone: 'ok', to: 'payments' }),
+          tone: 'ok', to: 'billing?show=month' }),
     kpi({ label: 'Outstanding', value: money(s.outstanding, { compact: true }),
           sub: s.overdue > 0 ? `${money(s.overdue, { compact: true })} overdue` : 'none overdue',
-          tone: s.overdue > 0 ? 'danger' : null, to: 'invoices' }),
+          tone: s.overdue > 0 ? 'danger' : null, to: 'billing?show=outstanding' }),
     kpi({ label: 'Occupancy', value: s.occupancy_rate + '%',
           sub: `${s.occupied_units} of ${s.units} units`, to: 'units' }),
     kpi({ label: 'Open tickets', value: String(s.open_tickets),
@@ -97,9 +98,10 @@ export function dashboardView() {
 
   const quickActions = [
     { label: 'Add tenant', path: 'tenants', icon: 'users' },
-    { label: 'Create invoice', path: 'invoices', icon: 'receipt' },
+    { label: 'Create invoice', path: 'billing', icon: 'receipt' },
     { label: 'Renew lease', path: 'leases', icon: 'file' },
-    { label: 'Log payment', path: 'payments', icon: 'card' }
+    // a payment is taken against an invoice, so start from what is owed
+    { label: 'Record payment', path: 'billing?show=outstanding', icon: 'card' }
   ];
 
   const alertList = [];
@@ -152,11 +154,11 @@ export function dashboardView() {
         const days = daysBetween(today(), l.end_date);
         const open = () => store.can('manager')
           ? openRenewLease(l, { onDone: () => refreshView() })
-          : navigate('tenants/' + l.tenant_id);
+          : navigate('leases/' + l.id);
         return el('li', { class: 'list-row clickable', onClick: open, title: store.can('manager') ? 'Renew this lease' : null }, [
           el('div', {}, [
-            el('strong', { text: store.label('tenants', l.tenant_id) }),
-            el('small', { class: 'muted', text: ' · ' + store.label('units', l.unit_id) })
+            el('strong', {}, [ref('tenants', l.tenant_id)]),
+            el('small', { class: 'muted' }, [' · ', ref('units', l.unit_id)])
           ]),
           el('span', { class: 'list-meta' }, [
             badge(days <= 0 ? 'today' : `in ${days} day${days === 1 ? '' : 's'}`,
@@ -173,7 +175,7 @@ export function dashboardView() {
                   - ({ Urgent: 0, High: 1, Medium: 2, Low: 3 }[b.priority] ?? 4));
   const ticketBody = openTickets.length
     ? el('ul', { class: 'list' }, openTickets.slice(0, 8).map(m =>
-        el('li', { class: 'list-row clickable', onClick: () => navigate('maintenance') }, [
+        el('li', { class: 'list-row clickable', onClick: () => navigate('maintenance/' + m.id) }, [
           el('div', {}, [
             el('strong', { text: m.title }),
             el('small', { class: 'muted', text: ' · ' + store.label('properties', m.property_id) })
@@ -186,7 +188,7 @@ export function dashboardView() {
   const docBody = docs.length
     ? el('ul', { class: 'list' }, docs.slice(0, 6).map(d => {
         const expired = d.expiry_date < today();
-        return el('li', { class: 'list-row' }, [
+        return el('li', { class: 'list-row clickable', onClick: () => navigate('documents/' + d.id) }, [
           el('div', {}, [
             el('strong', { text: d.title }),
             el('small', { class: 'muted', text: ' · ' + (d.category || 'Document') })
@@ -202,7 +204,7 @@ export function dashboardView() {
   wrap.append(el('div', { class: 'grid-2' }, [
     panel('Rent arrears', arrearsBody, {
       count: arrears.length || undefined,
-      action: el('button', { class: 'btn btn-ghost btn-sm', onClick: () => navigate('invoices') },
+      action: el('button', { class: 'btn btn-ghost btn-sm', onClick: () => navigate('billing?show=outstanding') },
                  ['View invoices'])
     }),
     panel('Leases expiring', expiringBody, { count: expiring.length || undefined })
@@ -221,7 +223,7 @@ export function dashboardView() {
   if (vacant.length) {
     wrap.append(panel('Vacant units',
       el('div', { class: 'chip-row' }, vacant.slice(0, 24).map(u =>
-        el('button', { class: 'chip', onClick: () => navigate('units') }, [
+        el('button', { class: 'chip', onClick: () => navigate('units/' + u.id) }, [
           store.label('units', u.id),
           el('small', { text: money(u.rent_amount, { compact: true }) })
         ]))),

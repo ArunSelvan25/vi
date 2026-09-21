@@ -8,11 +8,11 @@ const ID_INDEX = new WeakMap();
 
 /** The collections a bootstrap carries, each fingerprinted by the server. */
 const COLLECTIONS = ['properties', 'units', 'tenants', 'leases', 'invoices', 'invoiceItems',
-                     'payments', 'maintenance', 'expenses', 'documents', 'meterReadings'];
+                     'payments', 'maintenance', 'expenses', 'documents'];
 
 /**
- * Client-side cache of the whole workbook. Bootstrap pulls every tab in one
- * round-trip (Sheets is slow per-call, fast in bulk), then mutations patch the
+ * Client-side cache of all the data. Bootstrap pulls every table in one
+ * round-trip, then mutations patch the
  * cache locally so the UI stays instant.
  */
 export const store = {
@@ -21,12 +21,10 @@ export const store = {
   stats: {},
   activity: [],
   users: [],
-  timezones: null,
   /** Server fingerprint of each collection as it was last received. */
   hashes: {},
   properties: [], units: [], tenants: [], leases: [],
   invoices: [], invoiceItems: [], payments: [], maintenance: [], expenses: [], documents: [],
-  meterReadings: [],
 
   listeners: new Set(),
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
@@ -61,7 +59,6 @@ export const store = {
       stats: data.stats || {},
       activity: data.activity || [],
       users: data.users || [],
-      timezones: data.timezones || null,
       hashes: data.hashes || {},
       loaded: true
     };
@@ -79,9 +76,9 @@ export const store = {
 
   /**
    * Apply a snapshot the server sent along with a write, falling back to
-   * fetching one if it did not — the front end and the Apps Script deployment
-   * are updated separately, so a browser on the new build can be talking to an
-   * older backend that does not know about `withSnapshot` yet.
+   * fetching one if it did not — the site and the backend are deployed
+   * separately, so a browser on a new build can briefly be talking to an
+   * older backend.
    */
   async syncFrom(res) {
     if (res && res.snapshot) this.apply(res.snapshot);
@@ -98,10 +95,10 @@ export const store = {
   // ── CRUD that keeps the cache in step ───────────────────────────────────
 
   /**
-   * Writing one of these changes rows in other tabs too — a lease decides
+   * Writing one of these changes rows in other tables too — a lease decides
    * whether its unit reads as Occupied, a payment decides an invoice's balance
    * — so the local cache cannot be patched from the response alone. Re-pull
-   * instead, otherwise the screen disagrees with the sheet until a manual
+   * instead, otherwise the screen disagrees with the database until a manual
    * refresh.
    */
   CASCADING: new Set(['leases', 'units', 'payments', 'invoices', 'maintenance']),
@@ -260,7 +257,7 @@ export const store = {
 
   operatingExpenses(rows = this.expenses) { return rows.filter(e => !this.isDepositRefund(e)); },
 
-  /** Where a lease's security deposit stands — mirrors depositLedger in Code.gs. */
+  /** Where a lease's security deposit stands — mirrors depositLedger in the backend. */
   depositLedger(lease) {
     const deposits = this.invoices.filter(i => i.lease_id === lease.id && i.type === 'Deposit' && i.status !== 'Void');
     const paid = deposits.reduce((s, i) => s + Number(i.amount_paid || 0), 0);
@@ -276,7 +273,7 @@ export const store = {
     return { received: round2(received), applied: round2(applied), refunded: round2(refunded), held };
   },
 
-  /** The monthly rent in force on a date, escalation compounded — mirrors currentMonthlyRent in Code.gs. */
+  /** The monthly rent in force on a date, escalation compounded — mirrors currentMonthlyRent in the backend. */
   currentRent(lease, on = isoDate()) {
     const base = Number(lease.rent_amount || 0);
     const pct = Number(lease.escalation_pct || 0);
@@ -285,6 +282,66 @@ export const store = {
     let months = (d.getFullYear() - s.getFullYear()) * 12 + (d.getMonth() - s.getMonth());
     if (d.getDate() < s.getDate()) months--;
     return round2(base * Math.pow(1 + pct / 100, Math.floor(Math.max(0, months) / 12)));
+  },
+
+  /**
+   * The next rent invoice a lease with a rent day will raise — mirrors
+   * rentDayPeriods in the backend, which does the billing; this only
+   * previews it. Null for a lease without a rent day, or once its term is
+   * fully billed.
+   */
+  nextRentInvoice(lease) {
+    const rentDay = Number(lease.rent_day);
+    const monthly = (lease.frequency || 'Monthly') === 'Monthly';
+    if (!monthly || !lease.start_date || !(Number.isInteger(rentDay) && ((rentDay >= 1 && rentDay <= 28) || rentDay === 31))) return null;
+
+    const day = (iso) => new Date(String(iso).slice(0, 10) + 'T00:00:00');
+    const plus = (d, n) => { const out = new Date(d.getTime()); out.setDate(out.getDate() + n); return out; };
+    const rentDayIn = (y, m) => {
+      const first = new Date(y, m, 1);
+      const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+      return new Date(first.getFullYear(), first.getMonth(), Math.min(rentDay, last));
+    };
+    const span = (a, b) => Math.round((b - a) / 86400000) + 1;
+
+    // where billing stands: the last day any rent invoice on this lease covers
+    const rentLines = new Set(this.invoiceItems.filter(i => i.category === 'Rent').map(i => i.invoice_id));
+    const through = this.invoices
+      .filter(i => i.lease_id === lease.id && (i.type === 'Rent' || (i.period_start && rentLines.has(i.id))))
+      .reduce((m, i) => (String(i.period_end || '') > m ? String(i.period_end).slice(0, 10) : m), '');
+
+    let cursor = day(lease.start_date);
+    if (through && plus(day(through), 1) > cursor) cursor = plus(day(through), 1);
+    const end = lease.end_date ? day(lease.end_date) : null;
+    if (end && cursor > end) return null;
+
+    let close = rentDayIn(cursor.getFullYear(), cursor.getMonth());
+    if (close < cursor) close = rentDayIn(cursor.getFullYear(), cursor.getMonth() + 1);
+    const cycleEnd = end && close > end ? end : close;
+    const rent = this.currentRent(lease, isoDate(cursor));
+    const whole = isoDate(cursor) === isoDate(plus(rentDayIn(close.getFullYear(), close.getMonth() - 1), 1)) &&
+                  isoDate(cycleEnd) === isoDate(close);
+
+    const lines = [];
+    if (whole) lines.push({ start: isoDate(cursor), end: isoDate(cycleEnd), amount: round2(rent) });
+    else {
+      for (let from = cursor; from <= cycleEnd;) {
+        const monthEnd = new Date(from.getFullYear(), from.getMonth() + 1, 0);
+        const to = monthEnd < cycleEnd ? monthEnd : cycleEnd;
+        const days = span(from, to);
+        lines.push({ start: isoDate(from), end: isoDate(to), days, monthDays: monthEnd.getDate(),
+                     amount: round2(rent * days / monthEnd.getDate()) });
+        from = plus(to, 1);
+      }
+    }
+    // due on the rent day; raisable from the 1st of that month; the grace
+    // days run after the due date, before a late fee
+    return {
+      start: isoDate(cursor), end: isoDate(cycleEnd), due: isoDate(cycleEnd),
+      raiseFrom: isoDate(new Date(cycleEnd.getFullYear(), cycleEnd.getMonth(), 1)),
+      lateFeeFrom: isoDate(plus(cycleEnd, (parseInt(lease.grace_days || 0, 10) || 0) + 1)),
+      amount: round2(lines.reduce((t, l) => t + l.amount, 0)), partial: !whole, lines
+    };
   },
 
   /** Outstanding balance per tenant, biggest first. */
@@ -349,14 +406,6 @@ export const store = {
     return this.documents
       .filter(d => d.expiry_date && d.expiry_date <= limitStr)
       .sort((a, b) => String(a.expiry_date).localeCompare(String(b.expiry_date)));
-  },
-
-  /** The most recent reading of a unit's meter, for the next round to start from. */
-  lastReading(unitId, category) {
-    return this.meterReadings
-      .filter(r => r.unit_id === unitId && r.category === category)
-      .sort((a, b) => String(b.reading_date).localeCompare(String(a.reading_date)) ||
-                      String(b.id).localeCompare(String(a.id)))[0] || null;
   },
 
   can(minRole) {

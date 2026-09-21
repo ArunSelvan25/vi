@@ -1,9 +1,7 @@
 /**
- * Runs the Supabase backend (supabase/functions/api/backend.js) against a real
- * Postgres, with the same shape as gas-harness.mjs so the suites written
- * against the Apps Script backend carry over: `box.handle(action, payload,
- * token)`, `box.readTable(tab)`, `box.today()` and friends — except that
- * everything touching the database now returns a promise.
+ * Runs the backend (supabase/functions/api/backend.js) against a real
+ * Postgres: `box.handle(action, payload, token)`, `box.readTable(table)`,
+ * `box.today()` and friends, each returning a promise.
  *
  * Each sandbox is its own database, cloned from a template that has the
  * migrations applied, so tests cannot see each other's rows. Point it at a
@@ -20,6 +18,11 @@ import {
   hashPasswordLegacy, hashPasswordV2, signToken, THROTTLE, BOOTSTRAP_WINDOW_MS
 } from '../supabase/functions/api/backend.js';
 import { PG_TYPES } from '../supabase/functions/api/schema.js';
+import { insertRows } from '../supabase/functions/api/db.js';
+
+/** Tables in the order their foreign keys allow them to be filled. */
+const SEED_ORDER = ['Properties', 'Units', 'Tenants', 'Leases', 'Invoices', 'InvoiceItems',
+                    'Payments', 'Maintenance', 'Expenses', 'Documents'];
 
 const SERVER_URL = process.env.TEST_DATABASE_URL || 'postgres://postgres:pw@localhost:55432/postgres';
 const TEMPLATE = 'vipm_template';
@@ -136,6 +139,23 @@ export async function makeSandbox(opts = {}) {
     recoverAccess: (phone, password, displayName) => backend.recoverAccess(phone, password, displayName),
     getState: (key) => inTx(r => internals.getState(r, key)),
     setState: (key, value) => inTx(r => internals.setState(r, key, value)),
+    /**
+     * Write rows straight into the tables, as data that is already there —
+     * the dev server's sample portfolio. The id counters are moved past the
+     * seeded ids so new records carry on from them, and today's housekeeping
+     * is marked done, so opening the app changes nothing by itself.
+     */
+    seed: (tables) => backend.run(async (r) => {
+      for (const name of SEED_ORDER) {
+        const rows = tables[name] || [];
+        if (!rows.length) continue;
+        await insertRows(r, name, rows);
+        const last = Math.max(0, ...rows.map(x => Number((String(x.id).match(/(\d+)$/) || [])[1]) || 0));
+        await r.tx`insert into id_counters (table_name, last_value) values (${name}, ${last})
+                   on conflict (table_name) do update set last_value = greatest(id_counters.last_value, excluded.last_value)`;
+      }
+      await internals.setState(r, 'LAST_REFRESH', todayIn(tz));
+    }),
     /** Run raw SQL against this sandbox's database — the "someone edited the table by hand" case. */
     query: (text, params) => sql.unsafe(text, params || []),
     today: () => todayIn(tz),

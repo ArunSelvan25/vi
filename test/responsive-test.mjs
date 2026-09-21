@@ -82,8 +82,13 @@ const showRoute = async (r) => {
   await new Promise((s) => setTimeout(s, 200));
 };
 
-const ROUTES = ['dashboard', 'properties', 'units', 'tenants', 'leases', 'invoices',
-                'payments', 'expenses', 'reports', 'maintenance', 'documents', 'settings'];
+const ROUTES = ['dashboard', 'properties', 'units', 'tenants', 'leases', 'billing',
+                'billing?tab=payments', 'billing?show=overdue', 'expenses', 'reports', 'maintenance',
+                'documents', 'settings',
+                // every record page, with its sidebar, tabs and cards
+                'properties/PRP-00001', 'units/UNT-00001', 'tenants/TNT-00001', 'leases/LSE-00001',
+                'invoices/INV-00003', 'payments/PAY-00001', 'maintenance/MNT-00002',
+                'expenses/EXP-00001', 'documents/DOC-00001', 'tenants/TNT-00001?tab=invoices'];
 const WIDTHS = [320, 360, 390, 414, 768];
 
 // ── every screen, every common phone width ──────────────────────────────────
@@ -105,7 +110,7 @@ await page.setViewport({ width: 360, height: 780, isMobile: true });
 console.log('\n— dialogs —');
 for (const [route, label] of [['properties', 'property'], ['tenants', 'tenant'],
                               ['units', 'unit'], ['leases', 'lease'],
-                              ['expenses', 'expense'], ['invoices', 'invoice']]) {
+                              ['expenses', 'expense'], ['billing', 'invoice']]) {
   await showRoute(route);
   const opened = await page.evaluate(() => {
     const b = [...document.querySelectorAll('.head-actions .btn-primary')].pop();
@@ -147,7 +152,7 @@ for (const [route, name] of [['properties', 'property'], ['tenants', 'tenant']])
 
 console.log('\n— empty states —');
 // the screen the bug report came from: a table with nothing in it
-await showRoute('invoices');
+await showRoute('billing');
 await page.evaluate(() => {
   const s = document.querySelector('.search-input');
   s.value = 'zzzznothingmatchesthis';
@@ -197,7 +202,7 @@ ok('dark theme lays out identically', darkBad.length === 0, darkBad.join('\n    
 await page.evaluate(() => { localStorage.setItem('vipm.theme', 'light'); document.documentElement.dataset.theme = 'light'; });
 
 console.log('\n— touch targets —');
-await showRoute('invoices');
+await showRoute('billing');
 const small = await page.evaluate(() => {
   const out = [];
   for (const el of document.querySelectorAll('button, a, select, input[type=search]')) {
@@ -212,7 +217,7 @@ ok('every control is at least 32px tall on a phone', small.length === 0, small.j
 console.log('\n— the primary action stays reachable —');
 for (const w of [320, 360, 390]) {
   await page.setViewport({ width: w, height: 780, isMobile: true });
-  await showRoute('invoices');
+  await showRoute('billing');
   const btn = await page.evaluate(() => {
     const b = [...document.querySelectorAll('.head-actions .btn')].pop();
     const r = b.getBoundingClientRect();

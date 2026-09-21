@@ -1,41 +1,35 @@
 /**
  * Dev server: the app's static files, plus the REAL backend.
  *
- * `/api` runs apps-script/Code.gs itself, on the in-memory spreadsheet from
- * gas-harness.mjs. This used to be a hand-written imitation of the API, and it
- * drifted: it always claimed the sheet was set up (so the broken first-run
- * wizard passed every browser test), accepted any payment without touching the
- * invoice, and never applied a single business rule. Every browser test now
- * exercises the rules users actually get.
+ * `/api` runs supabase/functions/api/backend.js itself, on a throwaway
+ * Postgres database (see pg-harness.mjs; `npm run db:test` starts one). This
+ * used to be a hand-written imitation of the API, and it drifted: it always
+ * claimed the database was set up (so the broken first-run wizard passed every
+ * browser test), accepted any payment without touching the invoice, and never
+ * applied a single business rule. Every browser test now exercises the rules
+ * users actually get.
  *
- * The sample data is written straight into the tabs, as if the workbook already
- * held it, and dated relative to today so the tests do not expire. It is kept
+ * The sample data is written straight into the tables, as if it were already
+ * there, and dated relative to today so the tests do not expire. It is kept
  * consistent with the rules — statuses, balances and late fees already where
  * the backend would put them — so opening the app changes nothing by itself.
  *
  * Sign in with phone 9000012345 / password password123.
- *
- * BACKEND=supabase runs the Supabase backend instead, on a throwaway Postgres
- * database (see pg-harness.mjs; `npm run db:test` starts one), with the same
- * sample data loaded through the real import (scripts/import-sheet.mjs). Every
- * browser suite can be pointed at it: BACKEND=supabase npm run test:ui.
  */
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
-import { makeSandbox } from './gas-harness.mjs';
+import { makeSandbox, closeAll } from './pg-harness.mjs';
 
 const ROOT = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const TYPES = { '.html':'text/html', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
                 '.webmanifest':'application/manifest+json', '.png':'image/png', '.svg':'image/svg+xml',
                 '.ico':'image/x-icon', '.woff2':'font/woff2' };
 
-// The browser under test runs in this machine's time zone, so the backend and
-// the sheet do too — otherwise "today" differs between them around midnight.
+// The browser under test runs in this machine's time zone, so the backend does
+// too — otherwise "today" differs between them around midnight.
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-const SUPABASE = process.env.BACKEND === 'supabase';
-const pg = SUPABASE ? await import('./pg-harness.mjs') : null;
-const box = SUPABASE ? await pg.makeSandbox({ timeZone: TZ }) : makeSandbox({ scriptTz: TZ, sheetTz: TZ });
+const box = await makeSandbox({ timeZone: TZ });
 
 // ── dates relative to today ─────────────────────────────────────────────────
 const pad = (n) => String(n).padStart(2, '0');
@@ -49,14 +43,6 @@ const monthDay = (offset, day) => {
 const monthEnd = (offset) => iso(new Date(now.getFullYear(), now.getMonth() + offset + 1, 0));
 const inDays = (n) => { const d = new Date(now); d.setDate(d.getDate() + n); return iso(d); };
 
-// ── set up the workbook and its administrator, as the wizard would ──────────
-// (on Postgres the data goes in first: the import only writes to an empty database)
-const createAdmin = async () => {
-  const setup = await box.handle('setup', { adminPhone: '+91 90000 12345', adminPassword: 'password123',
-                                            adminName: 'Admin', adminEmail: 'admin@example.com' }, '');
-  if (!setup.ok) throw new Error('dev server setup failed: ' + setup.error);
-};
-if (!SUPABASE) await createAdmin();
 
 const seed = {
   Properties: [
@@ -106,37 +92,24 @@ const seed = {
   Documents: [
     { id:'DOC-00001', entity_type:'Lease', entity_id:'LSE-00001', title:'Rental agreement — A-101', category:'Lease Agreement', url:'https://drive.google.com/file/d/x', issue_date:monthDay(-11, 1), expiry_date:monthEnd(6) },
     { id:'DOC-00002', entity_type:'Property', entity_id:'PRP-00001', title:'Fire safety certificate', category:'NOC', url:'https://drive.google.com/file/d/y', issue_date:monthDay(-11, 1), expiry_date:inDays(16) }
-  ],
-  MeterReadings: [
-    { id:'MTR-00001', property_id:'PRP-00001', unit_id:'UNT-00001', lease_id:'LSE-00001', tenant_id:'TNT-00001', category:'Electricity', reading_date:monthEnd(-1), previous_reading:10240, current_reading:10382, consumption:142, rate:8.5, amount:1207, invoice_id:'' }
   ]
 };
 
-// write the rows into the tabs exactly as a sheet with this data would hold them
+// the sample data, then its administrator, as the setup wizard would create one
 const stamp = iso(now) + 'T09:00:00';
-if (SUPABASE) {
-  const { importExport } = await import('../scripts/import-sheet.mjs');
-  const tables = {};
-  for (const [table, rows] of Object.entries(seed)) {
-    tables[table] = rows.map(row => ({ created_at: stamp, updated_at: stamp, ...row }));
-  }
-  await importExport(box.sql, { tables, timezone: TZ }, { timeZone: TZ });
-  await createAdmin();
-  // drop the throwaway database when the tests stop the server
-  const stop = () => pg.closeAll().finally(() => process.exit(0));
-  process.on('SIGTERM', stop);
-  process.on('SIGINT', stop);
-} else {
-  for (const [table, rows] of Object.entries(seed)) {
-    const sh = box.sheetFor(table);
-    const headers = box.headersOf(sh, table);
-    for (const row of rows) {
-      const full = { created_at: stamp, updated_at: stamp, ...row };
-      sh.appendRow(headers.map((h) => full[h] ?? ''));
-    }
-  }
-  box.invalidateAll();
+const tables = {};
+for (const [table, rows] of Object.entries(seed)) {
+  tables[table] = rows.map(row => ({ created_at: stamp, updated_at: stamp, ...row }));
 }
+await box.seed(tables);
+const setup = await box.handle('setup', { adminPhone: '+91 90000 12345', adminPassword: 'password123',
+                                          adminName: 'Admin', adminEmail: 'admin@example.com' }, '');
+if (!setup.ok) throw new Error('dev server setup failed: ' + setup.error);
+
+// drop the throwaway database when the tests stop the server
+const stop = () => closeAll().finally(() => process.exit(0));
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
 
 // ── HTTP ────────────────────────────────────────────────────────────────────
 function handler(req, res) {

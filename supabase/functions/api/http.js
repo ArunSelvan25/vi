@@ -1,5 +1,5 @@
 /**
- * The HTTP surface of the backend: what the Apps Script doGet/doPost were.
+ * The HTTP surface of the backend.
  *
  *   OPTIONS            CORS preflight
  *   GET                health check only — it takes no action, token or callback
@@ -11,7 +11,7 @@
  */
 import { constantTimeEquals, nowIso } from './backend.js';
 
-/** Far above any real payload (a year of meter readings is ~100 kB). */
+/** Far above any real payload (an invoice with a year of line items is well under 100 kB). */
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const JOBS = ['dailyMaintenanceJob', 'dailyReminderJob'];

@@ -50,27 +50,39 @@
 
 - **One-click invoice generation.** Raises every missing rent invoice for every
   active lease up to today. **Idempotent** — a period that already has an
-  invoice is never billed twice, so it is safe to run daily on a trigger.
+  invoice is never billed twice, so it is safe to run as often as you like.
 - Correct period maths: month-end leases don't drift (a lease starting on the
   31st bills on the 31st, not the 28th, after February), lease end dates clip
   the final period, quarterly periods charge 3× the monthly rent.
+- **Rent day** — a monthly lease can have a fixed payment day each month
+  (1st–28th, or the last day). Its invoice can be raised any time in that
+  month — run Generate rent on the 1st and every invoice due that month goes
+  out — dated the day it is raised and due on the rent day: with the 10th, the
+  invoice for 11 Oct–10 Nov is due 10 Nov. Grace days then count after the
+  rent day, before the late fee: due the 10th with 5 days' grace, the fee is
+  added from the 16th while the invoice still shows the 10th. A part month is charged day by day at each month's own length — a lease
+  from 21 Sep is billed 21–30 Sep (10/30) and 1–10 Oct (10/31) on 10 Oct, one
+  line per month. Setting a rent day on a lease already billed carries on from
+  the last billed day, so no day is billed twice or skipped. The lease page
+  previews the next invoice.
 - **Line items** — one invoice carries any mix of charges: rent, electricity
   (EB), water, gas, internet, parking, maintenance, late fees. Add rows as you
   go, each with a description, category, quantity and unit amount, and the total
-  adds itself up live. Metered charges work naturally: `142 units × ₹8.50`.
+  adds itself up live. Metered charges work naturally: an EB bill is a line
+  with category Electricity, e.g. `EB bill · 142 units` at `142 × ₹8.50`.
 - The invoice header total is always the sum of its lines — it is never typed,
   so it cannot disagree with the detail.
 - Editing an invoice re-prices it; removed lines are deleted, and payments
   already recorded against it are preserved.
-- Every line carries a category, so you can pivot the `InvoiceItems` tab in
-  Sheets to see total electricity or water billed per month.
+- Every line carries a category (Rent, Electricity, Water …), so electricity
+  or water billed per month can be totalled from the lines.
 - **Payments** with method (Cash / Bank Transfer / UPI / Card / Cheque),
   reference number, date and who received it.
 - **Part payments handled properly** — paid, balance and status (Unpaid →
   Partial → Paid) are recomputed on the server from the payment records, so the
   numbers can't drift out of sync.
 - Overdue detection, late fees and lease expiry run once a day — on the daily
-  trigger, or on the first load of the day without one.
+  scheduled job, and on the first load of the day as a safety net.
 - **A payment covering several months is spread automatically** across that
   tenant's outstanding invoices, oldest due first. More than the tenant owes in
   total is refused, so no balance can ever go negative and understate arrears.
@@ -93,8 +105,11 @@
 - **GST** — a rate per invoice line and per lease; CGST + SGST within the state,
   IGST across states, from the property's state and your GSTIN. Registered
   businesses get a printed *Tax invoice*.
-- **Payments page** entries are checked and settle their invoice exactly like
-  payments recorded from the invoice.
+- **One Billing screen** holds invoices and the payments received against them,
+  as two tabs. The figures across the top — outstanding, overdue, due in the
+  next 7 days, collected this month — are also filters. A payment is always
+  recorded from the invoice it pays; any excess settles the tenant's other
+  unpaid invoices.
 - **Printable receipts** for every payment, and **tenant statements** for any
   date range — opening balance, each charge and payment, running and closing
   balance, and the deposit position.
@@ -107,16 +122,13 @@
 - **Records other rows depend on cannot be deleted.** Deleting a tenant with a
   lease, a unit with a lease, or an invoice with a payment against it is refused
   with a message naming what is in the way. So is deleting a tenant with
-  maintenance tickets or documents, or a unit with meter readings. Deleting a
+  maintenance tickets or documents. Deleting a
   draft invoice removes its own line items, since they are part of it.
 - **Printable invoice / receipt** — opens in the app, prints to paper or PDF via
   the browser, showing the payment history.
-- **Automated rent reminders by email** on a schedule — N days before, on the
-  due date, and on chosen days overdue — one email per tenant listing everything
-  they owe, never repeated the same day.
-- **Meter readings** — read every electricity, water or gas meter in a property
-  on one screen. Previous readings carry over; occupied units are billed to their
-  tenant in one click; vacant units' readings are kept for the next tenant.
+- **Rent reminders by email** are built — N days before, on the due date, and
+  on chosen days overdue, one email per tenant — but not connected to an email
+  provider yet, so none are sent. Share invoices over WhatsApp instead.
 
 ## Maintenance
 
@@ -197,37 +209,35 @@
   automatically and applied only when you accept the prompt.
 - Configurable currency, symbol, locale, organisation name and invoice prefix.
 - Keyboard-friendly: `Esc` closes any dialog.
-- **Your data stays yours** — it is a normal Google Sheet you can open, filter,
-  chart or export at any time. Nothing is locked in.
+- **Your data stays yours** — it is a standard Postgres database you can query,
+  export (`supabase db dump`) or move at any time, and every list exports to CSV.
 
 ## Known gaps
 
 Honest about what the current features do *not* do:
 
-- **`billing_day` is not honoured.** Rent bills from the lease start date, so a
-  lease starting on the 5th bills on the 5th (part periods are pro-rated). The
-  field is hidden from the form rather than left as an input that does nothing.
+- **Without a rent day, rent bills from the lease start date**, so a lease
+  starting on the 5th bills on the 5th. Set a rent day on a monthly lease to bill
+  on a fixed day instead. (The old `billing_day` column is not read.)
 - **A sold property's history stays in the reports** while dropping out of the
   dashboard headline figures. That is deliberate: past income and costs remain
   true.
 - **A late fee on an invoice raised already overdue** (other than by *Generate
   rent*) is added at the next day's housekeeping, not the moment it is saved.
-- **Meter readings bill a separate invoice** per unit rather than adding a line
-  to that month's rent invoice.
 - **No QR code** for UPI on printed invoices — the UPI ID and a *Pay via UPI*
   link are shown instead.
 
 ## Deliberately not included
 
-Being straight about the boundaries of a free, static + Sheets stack:
+Being straight about the boundaries of this stack:
 
 - **No tenant-facing portal or online rent collection.** There's no payment
   gateway; you record payments that happened elsewhere.
-- **No file uploads.** Documents are links, because Sheets is not a file store.
+- **No file uploads.** Documents are links to wherever the file lives.
 - **No real-time multi-user sync.** Screens show data as of the last load or
   save. Two people editing the same record cannot overwrite each other — the
   second save is refused — but neither sees the other's change until they
   refresh.
-- **Not built for thousands of units.** The whole workbook loads into the
-  browser. It's comfortable into the low thousands of rows and slows after that.
+- **Not built for thousands of units.** The whole portfolio loads into the
+  browser. It's comfortable into the low thousands of records and slows after that.
 - **Not a substitute for accounting software** at tax time — export the CSVs.

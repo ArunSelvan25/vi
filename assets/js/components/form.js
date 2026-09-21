@@ -13,11 +13,12 @@ function inputFor(field, value, form) {
 
   if (field.type === 'select' || field.type === 'ref') {
     const select = el('select', common);
-    select.append(el('option', { value: '', text: field.required ? 'Select…' : '— none —' }));
+    select.append(el('option', { value: '', text: field.blank || (field.required ? 'Select…' : '— none —') }));
 
+    // options are plain strings, or { value, label } where the two differ
     const opts = field.type === 'ref'
       ? store.options(field.optionsFrom)
-      : (field.options || []).map(o => ({ value: o, label: o }));
+      : (field.options || []).map(o => (typeof o === 'object' ? o : { value: o, label: o }));
 
     for (const o of opts) {
       select.append(el('option', { value: o.value, selected: String(value) === String(o.value) }, [o.label]));
@@ -58,6 +59,7 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
 
   const grid = el('div', { class: 'form-grid' });
   const controls = {};
+  const wrappers = {};
 
   for (const field of fields) {
     const control = inputFor(field, values[field.key], null);
@@ -65,7 +67,7 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
     const locked = !isEdit && Object.prototype.hasOwnProperty.call(overrides, field.key);
     if (locked) control.setAttribute('disabled', '');
 
-    grid.append(el('div', { class: 'field' + (field.type === 'textarea' ? ' field-wide' : '') }, [
+    grid.append(wrappers[field.key] = el('div', { class: 'field' + (field.type === 'textarea' ? ' field-wide' : '') }, [
       el('label', { for: 'f_' + field.key }, [
         field.label,
         field.required ? el('span', { class: 'req', text: ' *' }) : null
@@ -105,6 +107,17 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
     });
   }
 
+  // A field that only means something for some values of another — the rent
+  // day of a monthly lease — is hidden otherwise, and saved blank when hidden.
+  const shown = (field) => !field.showWhen || Object.entries(field.showWhen)
+    .every(([key, allowed]) => !controls[key] || allowed.includes(controls[key].value));
+  const conditional = fields.filter(f => f.showWhen);
+  const syncShown = () => { for (const f of conditional) wrappers[f.key].hidden = !shown(f); };
+  for (const key of new Set(conditional.flatMap(f => Object.keys(f.showWhen)))) {
+    controls[key]?.addEventListener('change', syncShown);
+  }
+  syncShown();
+
   const error = el('p', { class: 'form-error', hidden: true });
   const formEl = el('form', { class: 'entity-form', onSubmit: (e) => e.preventDefault() }, [error, grid]);
 
@@ -121,8 +134,8 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
           const btn = e.currentTarget;
           const data = {};
           for (const field of fields) {
-            let v = controls[field.key].value;
-            if (field.type === 'money' || field.type === 'number') v = v === '' ? '' : Number(v);
+            let v = shown(field) ? controls[field.key].value : '';
+            if (field.type === 'money' || field.type === 'number' || field.numeric) v = v === '' ? '' : Number(v);
             data[field.key] = v;
           }
           Object.assign(data, overrides);

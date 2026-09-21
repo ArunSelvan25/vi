@@ -1,7 +1,7 @@
 /**
  * Single source of truth for every entity. Forms, tables, filters, CSV export
  * and validation are all generated from these definitions, so adding a field
- * is a one-line change here plus a column in the sheet.
+ * is a one-line change here plus a column in the database (a migration).
  *
  * field: { key, label, type, options|optionsFrom, required, table, form, width, help }
  *   type        text | textarea | number | money | date | select | ref | email | tel | url | readonly
@@ -20,9 +20,6 @@ export const STATUS_COLORS = {
   Forfeited: 'muted', Transferred: 'muted', Pending: 'warn'
 };
 
-/** Utility meters that can be read and billed in bulk. */
-export const METER_CATEGORIES = ['Electricity', 'Water', 'Gas'];
-
 /** A GSTIN: 2-digit state code, PAN, entity number, Z, checksum. */
 export const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
 
@@ -31,6 +28,27 @@ export const ITEM_CATEGORIES = [
   'Rent', 'Electricity', 'Water', 'Gas', 'Internet', 'Parking', 'Maintenance',
   'Cleaning', 'Security', 'Property Tax', 'Late Fee', 'Deposit', 'Other'
 ];
+
+/** "1st", "2nd", "23rd" … */
+function ordinal(n) {
+  const v = n % 100;
+  return n + (v >= 11 && v <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'));
+}
+
+/**
+ * The day of the month a monthly lease bills on: 1–28, which every month has,
+ * or 31 standing for the last day of the month.
+ */
+export const RENT_DAY_OPTIONS = [
+  ...Array.from({ length: 28 }, (_, i) => ({ value: String(i + 1), label: ordinal(i + 1) })),
+  { value: '31', label: 'Last day of month' }
+];
+
+export function rentDayLabel(v) {
+  const n = Number(v);
+  if (!v || !Number.isInteger(n)) return '';
+  return n === 31 ? 'Last day of month' : ordinal(n);
+}
 
 export const entities = {
   properties: {
@@ -142,6 +160,12 @@ export const entities = {
             + 'outside the app. At move-out use "Settle deposit", which records deductions and the refund.' },
       { key: 'frequency', label: 'Billing frequency', type: 'select',
         options: ['Monthly', 'Quarterly', 'Half-Yearly', 'Yearly'] },
+      { key: 'rent_day', label: 'Rent day', type: 'select', options: RENT_DAY_OPTIONS, numeric: true,
+        blank: 'None — bill from the start date', showWhen: { frequency: ['Monthly', ''] },
+        help: 'The payment date each month. Generate rent raises the invoice any time in that month — on the '
+            + '1st for the 10th — for the month up to the rent day. The first one covers the start date up to '
+            + 'it, each month charged by its own number of days: a lease from 21 Sep with the 10th is billed '
+            + '21–30 Sep (10/30) and 1–10 Oct (10/31), due 10 Oct.' },
       // billing_day is kept as a column so existing values survive, but stays
       // off the form: rent periods follow the lease start date and nothing
       // reads it. An input that does nothing is worse than no input.
@@ -149,8 +173,9 @@ export const entities = {
       { key: 'late_fee', label: 'Late fee', type: 'money',
         help: 'Added once as a line item when an invoice on this lease goes overdue. Leave blank for none.' },
       { key: 'grace_days', label: 'Grace days', type: 'number',
-        help: 'Days after each period starts before the rent is due. Rent is billed '
-            + 'from the lease start date — a lease starting on the 5th bills on the 5th.' },
+        help: 'With a rent day: days after the rent day before the late fee is added — the invoice still '
+            + 'shows the rent day as its payment date. Without one: days after each period starts before the '
+            + 'rent is due; rent is billed from the lease start date, so a lease starting on the 5th bills on the 5th.' },
       { key: 'escalation_pct', label: 'Annual escalation %', type: 'number',
         help: 'Rent increases by this % on each lease anniversary' },
       { key: 'gst_rate', label: 'GST on rent %', type: 'number',
@@ -296,28 +321,6 @@ export const entities = {
       { key: 'notes', label: 'Notes', type: 'textarea' }
     ]
   }
-};
-
-// Meter readings are entered and billed in bulk from the Meter readings screen;
-// the definition drives that screen's history table and its CSV export.
-entities.meterReadings = {
-  table: 'MeterReadings',
-  title: 'Meter readings',
-  singular: 'Reading',
-  icon: 'bolt',
-  labelKey: 'id',
-  search: ['id', 'category'],
-  fields: [
-    { key: 'reading_date', label: 'Date', type: 'date', table: true },
-    { key: 'unit_id', label: 'Unit', type: 'ref', optionsFrom: 'units', table: true },
-    { key: 'category', label: 'Meter', type: 'select', table: true, options: METER_CATEGORIES },
-    { key: 'previous_reading', label: 'Previous', type: 'number', table: true },
-    { key: 'current_reading', label: 'Current', type: 'number', table: true },
-    { key: 'consumption', label: 'Units used', type: 'number', table: true },
-    { key: 'rate', label: 'Rate', type: 'money', table: true },
-    { key: 'amount', label: 'Amount', type: 'money', table: true },
-    { key: 'invoice_id', label: 'Invoice', type: 'ref', optionsFrom: 'invoices', table: true }
-  ]
 };
 
 /** Fields shown in the create/edit form. */

@@ -1,12 +1,11 @@
 /**
- * The storage layer: what readTable / createRow / updateRow / deleteRow did
- * against the spreadsheet, done against Postgres.
+ * The storage layer: readTable / createRow / updateRow / deleteRow, on Postgres.
  *
  * Every request runs inside one transaction that holds a single advisory lock
- * (see `openRequest`), so the business code above this can keep the shape it
- * had under the Apps Script lock: read a table, check something, write — and
- * nothing else can land in between. Unlike the sheet, a request that fails
- * part-way now leaves nothing behind: the transaction rolls back.
+ * (see `openRequest`), so the business code above this can simply read a
+ * table, check something, write — and nothing else can land in between. A
+ * request that fails part-way leaves nothing behind: the transaction rolls
+ * back.
  *
  * Reads are memoised per request. The memo is kept up to date by the writes
  * below rather than thrown away by them — a rent run that recomputes a hundred
@@ -19,12 +18,12 @@ const LOCK_KEY = 727274;
 
 /** Tables a delete can change behind the memo's back, through ON DELETE rules. */
 const CASCADES = {
-  Invoices: ['InvoiceItems', 'MeterReadings']
+  Invoices: ['InvoiceItems']
 };
 
 /**
  * Start a request: the app's time zone for the session (so timestamps read
- * and written as local wall-clock time mean what the sheet meant), then the
+ * and written as local wall-clock time mean the app's local time), then the
  * lock that serialises writers.
  */
 export async function openRequest(tx, tz) {

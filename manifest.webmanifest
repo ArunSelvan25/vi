@@ -2,7 +2,7 @@
   "id": "./",
   "name": "VI Property Manager",
   "short_name": "Property",
-  "description": "Property and tenancy management running on Google Sheets.",
+  "description": "Property and tenancy management: leases, rent, invoices and payments.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

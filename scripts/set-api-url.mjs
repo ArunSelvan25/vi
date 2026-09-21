@@ -1,6 +1,5 @@
 /**
- * Writes the API URL (the Supabase function, or the Apps Script Web App until
- * it is retired) into assets/js/config.js at deploy time,
+ * Writes the API URL (the Supabase function) into assets/js/config.js at deploy time,
  * so every device lands straight on the login screen instead of the setup
  * wizard.
  *
@@ -12,7 +11,7 @@
  * It only keeps the URL out of your git history. The endpoint is safe to expose
  * — every action except ping/login/setup requires a valid session token — but
  * set a SETUP_KEY secret as well so the first-run bootstrap cannot be
- * hijacked. See docs/SUPABASE_MIGRATION.md.
+ * hijacked. See docs/SETUP.md.
  */
 import fs from 'fs';
 
@@ -25,8 +24,7 @@ if (!url) {
 }
 
 const SUPABASE = /^https:\/\/[a-z0-9-]+\.supabase\.co\/functions\/v1\/[A-Za-z0-9_-]+$/;
-const APPS_SCRIPT = /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/;
-if (!SUPABASE.test(url) && !APPS_SCRIPT.test(url)) {
+if (!SUPABASE.test(url)) {
   console.error('VIPM_API_URL does not look like the API URL.');
   console.error('Expected: https://<project>.supabase.co/functions/v1/api');
   console.error('Received: ' + url.replace(/\/\/[^/]+/, '//***'));

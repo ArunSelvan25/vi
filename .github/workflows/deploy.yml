@@ -10,14 +10,17 @@ permissions:
   pages: write
   id-token: write
 
+# A newer push waits for the run in progress rather than cancelling it:
+# cancelling part-way through a database migration is never safe.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    # a throwaway Postgres for the Supabase backend's tests
+    # A throwaway Postgres: every suite, the browser ones included, runs the
+    # real backend against it.
     services:
       postgres:
         image: postgres:17-alpine
@@ -26,41 +29,69 @@ jobs:
         ports: ['55432:5432']
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgres://postgres:pw@localhost:55432/postgres
+      # the runner ships with Chrome pre-installed
+      CHROME_PATH: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
       - run: npm install --no-audit --no-fund
-      # the runner ships with Chrome pre-installed
-      - name: Backend logic tests
+      - name: Billing logic tests
         run: npm run test:backend
       - name: Security tests
         run: npm run test:security
       - name: Production-readiness tests
         run: npm run test:production
+      - name: HTTP and database-access tests
+        run: npm run test:http
       - name: Installable-app checks
         run: npm run test:pwa
       - name: Browser smoke tests
         run: npm run test:ui
-        env:
-          CHROME_PATH: /usr/bin/google-chrome
       - name: Mobile layout tests
         run: npm run test:responsive
-        env:
-          CHROME_PATH: /usr/bin/google-chrome
       - name: Installable-app browser tests
         run: npm run test:pwa:ui
-        env:
-          CHROME_PATH: /usr/bin/google-chrome
-      - name: Supabase backend tests (billing, security, production, HTTP, migration, browser)
-        run: npm run test:supabase
-        env:
-          TEST_DATABASE_URL: postgres://postgres:pw@localhost:55432/postgres
-          CHROME_PATH: /usr/bin/google-chrome
+
+  # The database and the API function, before the site that talks to them.
+  # Migrations are applied first: every one so far only adds, and a function
+  # that expects a new column must not go live before the column exists.
+  # Needs three repository secrets — see docs/SETUP.md.
+  backend:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      # Stop rather than publish a site ahead of a database it has not updated.
+      - name: Check the Supabase secrets are set
+        run: |
+          missing=""
+          [ -n "$SUPABASE_ACCESS_TOKEN" ] || missing="$missing SUPABASE_ACCESS_TOKEN"
+          [ -n "$SUPABASE_DB_PASSWORD" ]  || missing="$missing SUPABASE_DB_PASSWORD"
+          [ -n "$SUPABASE_PROJECT_ID" ]   || missing="$missing SUPABASE_PROJECT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Add these repository secrets (Settings → Secrets and variables → Actions):$missing"
+            exit 1
+          fi
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.117.0
+      - name: Migrations waiting to run
+        run: supabase db push --dry-run --project-ref "$SUPABASE_PROJECT_ID" --password "$SUPABASE_DB_PASSWORD"
+      - name: Run database migrations
+        run: supabase db push --yes --project-ref "$SUPABASE_PROJECT_ID" --password "$SUPABASE_DB_PASSWORD"
+      - name: Deploy the API function
+        run: supabase functions deploy api --no-verify-jwt --use-api --project-ref "$SUPABASE_PROJECT_ID"
 
   deploy:
-    needs: test
+    needs: [test, backend]
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -73,7 +104,7 @@ jobs:
       # Optional: set a VIPM_API_URL repository secret to skip the setup wizard
       # on every device. The URL is written into the published site, so it is
       # visible to anyone who loads the page — this only keeps it out of git.
-      # Pair it with a SETUP_KEY script property. See docs/SETUP.md.
+      # Pair it with a SETUP_KEY secret on the Supabase function. See docs/SETUP.md.
       - name: Inject API URL from repository secret
         env:
           VIPM_API_URL: ${{ secrets.VIPM_API_URL }}

@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * Break-glass: make a phone number an active administrator with a new
- * password, and clear any sign-in lockout on it. The replacement for the
- * spreadsheet's "Recover admin access" menu.
+ * password, and clear any sign-in lockout on it.
  *
  *   DATABASE_URL=… node scripts/recover-admin.mjs <phone> [name]
  *

@@ -16,7 +16,8 @@
  */
 const DEFAULT_API_URL = '';
 
-const APPS_SCRIPT = /^https:\/\/script\.google\.com\//;
+/** The address shape of the backend: a Supabase Edge Function. */
+const SUPABASE_FUNCTION = /^https:\/\/[a-z0-9-]+\.supabase\.co\/functions\/v1\//;
 
 const KEYS = {
   api: 'vipm.apiUrl',
@@ -28,10 +29,10 @@ const KEYS = {
 export const config = {
   get apiUrl() {
     const stored = localStorage.getItem(KEYS.api);
-    // After the move to Supabase, a browser that still remembers the retired
-    // Apps Script deployment follows the published default instead — otherwise
-    // every device set up before the move would keep talking to the old sheet.
-    if (stored && DEFAULT_API_URL && APPS_SCRIPT.test(stored) && !APPS_SCRIPT.test(DEFAULT_API_URL)) {
+    // A device that still remembers an address from an older backend follows
+    // the published one instead, rather than calling something retired.
+    // (A local development address is left alone.)
+    if (stored && DEFAULT_API_URL && !SUPABASE_FUNCTION.test(stored) && !/^http:\/\/localhost[:/]/.test(stored)) {
       return DEFAULT_API_URL;
     }
     // an explicitly stored '' means "disconnected", and beats the baked-in default

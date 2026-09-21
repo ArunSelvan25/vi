@@ -3,7 +3,6 @@ import { el, icon, money, date, badge, toast, confirmDialog, today, modal,
 import { store } from '../store.js';
 import { api } from '../api.js';
 import { ITEM_CATEGORIES } from '../schema.js';
-import { crudView } from './crud.js';
 import { openActionForm } from '../components/form.js';
 import { refreshView, navigate } from '../router.js';
 
@@ -483,76 +482,4 @@ export function showReceipt(payment) {
       { label: 'Print / PDF', variant: 'btn-primary', onClick: () => printDocument() }
     ]
   });
-}
-
-export function invoicesView() {
-  const bulkActions = store.can('manager') ? [
-    el('button', {
-      class: 'btn btn-ghost',
-      onClick: async (e) => {
-        const ok = await confirmDialog({
-          title: 'Generate rent invoices?',
-          message: 'Creates any missing rent invoices for every active lease up to today. Periods already invoiced are skipped, so it is safe to run repeatedly.',
-          confirmLabel: 'Generate', danger: false
-        });
-        if (!ok) return;
-        e.target.disabled = true;
-        try {
-          const res = await store.act('generateInvoices', { upto: today() });
-          toast(res.created ? `${res.created} invoice(s) generated` : 'Everything already invoiced', 'ok');
-          rerenderHost();
-        } catch (err) { toast(err.message, 'danger'); }
-        finally { e.target.disabled = false; }
-      }
-    }, [icon('bolt', 16), ' Generate rent']),
-    el('button', { class: 'btn btn-ghost', onClick: () => navigate('meters') },
-       [icon('gauge', 16), ' Meter readings']),
-    el('button', {
-      class: 'btn btn-ghost',
-      onClick: async (e) => {
-        e.target.disabled = true;
-        try {
-          const res = await store.act('sendReminders', {});
-          toast(`${res.sent} reminder(s) emailed, ${res.skipped} skipped`, res.sent ? 'ok' : 'info');
-        } catch (err) { toast(err.message, 'danger'); }
-        finally { e.target.disabled = false; }
-      }
-    }, [icon('mail', 16), ' Send reminders'])
-  ] : [];
-
-  const view = crudView('invoices', {
-    headerActions: bulkActions,
-    openForm: (row, opts) => openInvoiceForm(row, opts),
-    filterKeys: ['status', 'type'],
-    onRowClick: (row) => showInvoice(row),
-    // an issued invoice is voided, never deleted; only a draft can go
-    canDelete: (row) => row.status === 'Draft',
-    extraActions: [
-      { label: 'View / print', icon: 'receipt', onClick: (row) => showInvoice(row) },
-      {
-        label: 'Record payment', icon: 'card',
-        visible: (row) => store.can('manager') && Number(row.balance) > 0 && !['Void', 'Draft'].includes(row.status),
-        onClick: (row) => recordPaymentFor(row, () => rerenderHost())
-      },
-      {
-        label: 'Share on WhatsApp', icon: 'whatsapp',
-        visible: (row) => !!tenantOf(row)?.phone && row.status !== 'Draft',
-        onClick: (row) => window.open(whatsappLink(tenantOf(row).phone, invoiceMessage(row), country()),
-                                      '_blank', 'noopener')
-      },
-      {
-        label: 'Void', icon: 'ban', danger: true,
-        visible: (row) => store.can('manager') && !['Void', 'Draft'].includes(row.status) && !(Number(row.amount_paid) > 0),
-        onClick: (row) => voidInvoiceFor(row, () => rerenderHost())
-      }
-    ]
-  });
-
-  function rerenderHost() {
-    const parent = view.parentElement;
-    if (!parent) return;
-    parent.replaceChild(invoicesView(), view);
-  }
-
-  return view;
 }

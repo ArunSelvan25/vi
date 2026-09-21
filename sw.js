@@ -4,7 +4,7 @@
  * Two rules keep it out of trouble:
  *
  *  1. Only same-origin GETs are ever served from the cache. Every call to the
- *     Apps Script Web App is a cross-origin POST, so live data is never cached,
+ *     API is a cross-origin POST, so live data is never cached,
  *     never replayed, and never served stale. Sign-in tokens and tenant records
  *     stay out of the cache entirely.
  *
@@ -45,15 +45,18 @@ const SHELL = [
   './assets/js/store.js',
   './assets/js/ui.js',
   './assets/js/components/charts.js',
+  './assets/js/components/detail.js',
   './assets/js/components/form.js',
+  './assets/js/components/hovercard.js',
   './assets/js/components/table.js',
+  './assets/js/views/billing.js',
   './assets/js/views/crud.js',
   './assets/js/views/dashboard.js',
   './assets/js/views/details.js',
   './assets/js/views/invoices.js',
   './assets/js/views/leases.js',
-  './assets/js/views/meters.js',
   './assets/js/views/onboarding.js',
+  './assets/js/views/records.js',
   './assets/js/views/reports.js',
   './assets/js/views/settings.js',
   './assets/icons/icon-192.png',
@@ -86,7 +89,7 @@ self.addEventListener('message', (event) => {
 self.addEventListener('fetch', (event) => {
   const req = event.request;
 
-  // Every API call is a POST, so this alone keeps the Apps Script endpoint out.
+  // Every API call is a POST, so this alone keeps the API out of the cache.
   if (req.method !== 'GET') return;
 
   // ...and this keeps out anything else that is not ours, whatever its method.

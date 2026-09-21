@@ -1,7 +1,7 @@
 import { el, icon, money, date, toast, modal, today, addDays, isoDate } from '../ui.js';
 import { store } from '../store.js';
 import { crudView } from './crud.js';
-import { refreshView } from '../router.js';
+import { refreshView, navigate } from '../router.js';
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -212,6 +212,7 @@ export function openRenewLease(lease, { onDone } = {}) {
 export function leasesView() {
   return crudView('leases', {
     filterKeys: ['status', 'frequency'],
+    onRowClick: (row) => navigate('leases/' + encodeURIComponent(row.id)),
     extraActions: [
       {
         label: 'Renew', icon: 'renew',

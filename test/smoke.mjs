@@ -53,7 +53,7 @@ await step('first run shows setup wizard', async () => {
   if (!/Connect your database/.test(t)) throw new Error('got: ' + t);
 });
 
-await step('the wizard creates the first administrator on a fresh sheet', async () => {
+await step('the wizard creates the first administrator on a fresh database', async () => {
   // The wizard only accepts a real API URL, so answer for one here — with
   // exactly what the backend says to an empty database. The mock API always
   // claims to be set up already, which is how this path broke unseen.
@@ -204,7 +204,7 @@ await step('arrears + expiring lists populate', async () => {
 });
 
 console.log('\n— navigation across every view —');
-for (const path of ['properties','units','tenants','leases','invoices','payments',
+for (const path of ['properties','units','tenants','leases','billing',
                     'maintenance','expenses','documents','reports','settings']) {
   await step('view: ' + path, async () => {
     await page.evaluate(p => { location.hash = '#/' + p; }, path);
@@ -221,7 +221,7 @@ for (const path of ['properties','units','tenants','leases','invoices','payments
 
 console.log('\n— data tables —');
 await step('invoice table lists all 3 invoices', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   await page.waitForSelector('.data-table tbody tr', { timeout: 5000 });
   const rows = await page.$$eval('.data-table tbody tr', r => r.length);
   if (rows !== 3) throw new Error('expected 3 rows, got ' + rows);
@@ -375,7 +375,7 @@ await step('required-field validation blocks an empty save', async () => {
 });
 
 await step('record a payment updates the invoice', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   await page.waitForSelector('.data-table tbody tr', { timeout: 5000 });
   await page.evaluate(() => {
     const rows = [...document.querySelectorAll('.data-table tbody tr')];
@@ -392,7 +392,7 @@ await step('record a payment updates the invoice', async () => {
 });
 
 await step('build an invoice with rent + electricity + water in one go', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   const before = await page.$$eval('.data-table tbody tr', r => r.length);
   await page.evaluate(() => [...document.querySelectorAll('button')]
     .find(b => /New invoice/i.test(b.textContent)).click());
@@ -481,11 +481,12 @@ await step('the last line cannot be removed', async () => {
 });
 
 await step('the printed invoice itemises every charge', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   await page.evaluate(() => {
     const row = [...document.querySelectorAll('.data-table tbody tr')]
       .find(r => /INV-00003/.test(r.textContent));
-    row.click();
+    // a row opens the invoice's page; its printable document is a row action
+    row.querySelector('.row-actions button[title="View / print"]').click();
   });
   await page.waitForSelector('.invoice-doc', { timeout: 5000 });
   const txt = await page.$eval('.invoice-doc', e => e.textContent);
@@ -498,7 +499,7 @@ await step('the printed invoice itemises every charge', async () => {
 });
 
 await step('invoice document opens and prints', async () => {
-  await page.evaluate(() => document.querySelector('.data-table tbody tr').click());
+  await page.evaluate(() => document.querySelector('.data-table tbody tr .row-actions button[title="View / print"]').click());
   await page.waitForSelector('.invoice-doc', { timeout: 5000 });
   const txt = await page.$eval('.invoice-doc', e => e.textContent);
   if (!/Balance due/.test(txt)) throw new Error('invoice body incomplete');
@@ -519,6 +520,181 @@ await step('tenant detail shows ledger', async () => {
   await page.waitForSelector('.stat-row', { timeout: 5000 });
   const txt = await page.$eval('.view', e => e.textContent);
   if (!/Outstanding/.test(txt) || !/INV-0000/.test(txt)) throw new Error('tenant ledger missing');
+});
+
+/** Open a record page and wait for its header. */
+const openRecord = async (hash) => {
+  await page.evaluate(h => { location.hash = '#/' + h; }, hash);
+  await page.waitForSelector('.detail-head h1', { timeout: 5000 });
+  await new Promise(r => setTimeout(r, 150));
+  const body = await page.$eval('#main', e => e.textContent);
+  if (/Something went wrong/.test(body)) throw new Error(hash + ' threw');
+  return page.$eval('.view', e => e.textContent);
+};
+
+await step('every kind of record has a page of its own', async () => {
+  const want = {
+    'units/UNT-00001': ['A-101', 'Anita Rao', 'LSE-00001', 'INV-00002'],
+    'leases/LSE-00001': ['LSE-00001', 'Anita Rao', 'A-101', 'Security deposit', 'INV-00002'],
+    'invoices/INV-00003': ['INV-00003', 'Karthik Menon', 'EB bill', 'Water charges', 'Balance due', '25,000'],
+    'payments/PAY-00001': ['28,000', 'Anita Rao', 'INV-00001', 'UPI-8891'],
+    'maintenance/MNT-00002': ['Pool pump service', 'AquaCare', 'Booked as expense'],
+    'expenses/EXP-00001': ['32,000', 'Sunrise Residency', 'BBMP'],
+    'documents/DOC-00001': ['Rental agreement', 'Open']
+  };
+  for (const [hash, parts] of Object.entries(want)) {
+    const txt = await openRecord(hash);
+    const gone = parts.filter(p => !txt.includes(p));
+    if (gone.length) throw new Error(`${hash} is missing ${gone.join(', ')}`);
+  }
+  await page.evaluate(() => { location.hash = '#/units/UNT-99999'; });
+  await page.waitForFunction(() => /Unit not found/.test(document.querySelector('#main .view h1')?.textContent || ''),
+                             { timeout: 5000 });
+});
+
+await step('a list row opens the record page, and related records link onward', async () => {
+  await go('billing', 'Billing');
+  await page.evaluate(() => [...document.querySelectorAll('.data-table tbody tr')]
+    .find(r => /INV-00003/.test(r.textContent)).click());
+  await page.waitForFunction(() => location.hash === '#/invoices/INV-00003' &&
+    document.querySelector('.detail-head h1')?.textContent === 'INV-00003', { timeout: 5000 });
+  // the tenant named on the invoice is a link to the tenant
+  await page.evaluate(() => document.querySelector('.detail-sub a.ref[href="#/tenants/TNT-00002"]').click());
+  await page.waitForFunction(() => document.querySelector('.detail-head h1')?.textContent === 'Karthik Menon', { timeout: 5000 });
+  // a reference inside a table row opens that record, not the row's
+  await go('billing', 'Billing');
+  await page.evaluate(() => document.querySelector('.data-table tbody tr a.ref[href^="#/units/"]').click());
+  await page.waitForFunction(() => /^#\/units\//.test(location.hash) &&
+    !!document.querySelector('.detail-head h1'), { timeout: 5000 });
+});
+
+await step('tabs switch in place and are remembered in the address', async () => {
+  await openRecord('tenants/TNT-00001');
+  await page.evaluate(() => [...document.querySelectorAll('.tab')].find(t => /Payments/.test(t.textContent)).click());
+  await page.waitForFunction(() => location.hash === '#/tenants/TNT-00001?tab=payments', { timeout: 3000 });
+  const rows = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.length);
+  if (rows !== 1) throw new Error('payments tab shows ' + rows + ' rows');
+  await page.reload({ waitUntil: 'networkidle0' });
+  await page.waitForSelector('.tab[aria-selected="true"]', { timeout: 8000 });
+  const active = await page.$eval('.tab[aria-selected="true"]', e => e.textContent);
+  if (!/Payments/.test(active)) throw new Error('after reload the open tab is ' + active);
+});
+
+await step('ids, phones and emails copy to the clipboard', async () => {
+  const ctx = browser.defaultBrowserContext();
+  await ctx.overridePermissions(BASE, ['clipboard-read', 'clipboard-write', 'clipboard-sanitized-write']);
+  await openRecord('tenants/TNT-00001');
+  await page.evaluate(() => document.querySelector('.detail-meta .copyable .copy-btn').click());
+  await page.waitForFunction(() => [...document.querySelectorAll('.toast')].some(t => /Tenant ID copied/.test(t.textContent)),
+                             { timeout: 3000 });
+  const clip = await page.evaluate(() => navigator.clipboard.readText());
+  if (clip !== 'TNT-00001') throw new Error('clipboard holds ' + JSON.stringify(clip));
+});
+
+await step('hovering a linked record shows its card', async () => {
+  await go('billing', 'Billing');
+  await page.hover('.data-table tbody tr a.ref[href="#/tenants/TNT-00001"]');
+  await page.waitForSelector('.hovercard.open', { timeout: 3000 });
+  const txt = await page.$eval('.hovercard', e => e.textContent);
+  if (!/Anita Rao/.test(txt) || !/Outstanding/.test(txt) || !/TNT-00001/.test(txt)) throw new Error('card reads: ' + txt);
+  await page.mouse.move(5, 5);
+  await page.waitForFunction(() => !document.querySelector('.hovercard.open'), { timeout: 3000 });
+});
+
+console.log('\n— billing —');
+await step('invoices and payments share one Billing screen; the old addresses lead there', async () => {
+  const nav = await page.$$eval('.nav-item', a => a.map(x => x.textContent.trim()));
+  if (!nav.includes('Billing') || nav.includes('Invoices') || nav.includes('Payments')) throw new Error('sidebar: ' + nav.join(', '));
+  for (const [from, to] of [['invoices', '#/billing'], ['payments', '#/billing?tab=payments']]) {
+    await page.evaluate(h => { location.hash = '#/' + h; }, from);
+    await page.waitForFunction(t => location.hash === t && /Billing/.test(document.querySelector('#main .view h1')?.textContent || ''),
+                               { timeout: 5000 }, to);
+  }
+  const tab = await page.$eval('.tab[aria-selected="true"]', e => e.textContent);
+  if (!/Payments received/.test(tab)) throw new Error('#/payments opened the ' + tab + ' tab');
+  const buttons = await page.$$eval('#main button', b => b.map(x => x.textContent.trim()));
+  if (buttons.some(t => /New payment/i.test(t))) throw new Error('a separate New payment button is still offered');
+});
+
+await step('the Billing figures filter the list, and clicking again clears it', async () => {
+  await go('billing', 'Billing');
+  const all = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.length);
+  const want = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    const t = new Date(); const today = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+    return store.invoices.filter(i => ['Unpaid', 'Partial', 'Overdue'].includes(i.status) && i.due_date < today).length;
+  });
+  await page.evaluate(() => [...document.querySelectorAll('.stat-button')].find(b => /Overdue/.test(b.textContent)).click());
+  await page.waitForFunction(() => location.hash === '#/billing?show=overdue' && !!document.querySelector('.filter-chip'), { timeout: 5000 });
+  const rows = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.map(x => x.textContent));
+  if (rows.length !== want) throw new Error(`overdue filter shows ${rows.length}, expected ${want}`);
+  if (rows.some(r => !/Overdue/.test(r))) throw new Error('a row that is not overdue: ' + rows.join(' | '));
+  await page.evaluate(() => document.querySelector('.stat-button.is-active').click());
+  await page.waitForFunction(n => location.hash === '#/billing' &&
+    document.querySelectorAll('.tab-panel:not([hidden]) .data-table tbody tr').length === n, { timeout: 5000 }, all);
+  // "Collected this month" opens the payments tab with just this month's
+  await page.evaluate(() => [...document.querySelectorAll('.stat-button')].find(b => /Collected/.test(b.textContent)).click());
+  await page.waitForFunction(() => location.hash === '#/billing?tab=payments&show=month', { timeout: 5000 });
+  const sub = await page.$eval('.stat-button.is-active .stat-sub', e => e.textContent);
+  const shown = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.length);
+  if (parseInt(sub, 10) !== shown) throw new Error(`figure says ${sub}, list shows ${shown}`);
+});
+
+await step('an invoice page says how much is paid and what is left', async () => {
+  await page.evaluate(() => { location.hash = '#/invoices/INV-00001'; });
+  await page.waitForSelector('.pay-progress', { timeout: 5000 });
+  const txt = await page.$eval('.pay-progress', e => e.textContent);
+  if (!/Paid in full/.test(txt)) throw new Error('INV-00001 reads: ' + txt);
+  const crumb = await page.$eval('.crumbs a', e => e.getAttribute('href'));
+  if (crumb !== '#/billing') throw new Error('breadcrumb leads to ' + crumb);
+  const active = await page.$eval('.nav-item.active', e => e.textContent.trim());
+  if (active !== 'Billing') throw new Error('sidebar highlights ' + active);
+});
+
+console.log('\n— rent day —');
+await step('the lease form offers a rent day for monthly leases only', async () => {
+  await go('leases', 'Leases');
+  await page.evaluate(() => [...document.querySelectorAll('.head-actions .btn-primary')].pop().click());
+  await page.waitForSelector('#f_rent_day', { timeout: 5000 });
+  const visible = () => page.$eval('#f_rent_day', e => !e.closest('.field').hidden);
+  if (!await visible()) throw new Error('hidden on a new lease');
+  const labels = await page.$$eval('#f_rent_day option', o => o.map(x => x.textContent));
+  if (!labels.includes('10th') || !labels.includes('Last day of month') || labels.includes('30th')) {
+    throw new Error('options: ' + labels.join(', '));
+  }
+  await page.select('#f_frequency', 'Quarterly');
+  if (await visible()) throw new Error('still shown for a quarterly lease');
+  await page.select('#f_frequency', 'Monthly');
+  if (!await visible()) throw new Error('not shown again for monthly');
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 5000 });
+});
+
+await step('a lease with a rent day shows the next invoice and how a part month is charged', async () => {
+  const set = (value) => page.evaluate(async (v) => {
+    const res = await fetch('/api', { method: 'POST', body: JSON.stringify({
+      action: 'update', token: localStorage.getItem('vipm.token'),
+      payload: { table: 'Leases', id: 'LSE-00001', data: { rent_day: v } } }) });
+    const body = await res.json();
+    if (!body.ok) throw new Error(body.error);
+    const { store } = await import('/assets/js/store.js');
+    await store.refresh();
+  }, value);
+  await set(10);
+  try {
+    await page.evaluate(() => { location.hash = '#/leases/LSE-00001'; });
+    await page.waitForFunction(() => [...document.querySelectorAll('.panel')].some(p => /Next rent invoice/.test(p.textContent)),
+                               { timeout: 5000 });
+    const txt = await page.evaluate(() => [...document.querySelectorAll('.panel')]
+      .find(p => /Next rent invoice/.test(p.textContent)).textContent);
+    if (!/₹[\d,.]+ due \d/.test(txt) || !/Can be raised from/.test(txt) || !/Late fee from/.test(txt)) {
+      throw new Error('panel reads: ' + txt);
+    }
+    const facts = await page.$eval('.view', e => e.textContent);
+    if (!/Rent day10th/.test(facts)) throw new Error('rent day not shown on the lease');
+  } finally {
+    await set('');
+  }
 });
 
 console.log('\n— reports —');
@@ -575,7 +751,7 @@ const rowAction = (rowText, title) => page.evaluate((txt, t) => {
 }, rowText, title);
 
 await step('the invoice editor prices GST per line', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   await clickText('button', /New invoice/);
   await page.waitForSelector('.line-editor', { timeout: 5000 });
   const row = (await page.$$('.line-row'))[0];
@@ -594,7 +770,7 @@ await step('an invoice can be shared on WhatsApp and paid by UPI', async () => {
     store.settings.upi_id = 'vilifestyle@okhdfc';
   });
   await page.evaluate(() => [...document.querySelectorAll('.data-table tbody tr')]
-    .find(r => /INV-00002/.test(r.textContent)).click());
+    .find(r => /INV-00002/.test(r.textContent)).querySelector('.row-actions button[title="View / print"]').click());
   await page.waitForSelector('.invoice-doc', { timeout: 5000 });
   const links = await page.$$eval('.modal a', a => a.map(x => x.getAttribute('href')));
   if (!links.some(h => /^https:\/\/wa\.me\/919880011111\?text=/.test(h))) throw new Error('no WhatsApp link: ' + links.join(' '));
@@ -603,7 +779,7 @@ await step('an invoice can be shared on WhatsApp and paid by UPI', async () => {
 });
 
 await step('an issued invoice is voided with a reason, not deleted', async () => {
-  await go('invoices', 'Invoices');
+  await go('billing', 'Billing');
   if (await rowAction('INV-00002', 'Delete')) throw new Error('an issued invoice offers Delete');
   if (!await rowAction('INV-00002', 'Void')) throw new Error('no Void action on INV-00002');
   await page.waitForSelector('.modal textarea', { timeout: 5000 });
@@ -616,28 +792,17 @@ await step('an issued invoice is voided with a reason, not deleted', async () =>
   if (!/Void/.test(row)) throw new Error('row reads: ' + row);
 });
 
-await step('meter readings bill the occupied units in one go', async () => {
-  await go('meters', 'Meter readings');
-  await page.waitForSelector('.meter-table', { timeout: 5000 });
-  const prev = await page.$eval('tr[data-unit="UNT-00001"] .meter-prev', e => e.value);
-  if (prev !== '10382') throw new Error('previous reading not carried over: ' + prev);
-  const rate = await page.$('.panel .form-grid .meter-rate');
-  await rate.type('8.5');
-  await page.type('tr[data-unit="UNT-00001"] .meter-cur', '10500');
-  await new Promise(r => setTimeout(r, 150));
-  const amount = await page.$eval('tr[data-unit="UNT-00001"] .meter-amount', e => e.textContent);
-  if (!/1,003/.test(amount)) throw new Error('amount shows ' + amount);
-  await clickText('button', /Save & bill/);
-  // billed once the new reading is in the store and the screen has redrawn
-  await page.waitForFunction(async () => {
+await step('meter readings are gone, and an old link to them is a plain not-found page', async () => {
+  const nav = await page.$$eval('.nav-item', a => a.map(x => x.textContent));
+  if (nav.some(t => /meter/i.test(t))) throw new Error('the sidebar still offers ' + nav.join(', '));
+  await page.evaluate(() => { location.hash = '#/meters'; });
+  await page.waitForFunction(() => /Page not found/.test(document.querySelector('#main h1')?.textContent || ''),
+                             { timeout: 5000 });
+  const kept = await page.evaluate(async () => {
     const { store } = await import('/assets/js/store.js');
-    return store.meterReadings.length >= 2 && !document.querySelector('.meter-cur')?.value;
-  }, { timeout: 10000, polling: 200 });
-  const invoices = await page.evaluate(async () => {
-    const { store } = await import('/assets/js/store.js');
-    return store.invoices.filter(i => i.type === 'Electricity' && i.tenant_id === 'TNT-00001').map(i => i.total);
+    return 'meterReadings' in store;
   });
-  if (!invoices.includes(1003)) throw new Error('no electricity invoice: ' + JSON.stringify(invoices));
+  if (kept) throw new Error('the store still carries meter readings');
 });
 
 await step('an expiring lease is renewed from the dashboard, deposit carried over', async () => {
@@ -691,8 +856,8 @@ await step('a tenant statement and a payment receipt open and print', async () =
   const txt = await page.$eval('.statement-table', e => e.textContent);
   if (!/Opening balance/.test(txt) || !/Closing balance/.test(txt)) throw new Error('statement incomplete');
   await closeModal();
-  await go('payments', 'Payments');
-  await page.evaluate(() => document.querySelector('.data-table tbody tr').click());
+  await go('billing?tab=payments', 'Billing');
+  await page.evaluate(() => document.querySelector('.data-table tbody tr .row-actions button[title="Receipt"]').click());
   await page.waitForSelector('.receipt-body', { timeout: 5000 });
   const kind = await page.$eval('.doc-kind', e => e.textContent);
   if (!/receipt/i.test(kind)) throw new Error('opened ' + kind);

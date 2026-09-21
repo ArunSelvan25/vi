@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Property Manager</title>
-  <meta name="description" content="Property and tenancy management running on Google Sheets.">
+  <meta name="description" content="Property and tenancy management: leases, rent, invoices and payments.">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#21420d">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏠</text></svg>">
@@ -20,12 +20,6 @@
 
   <link rel="stylesheet" href="assets/css/styles.css">
 
-  <!-- Every API call goes to Apps Script, which answers by redirecting to
-       googleusercontent.com: open both connections while the page loads rather
-       than on the first request. -->
-  <link rel="preconnect" href="https://script.google.com" crossorigin>
-  <link rel="preconnect" href="https://script.googleusercontent.com" crossorigin>
-
   <!-- The module graph is three imports deep, which a browser otherwise
        discovers one level per round trip. Listing it lets a first visit fetch
        every module at once. test/pwa-test.mjs keeps this in step with sw.js. -->
@@ -38,15 +32,18 @@
   <link rel="modulepreload" href="assets/js/store.js">
   <link rel="modulepreload" href="assets/js/ui.js">
   <link rel="modulepreload" href="assets/js/components/charts.js">
+  <link rel="modulepreload" href="assets/js/components/detail.js">
   <link rel="modulepreload" href="assets/js/components/form.js">
+  <link rel="modulepreload" href="assets/js/components/hovercard.js">
   <link rel="modulepreload" href="assets/js/components/table.js">
+  <link rel="modulepreload" href="assets/js/views/billing.js">
   <link rel="modulepreload" href="assets/js/views/crud.js">
   <link rel="modulepreload" href="assets/js/views/dashboard.js">
   <link rel="modulepreload" href="assets/js/views/details.js">
   <link rel="modulepreload" href="assets/js/views/invoices.js">
   <link rel="modulepreload" href="assets/js/views/leases.js">
-  <link rel="modulepreload" href="assets/js/views/meters.js">
   <link rel="modulepreload" href="assets/js/views/onboarding.js">
+  <link rel="modulepreload" href="assets/js/views/records.js">
   <link rel="modulepreload" href="assets/js/views/reports.js">
   <link rel="modulepreload" href="assets/js/views/settings.js">
 </head>

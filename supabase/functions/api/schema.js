@@ -1,11 +1,12 @@
 /**
- * The tables, as the SPA knows them (by their old tab names), and how each
- * column converts between what the browser sends and what Postgres stores.
+ * The tables, by the names the app uses for them (Leases, InvoiceItems …), and
+ * how each column converts between what the browser sends and what Postgres
+ * stores.
  *
- * The SPA was written against a spreadsheet, where an empty cell is '' and a
- * number typed into a form arrives as a string. Postgres wants NULL and real
- * numbers. Every value crossing the boundary goes through `toDb` / `fromDb`
- * below, so the rest of the backend can keep treating rows the way Code.gs did.
+ * In the app an empty field is '' and a number typed into a form arrives as a
+ * string. Postgres wants NULL and real numbers. Every value crossing the
+ * boundary goes through `toDb` / `fromDb` below, so the rest of the backend
+ * can treat rows the same way everywhere.
  *
  * Column kinds:
  *   text     nullable text; '' is stored as NULL
@@ -18,7 +19,7 @@
  *   int0     NOT NULL integer, empty means 0
  *   ts       timestamptz, returned as yyyy-MM-ddTHH:mm:ss in the app's zone
  *   ms       timestamptz the code handles as epoch milliseconds
- *   bool     boolean ('TRUE' / 'FALSE' from the sheet era are accepted)
+ *   bool     boolean (the strings 'TRUE' / 'FALSE' are accepted too)
  */
 
 const col = (kind, def) => ({ kind, def });
@@ -48,7 +49,7 @@ export const TABLES = {
     id: req, property_id: text, unit_id: text, tenant_id: text, start_date: date, end_date: date,
     rent_amount: num0, deposit_amount: num0, deposit_status: oneOf('Pending'), frequency: oneOf('Monthly'),
     billing_day: int, late_fee: num0, grace_days: int0, escalation_pct: num0, status: oneOf('Active'),
-    notes: text, ...STAMPS, gst_rate: num0, renewed_from: text } },
+    notes: text, ...STAMPS, gst_rate: num0, renewed_from: text, rent_day: int } },
 
   Invoices: { sql: 'invoices', prefix: 'INV', cols: {
     id: req, lease_id: text, tenant_id: text, unit_id: text, property_id: text, type: req,
@@ -77,11 +78,6 @@ export const TABLES = {
   Documents: { sql: 'documents', prefix: 'DOC', cols: {
     id: req, entity_type: text, entity_id: text, title: text, category: text, url: text,
     issue_date: date, expiry_date: date, notes: text, ...STAMPS } },
-
-  MeterReadings: { sql: 'meter_readings', prefix: 'MTR', cols: {
-    id: req, property_id: text, unit_id: text, lease_id: text, tenant_id: text, category: req,
-    reading_date: date, previous_reading: num0, current_reading: num, consumption: num0, rate: num0,
-    amount: num0, invoice_id: text, notes: text, ...STAMPS } },
 
   Users: { sql: 'app_users', prefix: 'USR', cols: {
     id: req, name: req, phone: req, email: text, role: oneOf('viewer'), salt: req, password_hash: req,
@@ -171,7 +167,7 @@ export function fromDb(table, column, v) {
 /**
  * Parsers for the Postgres driver. Dates and timestamps stay text — turning
  * them into JS Dates would put them through the server's zone, which is exactly
- * the day-shift bug the sheet backend spent a lot of effort avoiding.
+ * the classic day-shift bug: a date landing on the day before in some zones.
  */
 export const PG_TYPES = {
   date:        { to: 1082, from: [1082], serialize: (x) => x, parse: (x) => x },

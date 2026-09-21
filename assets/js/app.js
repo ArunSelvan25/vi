@@ -4,10 +4,11 @@ import { store } from './store.js';
 import { start, navigate, parseHash } from './router.js';
 import { crudView } from './views/crud.js';
 import { dashboardView } from './views/dashboard.js';
-import { invoicesView, showReceipt } from './views/invoices.js';
+import { billingView } from './views/billing.js';
 import { leasesView } from './views/leases.js';
-import { metersView } from './views/meters.js';
-import { propertyDetail, tenantDetail } from './views/details.js';
+import { propertyDetail, unitDetail, tenantDetail } from './views/details.js';
+import { leaseDetail, invoiceDetail, paymentDetail, recordDetail } from './views/records.js';
+import { installHovercards } from './components/hovercard.js';
 import { reportsView } from './views/reports.js';
 import { settingsView } from './views/settings.js';
 import { setupView, loginView } from './views/onboarding.js';
@@ -30,9 +31,9 @@ const NAV = [
     { path: 'leases', label: 'Leases', icon: 'file' }
   ]},
   { group: 'Money', items: [
-    { path: 'invoices', label: 'Invoices', icon: 'receipt' },
-    { path: 'payments', label: 'Payments', icon: 'card' },
-    { path: 'meters', label: 'Meter readings', icon: 'gauge' },
+    // invoices and the payments against them live together; their record
+    // pages keep their own addresses, so they light this item up too
+    { path: 'billing', label: 'Billing', icon: 'receipt', also: ['invoices', 'payments'] },
     { path: 'expenses', label: 'Expenses', icon: 'wallet' },
     { path: 'reports', label: 'Reports', icon: 'chart' }
   ]},
@@ -45,9 +46,8 @@ const NAV = [
 
 const PAGE_TITLES = {
   dashboard: 'Dashboard', properties: 'Properties', units: 'Units', tenants: 'Tenants',
-  leases: 'Leases', invoices: 'Invoices', payments: 'Payments', maintenance: 'Maintenance',
-  expenses: 'Expenses', documents: 'Documents', reports: 'Reports', settings: 'Settings',
-  meters: 'Meter readings'
+  leases: 'Leases', billing: 'Billing', invoices: 'Invoices', payments: 'Payments', maintenance: 'Maintenance',
+  expenses: 'Expenses', documents: 'Documents', reports: 'Reports', settings: 'Settings'
 };
 
 const root = document.getElementById('app');
@@ -70,7 +70,8 @@ function shell() {
         group.group ? el('div', { class: 'nav-group-label', text: group.group }) : null,
         ...group.items.map(item =>
           el('a', {
-            class: 'nav-item', href: '#/' + item.path, dataset: { path: item.path },
+            class: 'nav-item', href: '#/' + item.path,
+            dataset: { path: item.path, also: (item.also || []).join(' ') },
             onClick: () => document.body.classList.remove('nav-open')
           }, [icon(item.icon, 17), el('span', { text: item.label })])
         )
@@ -136,7 +137,7 @@ function render() {
     root.append(layout);
   }
   for (const a of layout.querySelectorAll('.nav-item')) {
-    const active = a.dataset.path === ctx.path;
+    const active = a.dataset.path === ctx.path || (a.dataset.also || '').split(' ').includes(ctx.path);
     a.classList.toggle('active', active);
     if (active) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
@@ -155,8 +156,11 @@ function render() {
     ]));
   }
   main.scrollTop = 0;
+  // a record's page is titled by the record, not by the list it belongs to
+  const recordTitle = ctx.id ? main.querySelector('.detail-head h1')?.textContent : '';
+  if (titleEl && recordTitle) titleEl.textContent = recordTitle;
   watchHeading(main, layout.querySelector('#page-title'));
-  document.title = (PAGE_TITLES[ctx.path] || 'Not found') + ' · ' +
+  document.title = (recordTitle || PAGE_TITLES[ctx.path] || 'Not found') + ' · ' +
     (store.settings.org_name || 'Property Manager');
 }
 
@@ -182,23 +186,42 @@ function watchHeading(main, titleEl) {
   headingObserver.observe(heading);
 }
 
+/**
+ * A list, or with an id one record's own page. Every list row opens the
+ * record's page, and every page links onward to the records around it.
+ */
+/**
+ * A list that has moved: send the address on to where it lives now, replacing
+ * the old one in history so Back does not bounce straight here again.
+ */
+function moved(to) {
+  navigate(to, { replace: true });
+  return el('div', { class: 'view' });
+}
+
+function listOrDetail(list, detail) {
+  return (ctx) => (ctx.id ? detail(ctx.id, ctx) : list(ctx));
+}
+
 function routeHandler(path) {
+  const open = (entity) => (row) => navigate(entity + '/' + encodeURIComponent(row.id));
   const handlers = {
     dashboard: dashboardView,
-    properties: (ctx) => (ctx.id ? propertyDetail(ctx.id) : crudView('properties', {
-      onRowClick: (row) => navigate('properties/' + row.id) })),
-    units: () => crudView('units', { filterKeys: ['status', 'furnishing'],
-      onRowClick: (row) => navigate('properties/' + row.property_id) }),
-    tenants: (ctx) => (ctx.id ? tenantDetail(ctx.id) : crudView('tenants', {
-      onRowClick: (row) => navigate('tenants/' + row.id) })),
-    leases: leasesView,
-    invoices: invoicesView,
-    payments: () => crudView('payments', { filterKeys: ['method'], onRowClick: (row) => showReceipt(row),
-      extraActions: [{ label: 'Receipt', icon: 'receipt', onClick: (row) => showReceipt(row) }] }),
-    meters: metersView,
-    maintenance: () => crudView('maintenance', { filterKeys: ['status', 'priority', 'category'] }),
-    expenses: () => crudView('expenses', { filterKeys: ['category'] }),
-    documents: () => crudView('documents', { filterKeys: ['category', 'entity_type'] }),
+    properties: listOrDetail(() => crudView('properties', { onRowClick: open('properties') }), propertyDetail),
+    units: listOrDetail(() => crudView('units', { filterKeys: ['status', 'furnishing'], onRowClick: open('units') }),
+                        unitDetail),
+    tenants: listOrDetail(() => crudView('tenants', { onRowClick: open('tenants') }), tenantDetail),
+    leases: listOrDetail(leasesView, leaseDetail),
+    billing: billingView,
+    // the old list addresses still work: they open the matching Billing tab
+    invoices: listOrDetail(() => moved('billing'), invoiceDetail),
+    payments: listOrDetail(() => moved('billing?tab=payments'), paymentDetail),
+    maintenance: listOrDetail(() => crudView('maintenance', { filterKeys: ['status', 'priority', 'category'],
+      onRowClick: open('maintenance') }), (id) => recordDetail('maintenance', id)),
+    expenses: listOrDetail(() => crudView('expenses', { filterKeys: ['category'], onRowClick: open('expenses') }),
+                           (id) => recordDetail('expenses', id)),
+    documents: listOrDetail(() => crudView('documents', { filterKeys: ['category', 'entity_type'],
+      onRowClick: open('documents') }), (id) => recordDetail('documents', id)),
     reports: reportsView,
     settings: settingsView
   };
@@ -217,7 +240,7 @@ function notFoundView() {
 function showScreen(node) { clear(root); layout = null; root.append(node); }
 
 /**
- * @param snapshot the workbook, when sign-in already returned it. Only ever
+ * @param snapshot all the data, when sign-in already returned it. Only ever
  *   the one from this sign-in: a store left over from an earlier session is
  *   never reused, because the next account may be allowed to see less.
  */
@@ -252,7 +275,7 @@ async function boot(snapshot) {
         el('p', { class: 'form-error', text: err.message }),
         el('button', { class: 'btn btn-primary btn-block', onClick: () => boot() }, ['Try again']),
         el('button', { class: 'link-btn', onClick: () => { config.apiUrl = null; config.clearSession(); location.reload(); } },
-          ['Reconnect a sheet'])
+          ['Connect a different database'])
       ])
     ]));
     return;
@@ -264,4 +287,5 @@ async function boot(snapshot) {
 }
 
 registerServiceWorker();
+installHovercards();
 boot();

@@ -1,193 +1,203 @@
 # Setup guide
 
-About 15 minutes, start to finish. Everything below is on Google's and GitHub's free tiers.
+The app has three parts:
 
 ```
-GitHub Pages (this SPA)  ──HTTPS──►  Apps Script Web App  ──►  Your Google Sheet
+GitHub Pages (the app)            Supabase Edge Function "api"        Supabase Postgres
+┌──────────────────────┐          ┌───────────────────────────┐      ┌──────────────────┐
+│ api(action, payload) │──HTTPS──►│ sign-in, roles, billing   │─SQL─►│ tables, foreign  │
+│                      │◄─────────│ rules, every action       │◄─────│ keys, checks     │
+└──────────────────────┘          └───────────────────────────┘      └──────────────────┘
+                                         ▲ pg_cron, daily 05:00 IST (housekeeping)
 ```
+
+- **The app** is static files served free by GitHub Pages. It installs on a
+  phone like an app.
+- **The API** is one Supabase Edge Function, [`supabase/functions/api/`](../supabase/functions/api/).
+  It holds every rule: sign-in, roles, rent, payments, deposits.
+- **The database** is Supabase Postgres, created by the files in
+  [`supabase/migrations/`](../supabase/migrations/). Each request runs in one
+  transaction, so nothing is ever left half-saved.
+
+You need Node 20+. The [Supabase CLI](https://supabase.com/docs/guides/cli) runs
+through `npx`, so there is nothing to install.
 
 ---
 
-## 1 · Create the spreadsheet
+## First-time setup
 
-1. Go to <https://sheets.new> and name it something like **Property Manager DB**.
-2. Leave it empty — the script creates every tab and header row for you.
+### 1 · Create the Supabase project
 
-## 2 · Add the backend script
+1. At [supabase.com](https://supabase.com), create a project. Choose region
+   **South Asia (Mumbai)**, and keep the database password somewhere safe.
+2. Note the **project ref**: the `abcdefghijklmnop` in `https://abcdefghijklmnop.supabase.co`.
+3. In this repository, run:
 
-1. In the sheet: **Extensions → Apps Script**.
-2. Delete the placeholder `Code.gs` contents.
-3. Paste the entire contents of [`apps-script/Code.gs`](../apps-script/Code.gs).
-4. Save (**Ctrl/Cmd + S**).
-
-> Optional: to keep the script separate from the sheet, create a standalone
-> Apps Script project instead and add a Script Property `SHEET_ID` set to the
-> id from your sheet's URL (`docs.google.com/spreadsheets/d/`**`THIS_PART`**`/edit`).
-
-## 3 · Deploy it as a Web App
-
-1. **Deploy → New deployment**.
-2. Click the gear next to "Select type" and choose **Web app**.
-3. Set:
-   - **Description**: `Property Manager API`
-   - **Execute as**: **Me** *(so the script can reach your sheet)*
-   - **Who has access**: **Anyone** *(required — the browser calls it anonymously; your own login still guards the data)*
-4. **Deploy**, then **Authorize access** and accept the permission screen.
-   Google shows an "unverified app" warning because it is your own private
-   script: choose **Advanced → Go to … (unsafe)** to continue.
-5. Copy the **Web app URL**. It ends in `/exec`.
-
-⚠️ Every time you edit `Code.gs`, use **Deploy → Manage deployments → ✏️ → Version: New version**.
-Creating a *new deployment* instead gives you a different URL.
-
-## 4 · Publish the front-end to GitHub Pages
-
-```bash
-git init
-git add .
-git commit -m "Property manager"
-git branch -M main
-git remote add origin https://github.com/<you>/<repo>.git
-git push -u origin main
+```sh
+npx supabase login
+npx supabase link --project-ref <project-ref>
 ```
 
-Then in the repo: **Settings → Pages → Source: GitHub Actions**. The included
-workflow at [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml)
-publishes on every push to `main`.
+### 2 · Create the tables
 
-*(Prefer no Actions? Set **Source: Deploy from a branch → main → / (root)**.
-The `.nojekyll` file is already there so `assets/` is served as-is.)*
+```sh
+npx supabase db push
+```
 
-Your site lands at `https://<you>.github.io/<repo>/`.
+### 3 · Set the secrets and deploy the API
 
-## 5 · First run
+```sh
+CRON_SECRET="$(openssl rand -hex 32)"
+echo "CRON_SECRET=$CRON_SECRET   <- save this, step 5 needs it"
 
-1. Open the site. The setup wizard asks for the Web App URL — paste it and press **Connect**.
-2. The script creates all 13 tabs and their headers.
-3. Create the first administrator: **name, phone number, and a password of at
-   least 10 characters**. The phone number is what you sign in with — email is
-   optional. Country code is optional too; `+91 98800 11111` and `9880011111`
-   are treated as the same number.
-4. Sign in. You're live.
+npx supabase secrets set \
+  AUTH_SECRET="$(openssl rand -hex 32)" \
+  CRON_SECRET="$CRON_SECRET" \
+  SETUP_KEY="$(openssl rand -hex 16)" \
+  APP_TIMEZONE=Asia/Kolkata
 
-The URL and your session live in the browser's `localStorage`, which is scoped
-**per origin**. Two consequences worth knowing:
+npx supabase functions deploy api --no-verify-jwt
+```
 
-- A URL you entered while testing on `localhost` does **not** carry over to your
-  `github.io` site — you paste it again there, once.
-- Each person pastes it once per browser/device.
+| Secret | What it does |
+|---|---|
+| `AUTH_SECRET` | Signs sign-in sessions. Changing it signs everyone out. |
+| `CRON_SECRET` | Lets the daily job (step 5) call the API. |
+| `SETUP_KEY` | Needed once, to create the first administrator. See *Close the bootstrap window* below. |
+| `APP_TIMEZONE` | The zone "today" is measured in: when rent turns overdue, when leases expire. |
 
-### Using the app on several devices
+Check it answers:
 
-By default each device pastes the URL once. To skip that everywhere, pick one:
+```sh
+curl https://<project-ref>.supabase.co/functions/v1/api
+# {"ok":true,"data":{"service":"vi-property-manager",...}}
+```
 
-**A. Put it in the code** — simplest, best for a **private** repo.
-Set `DEFAULT_API_URL` at the top of
-[`assets/js/config.js`](../assets/js/config.js) to your `/exec` URL and push.
+### 4 · Publish the app to GitHub Pages
 
-**B. Put it in a GitHub secret** — best for a **public** repo.
-Repo → **Settings → Secrets and variables → Actions → New repository secret**,
-named `VIPM_API_URL`, value = your `/exec` URL. The deploy workflow writes it
-into `config.js` as the site is published.
+Push this repository to GitHub, then in the repo: **Settings → Pages → Source:
+GitHub Actions**. The workflow in
+[`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) deploys on every
+push to `main` (see *Deploying* below). Your site lands at
+`https://<you>.github.io/<repo>/`.
 
-> **Be clear about what a secret does here.** GitHub Secrets are readable only
-> by Actions, at build time. This site has no build step, so for the browser to
-> use the URL it must be written into a published file — where anyone who loads
-> the page can read it. Option B keeps the URL out of your **git history**; it
-> is not a security boundary.
+### 5 · Schedule the daily housekeeping
 
-That is acceptable, because the URL on its own grants nothing: every action
-except `ping`, `login` and `setup` needs a valid session token, and roles are
-enforced server-side. **If you publish the URL either way, also set a
-`SETUP_KEY`** (below) so the one-time bootstrap cannot be hijacked.
+Housekeeping flags overdue invoices, expires leases, keeps unit occupancy in step
+and applies late fees. The app also runs it on the first load of each day, so this
+is a safety net.
 
-Whichever you choose, someone can still paste a different URL on their own
-device, and **Disconnect** in Settings returns them to the wizard.
+1. In the Supabase dashboard, open **Integrations** and enable **Cron** and **pg_net**.
+2. In the SQL editor, run:
+
+```sql
+select vault.create_secret('<CRON_SECRET from step 3>', 'vipm_cron_secret');
+
+select cron.schedule('vipm-daily-maintenance', '30 23 * * *',   -- 05:00 IST
+$$
+  select net.http_post(
+    url     := 'https://<project-ref>.supabase.co/functions/v1/api/cron',
+    headers := jsonb_build_object(
+                 'Content-Type', 'application/json',
+                 'x-cron-secret', (select decrypted_secret from vault.decrypted_secrets
+                                   where name = 'vipm_cron_secret')),
+    body    := '{"job":"dailyMaintenanceJob"}'::jsonb);
+$$);
+```
+
+### 6 · First run
+
+1. Open the site. The setup wizard asks for the API URL:
+   `https://<project-ref>.supabase.co/functions/v1/api`. Paste it and press **Connect**.
+2. Create the first administrator: **name, phone number, and a password of at
+   least 10 characters**, plus the `SETUP_KEY` from step 3. The phone number is
+   what you sign in with; email is optional. Country code is optional too:
+   `+91 98800 11111` and `9880011111` are the same number.
+3. Sign in. You're live.
+
+---
+
+## Using the app on several devices
+
+The API URL and your session live in the browser's `localStorage`, which is
+scoped **per origin**, so by default each device pastes the URL once. To skip the
+wizard everywhere, pick one:
+
+**A. Put it in the code** — simplest, best for a **private** repo. Set
+`DEFAULT_API_URL` at the top of [`assets/js/config.js`](../assets/js/config.js)
+and push.
+
+**B. Put it in a GitHub secret** — best for a **public** repo. Add a repository
+secret named `VIPM_API_URL` with the API URL. The deploy workflow writes it into
+`config.js` as the site is published.
+
+> **What a secret does here.** This site has no build step, so for the browser to
+> use the URL it must be written into a published file, where anyone who loads the
+> page can read it. Option B keeps the URL out of your **git history**; it is not a
+> security boundary. That is fine: the URL on its own grants nothing (see below).
+
+With either, a device that still remembers an older API address follows the
+published one automatically. **Disconnect** in Settings returns a device to the
+wizard.
 
 ---
 
 ## Install it on a phone
 
-The published site is a Progressive Web App, so it can be added to a home
-screen and run like an installed app — full screen, its own icon, no browser
-chrome.
+The site is a Progressive Web App, so it can be added to a home screen and run
+like an installed app: full screen, its own icon, no browser chrome.
 
-**Android (Chrome)** — open the site, then either accept the install prompt or
-use **⋮ → Install app** / **Add to Home screen**.
+- **Android (Chrome):** accept the install prompt, or **⋮ → Install app** /
+  **Add to Home screen**.
+- **iPhone / iPad (Safari):** tap **Share**, then **Add to Home Screen**. iOS only
+  offers this in Safari.
+- **Desktop (Chrome / Edge):** the install icon at the right of the address bar.
 
-**iPhone / iPad (Safari)** — open the site, tap **Share**, then **Add to Home
-Screen**. iOS only offers this in Safari, not in Chrome or Firefox.
+Once installed it opens instantly, and even without a network, though it cannot
+load data until you are back online.
 
-**Desktop (Chrome / Edge)** — the install icon appears at the right-hand end of
-the address bar.
+**What is stored on the device:** only the app itself (HTML, CSS, JavaScript,
+icons). No property, tenant, invoice or payment data is ever written to the app
+cache, and neither is your session token: every API call is a POST to another
+origin, and the service worker ignores both. A shared or lost phone leaks nothing
+beyond what is on the public site.
 
-Once installed:
-
-- It **opens instantly**, because the interface is stored on the device.
-- It **opens without a network**, though it will say it cannot load data until
-  you are back online — the records themselves are never cached (see below).
-- Long-press the icon for shortcuts straight to Dashboard, Invoices or
-  Maintenance.
-
-### What is and is not stored on the device
-
-Only the application itself — HTML, CSS, JavaScript and icons. **No property,
-tenant, lease, invoice or payment data is ever written to the app cache**, and
-neither is your session token. Every call to the Apps Script Web App is a POST
-to another origin, and the service worker ignores both. A shared or lost phone
-therefore leaks nothing beyond what is already on the public site.
-
-Signing out still clears the session as usual. To remove the app entirely,
-uninstall it the way you would any app; that clears its cache with it.
-
-### Updating an installed copy
-
-Each deployment stamps a new build id into `sw.js`, so an installed copy notices
-the release the next time it is opened and offers **Update now**. It is never
-applied underneath you mid-session — accepting it reloads onto the new version,
-and the previous cache is discarded so a release can never leave half the old
-files in place.
-
-> If you deploy by copying files somewhere by hand rather than through the
-> included GitHub Actions workflow, run `node scripts/stamp-build.mjs` first.
-> Without it `sw.js` is unchanged, no browser notices the release, and installed
-> devices keep serving the previous version.
+**Updates:** each deployment stamps a new build id into `sw.js`, so an installed
+copy offers **Update now** the next time it opens. It is never applied underneath
+you mid-session. If you ever deploy by copying files by hand rather than through
+the workflow, run `node scripts/stamp-build.mjs` first, or installed devices keep
+the previous version.
 
 ---
 
-## Recommended · Daily automation
+## Deploying
 
-In the spreadsheet: **Property Manager → Install daily automation**. It adds two
-time-driven triggers, once (running it again changes nothing):
+A push to `main` runs the tests, then the **backend** job — database migrations
+(`supabase db push`), then the `api` function — and only then publishes the site,
+so the site never goes out ahead of the database it talks to. If the tests or a
+migration fail, nothing after them runs. A newer push waits for a deploy in
+progress rather than cancelling it part-way through a migration.
 
-| Trigger | When | What it does |
-|---|---|---|
-| `dailyMaintenanceJob` | ~5am | Marks invoices overdue, adds late fees, expires leases, updates occupancy |
-| `dailyReminderJob` | ~9am | Emails reminders — only if **Settings → Scheduled reminders** is `true` |
+It needs three repository secrets, under **Settings → Secrets and variables →
+Actions** on GitHub. Without them the deploy stops with a message naming what is
+missing:
 
-Without the triggers the app still works: the first time anyone opens it each
-day does the housekeeping, and every other load that day is read-only.
+| Secret | Where to find it |
+|---|---|
+| `SUPABASE_ACCESS_TOKEN` | supabase.com → your account → **Access Tokens** → generate one for GitHub |
+| `SUPABASE_DB_PASSWORD` | The database password chosen when the project was created (Project Settings → Database can reset it) |
+| `SUPABASE_PROJECT_ID` | The project ref — `abcdefghijklmnop` in `https://abcdefghijklmnop.supabase.co` |
 
-### Rent reminders
+Each run's **Migrations waiting to run** step lists what it is about to apply.
+`db push` only applies migrations the database has not had yet, so a deploy with
+no new migration changes nothing there.
 
-Turn on **Settings → Scheduled reminders**. Reminders keep to a schedule rather
-than going out every day:
+**Changing the database:** add a **new** file to `supabase/migrations/` (named
+`<timestamp>_<what>.sql`) and push. Never edit a migration that has already been
+pushed — the database will not notice. Back up first when a migration drops or
+rewrites data.
 
-- **Remind this many days before due** (default 3), and again on the due date;
-- **Remind on these days overdue** (default `1, 7, 14, 30`).
-
-Each tenant gets **one email listing everything they owe**, with your UPI ID if
-you set one, and no invoice is reminded about twice in a day — however often
-someone presses *Send reminders*. The button sends for everything due within
-the reminder window. Tenants without an email are skipped. Gmail's free quota is
-100 recipients/day.
-
-### Nightly invoice generation
-
-Add a time-driven trigger on `menuGenerate` to raise rent invoices
-automatically. It is safe to run daily — periods that already have an invoice
-are skipped — and it goes by each lease's dates, so a lease that starts on a day
-nobody opens the app is still billed that night.
+---
 
 ## Optional · GST, UPI and WhatsApp
 
@@ -199,10 +209,29 @@ In **Settings**:
   property is, so fill in each property's **state** (name, `KA`, or `29`).
 - **GST on rent %** is set per lease (18 for commercial, 0 for a home) and is
   added to rent invoices and late fees. Any invoice line can carry its own rate.
-- **UPI ID** — shown on invoices and reminders, with a *Pay via UPI* link that
-  opens the payer's UPI app on a phone.
+- **UPI ID** — shown on invoices, with a *Pay via UPI* link that opens the
+  payer's UPI app on a phone.
 - **Country code for WhatsApp** — invoices, receipts and statements have a
   *WhatsApp* button that opens a chat with the tenant, message filled in.
+
+**Email reminders are not set up.** The reminder logic exists, but no email
+provider is connected: **Send reminders** says so, and the daily reminder job does
+nothing. Share invoices over WhatsApp instead. Turning email on later means
+supplying a `sendEmail` function in `supabase/functions/api/index.ts` (for example
+with Resend or SMTP).
+
+---
+
+## Day to day
+
+| Task | How |
+|---|---|
+| Someone forgot their password | Settings → Team members → *Reset password* |
+| Someone has left | *Disable* them. They are signed out at once and their records are kept. |
+| Look at or fix data by hand | Supabase dashboard → Table editor. The app picks up edits on the next load. |
+| Back up | `npx supabase db dump --data-only -f backup.sql` now and then, and before any migration that drops or rewrites data. The Pro plan adds daily backups. |
+| Free-plan pausing | A free project pauses after 7 days with no traffic. The daily job counts as traffic, so an app in use won't pause. |
+| Run the app locally | `npm run db:test`, then `npm run dev`. Sign in with 9000012345 / password123. |
 
 ---
 
@@ -210,28 +239,24 @@ In **Settings**:
 
 | Symptom | Cause and fix |
 |---|---|
-| *"The API returned HTML instead of JSON"* | The deployment's access is not **Anyone**. Redeploy with the correct setting. |
-| *"Could not reach the API"* | Wrong URL, or you copied the `/dev` URL. It must end in `/exec`. |
-| Changes to `Code.gs` have no effect | You created a new deployment instead of a **new version** of the existing one. |
-| *"Your session expired"* | Sessions last `session_hours` (default 12). Just sign in again. |
-| Setup says tables exist but you have no login | Someone already seeded a user. Recover it from the **Users** tab, or clear that tab and re-run setup. |
+| *"Could not reach the API"* | Wrong URL. It is `https://<project-ref>.supabase.co/functions/v1/api`. |
+| Every call fails right after a deploy | The function and the database are out of step. Check the latest **Deploy** run on GitHub: the migration or function step will show the error. |
+| *"Your session expired"* | Sessions last `session_hours` (default 12). Sign in again. |
 | *"… was changed by someone else after you opened it"* | Another person saved the same record first. Close the form, open it again to see their change, and redo yours. |
 | *"Invoice … has been issued, so it cannot be deleted"* | Issued invoices keep their number. Use **Void** (with a reason) instead. Only drafts can be deleted. |
-| Settings shows a time-zone warning | The sheet and the script are in different zones. Set both to the same one (sheet: File → Settings; script: Project Settings). |
-| Every date is a day early | Only happens with an older `Code.gs` and a sheet in a different time zone. Update `Code.gs` (new version). |
-| Everything is slow | Google Sheets is the bottleneck. The app fetches everything in one call and caches it; press the refresh icon only when you need fresh data. |
+| Generate rent raised nothing | Nothing is due yet. A rent-day lease can be raised from the 1st of the month its rent day falls in; the lease page shows when its next invoice can be raised. |
 
-## Security, honestly
+---
 
-The Web App URL is unguessable but **not secret** — treat it as a public
-endpoint and assume someone may eventually find it.
+## Security
+
+The API URL is **not secret**. Treat it as a public endpoint.
 
 **What the URL alone gets an attacker: nothing.** Every action except `ping`,
 `login` and `setup` requires a valid HMAC-signed session token, and roles are
-re-checked on the server for every write. Tampering with a token invalidates its
-signature. Password hashes and salts are never sent to the browser.
-
-**Hardening that is in place:**
+re-checked on the server for every write. Password hashes and salts are never sent
+to the browser. Supabase's auto-generated REST API is switched off for every table,
+so nobody can go around the API.
 
 | Guard | Behaviour |
 |---|---|
@@ -239,84 +264,60 @@ signature. Password hashes and salts are never sent to the browser.
 | Brute force | After 4 wrong passwords a number is locked out, for 30 s, then 1 min, 2 min … up to 30 min per further failure. Someone else's failures never lock out a person typing the right password |
 | Password spraying | While failures across all accounts run unusually high (over 100 in 15 min), each targeted number locks after its first wrong guess |
 | Account enumeration | Unknown / disabled / wrong-password all return one identical message |
-| Timing | Password comparison is constant-time, and an unknown address still costs a hash |
+| Passwords | PBKDF2-SHA256 with 600,000 rounds. At least 10 characters, not all digits, not one repeated character, not containing the phone number. |
 
 All of the above are covered by `npm run test:security`.
 
+- Changing or resetting a password **ends that account's other sessions**.
+- Every request re-checks the account, so disabling or demoting someone takes
+  effect at once rather than when their session expires.
+- Two people saving the same record: the second save is refused with a message,
+  never silently overwriting the first. Two payments at the same moment cannot
+  both squeeze into one balance.
+- Anyone with access to the Supabase dashboard can read and change everything
+  directly. Invite only people who should have full access.
+- Do not use this to store payment card data.
+
 ### Close the bootstrap window
 
-There is one genuinely sensitive moment: **between deploying the Web App and
-creating your first administrator**, anyone who reaches the URL can seed
-themselves as admin. Two ways to handle it:
+Between deploying the API and creating the first administrator, whoever reaches the
+URL first could make themselves admin. The `SETUP_KEY` secret (step 3) closes that:
+setup refuses to create an administrator without it. With no `SETUP_KEY`, the
+window closes on its own **one hour** after the API first answers a request.
 
-1. **Just finish setup immediately** after deploying. The window is minutes, and
-   nobody knows the URL yet. This is fine for most people.
-2. **Require a setup key** — do this if you are publishing the URL (see
-   `DEFAULT_API_URL`) or working in a public repo. In the Apps Script editor go
-   to **Project Settings → Script Properties → Add script property**, name it
-   `SETUP_KEY`, and give it any random string. Setup then refuses to bootstrap
-   without it, and the wizard will ask for it.
+### Locked out?
 
-With no `SETUP_KEY` set, the window closes **on its own one hour** after the
-deployment first answers a request. After that, create the administrator from
-**Property Manager → Recover admin access** in the spreadsheet instead.
+The API deliberately cannot let you back in — that is what stops a stranger
+seizing the workspace. Recovery talks to the database directly, so only someone
+holding the database connection string can run it:
 
-### Locked out? Recover from the spreadsheet
+```sh
+DATABASE_URL='<connection string: dashboard → Connect → Session pooler>' \
+  node scripts/recover-admin.mjs <phone> [name]
+```
 
-The Web App deliberately cannot let you back in — that is what stops a stranger
-seizing the workspace. Recovery runs from the sheet instead, where Google has
-already authenticated you as the owner:
-
-1. Open the spreadsheet → menu **Property Manager → Recover admin access**.
-   *(If the menu is missing, reload the sheet. If it still isn't there, open
-   Extensions → Apps Script and run the `onOpen` function once.)*
-2. Enter the phone number you want to sign in with, then a new password.
-3. Sign in with that number and password.
-
-It adds any missing columns, makes that number an active administrator —
-adopting your existing account rather than creating a duplicate — and clears any
+It asks for a new password, makes that phone number an active administrator
+(adopting the existing account rather than creating a duplicate), and clears any
 sign-in lockout.
 
-**If you set the workspace up before sign-in moved to phone numbers**, this is
-exactly what you need: your account has an email but no phone, so nothing you
-type can match. One run of *Recover admin access* fixes it.
+---
 
-### Running it day to day
+## Tests
 
-- **Someone forgot their password** — Settings → Team members → *Reset password*.
-- **Someone has left** — *Disable* them. They are signed out at once and their
-  records are kept. Deleting is possible but loses the audit trail.
-- **Quotas** (consumer Google account): a script run must finish inside 6
-  minutes, with 90 minutes of total runtime a day, and `MailApp` sends at most
-  100 emails a day. Comfortable for a private portfolio; watch the email cap if
-  you have many tenants and enable reminders.
-- **Backups** — the sheet is your database. Google keeps version history
-  (File → Version history), and *File → Download → CSV* per tab is a quick
-  belt-and-braces export. Take one before any bulk edit.
+```sh
+npm run db:test   # a disposable Postgres in Docker on port 55432
+npm test          # everything below
+```
 
-### Remaining trade-offs
+| Suite | What it proves |
+|---|---|
+| `test:backend` | Rent periods, rent-day cycles and part months, late-fee grace |
+| `test:security` | The attacks above, and that accounts with older password hashes still sign in |
+| `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, a failed request leaving nothing behind |
+| `test:http` | The HTTP surface, the cron secret, and that the public REST roles can reach no table |
+| `test:pwa`, `test:pwa:ui` | The installable app: manifest, service worker, offline start, updates |
+| `test:ui` | The real app in Chrome against the real API on Postgres |
+| `test:responsive` | Every screen at phone widths: no sideways scrolling, thumb-sized targets |
 
-- Passwords are salted and **stretched over 1,000 SHA-256 rounds**. Apps Script
-  has no bcrypt/scrypt/PBKDF2, and `computeDigest` is slow enough that a modern
-  iteration count would take minutes per sign-in. 1,000 is a compromise, not a
-  recommendation — raise `HASH_ITERATIONS` in `Code.gs` if sign-in feels
-  instant. Existing accounts upgrade to the current scheme automatically the
-  next time they sign in.
-- New passwords must be at least 10 characters, and cannot be all digits, one
-  repeated character, or contain the phone number.
-- Changing or resetting a password **ends that account's other sessions**.
-- Anyone with edit access to the spreadsheet can read and change everything
-  directly, bypassing the app entirely. Share the sheet only with people who
-  should have full access.
-- Sessions live in `localStorage` and last `session_hours` (default 12), but
-  every request re-checks the account against the sheet, so disabling or
-  demoting someone takes effect at once rather than when their token expires.
-- **Two people editing the same record:** the second save is refused with a
-  message, rather than silently overwriting the first. Every write also runs
-  under one script-wide lock, so two payments at the same moment cannot both
-  squeeze into one balance.
-- **New columns arrive by themselves.** After you update `Code.gs`, the first
-  signed-in request adds any columns and settings the new version needs; there
-  is no need to re-run setup.
-
-Do not use this to store payment card data.
+CI runs all of it against a Postgres service container on every push, before
+anything is deployed.

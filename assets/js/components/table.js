@@ -1,6 +1,7 @@
 import { el, icon, money, num, date, badge, debounce, downloadCsv, emptyState, isoDate, safeUrl } from '../ui.js';
 import { store } from '../store.js';
 import { entities, tableFields } from '../schema.js';
+import { DETAIL_ENTITIES, ref, copyable } from './detail.js';
 
 const PAGE_SIZE = 25;
 
@@ -21,15 +22,30 @@ export function cellValue(field, row) {
  * What a cell shows on screen: its text, or for a link field an actual link.
  * Documents are stored as links precisely so they can be opened, but the list
  * only printed the address. Anything that is not http(s) stays plain text, so
- * a `javascript:` value typed into a sheet can never become clickable.
+ * a `javascript:` value typed into a record can never become clickable.
+ *
+ * A reference to another record links to that record's page (with a hover
+ * card), and identifiers people read out or paste elsewhere — ids, phone
+ * numbers, emails — carry a copy button.
  */
-function cellContent(field, row) {
+function cellContent(entity, field, row) {
+  const raw = row[field.key];
   if (field.type === 'url') {
-    const href = safeUrl(row[field.key]);
+    const href = safeUrl(raw);
     if (href) {
       return el('a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'link',
                        onClick: (e) => e.stopPropagation() }, ['Open ↗']);
     }
+  }
+  if (raw === '' || raw === null || raw === undefined) return cellValue(field, row);
+  if (field.type === 'ref' && DETAIL_ENTITIES.has(field.optionsFrom)) {
+    return ref(field.optionsFrom, raw, { short: field.short });
+  }
+  if (field.key === 'id' && DETAIL_ENTITIES.has(entity)) {
+    return copyable(raw, { label: entities[entity].singular + ' ID', mono: true, compact: true });
+  }
+  if (field.type === 'email' || field.type === 'tel') {
+    return copyable(raw, { label: field.type === 'email' ? 'Email' : 'Phone', compact: true });
   }
   return cellValue(field, row);
 }
@@ -161,7 +177,7 @@ export function dataTable({
           onClick: onRowClick ? (e) => { if (!e.target.closest('.row-actions')) onRowClick(row); } : null
         });
         for (const c of cols) {
-          const content = isStatusField(c) ? badge(row[c.key]) : cellContent(c, row);
+          const content = isStatusField(c) ? badge(row[c.key]) : cellContent(entity, c, row);
           tr.append(el('td', { class: c.type === 'money' || c.type === 'number' ? 'num' : null,
                                title: typeof content === 'string' ? content : null },
                       [content]));

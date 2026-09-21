@@ -1,13 +1,11 @@
 import { config } from './config.js';
 
 /**
- * Calls the backend — the Supabase Edge Function (or, until it is retired, the
- * Apps Script Web App; both speak the same actions).
+ * Calls the backend — the Supabase Edge Function.
  *
  * The body is sent as text/plain on purpose: that keeps the request a CORS
- * "simple request", so the browser never sends a preflight OPTIONS — which
- * Apps Script cannot answer, and which would cost a round trip on Supabase.
- * The payload is still JSON.
+ * "simple request", so the browser never sends a preflight OPTIONS, which
+ * would cost an extra round trip on every call. The payload is still JSON.
  */
 export async function api(action, payload = {}, { signal } = {}) {
   const url = config.apiUrl;

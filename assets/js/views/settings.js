@@ -23,7 +23,7 @@ const SETTING_FIELDS = [
   { key: 'reminder_overdue_days', label: 'Remind on these days overdue', type: 'text',
     help: 'Comma separated, e.g. 1, 7, 14, 30. One email per tenant lists everything they owe.' },
   { key: 'reminder_enabled', label: 'Scheduled reminders', type: 'select', options: ['true', 'false'],
-    help: 'Needs the daily triggers: Property Manager → Install daily automation, in the spreadsheet' },
+    help: 'Email sending is not set up yet, so no reminders go out for now. Share invoices over WhatsApp instead.' },
   { key: 'gstin', label: 'Your GSTIN', type: 'text',
     help: 'When set, invoices carrying GST print as tax invoices with CGST/SGST or IGST' },
   { key: 'sac_code', label: 'SAC code', type: 'text', help: '997212 for renting non-residential property' },
@@ -99,7 +99,7 @@ export function settingsView() {
             e.target.disabled = true;
             try {
               // Saved side by side rather than one round trip after another,
-              // and a key is only created when the sheet says it is missing — a
+              // and a key is only created when the server says it is missing — a
               // create after any failure (a dropped connection, say) appended a
               // second row for a key that was already there.
               const gstin = controls.gstin.value.replace(/\s+/g, '').toUpperCase();
@@ -276,19 +276,6 @@ export function settingsView() {
   }
 
   // ── connection + maintenance ────────────────────────────────────────────
-  // A sheet and script in different time zones used to shift every date by a
-  // day. The backend now reads dates in the sheet's zone, but "today" (overdue,
-  // expiry) is still the script's, so say so when they differ.
-  const tz = store.timezones;
-  if (tz && tz.script && tz.sheet && tz.script !== tz.sheet) {
-    wrap.append(el('div', { class: 'notice notice-warn' }, [
-      icon('alert', 16),
-      el('span', { text: `The spreadsheet's time zone (${tz.sheet}) differs from the script's (${tz.script}). ` +
-        'Due dates and expiries change over at midnight in ' + tz.script + '. To avoid surprises, set both to the same zone: ' +
-        'File → Settings in the sheet, and Project Settings in Apps Script.' })
-    ]));
-  }
-
   wrap.append(panel('Connection', el('div', {}, [
     el('div', { class: 'kv-list' }, [
       el('div', { class: 'kv' }, [
@@ -317,7 +304,7 @@ export function settingsView() {
         onClick: async () => {
           const ok = await confirmDialog({
             title: 'Disconnect this browser?',
-            message: 'Clears the saved API URL and session. Your Google Sheet data is untouched.',
+            message: 'Clears the saved API URL and session on this browser. Your data is untouched.',
             confirmLabel: 'Disconnect'
           });
           if (!ok) return;

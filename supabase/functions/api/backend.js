@@ -1,19 +1,14 @@
 /**
- * VI Property & Tenancy Manager — Supabase backend
- * ------------------------------------------------
- * A port of apps-script/Code.gs onto Postgres. The actions, their payloads and
- * their responses are unchanged, so the SPA only needs a different URL. The
- * business rules are the same rules, in the same order, with the same error
- * messages; the comments that explain *why* a rule exists travelled with it.
+ * VI Property & Tenancy Manager — backend
+ * ---------------------------------------
+ * Every action the app calls, and the business rules behind them, on Postgres.
  *
- * What changed underneath:
- *   Sheets tabs          → Postgres tables (schema.js, supabase/migrations)
- *   LockService          → one advisory lock per request, inside a transaction
- *   a failed request     → rolled back, instead of leaving half its writes
- *   CacheService         → login_throttle table
- *   Script Properties    → app_state table + function secrets
- *   Utilities            → WebCrypto
- *   MailApp              → an injected `sendEmail` (none configured yet)
+ *   data             → Postgres tables (schema.js, supabase/migrations)
+ *   concurrency      → one advisory lock per request, inside a transaction
+ *   a failed request → rolled back whole, never half-written
+ *   sign-in lockout  → login_throttle table
+ *   app state        → app_state table + function secrets
+ *   email            → an injected `sendEmail` (none configured yet)
  *
  * Plain JavaScript on purpose: the same module runs on Supabase's Deno runtime
  * (index.ts) and under Node for the test suites (test/pg-harness.mjs).
@@ -96,7 +91,7 @@ const VERSION = '2.0.0';
  * @param {Function} deps.sql         a postgres.js client (created with PG_TYPES)
  * @param {string}   deps.authSecret  HMAC key for session tokens
  * @param {string}   [deps.setupKey]  when set, required for the first-run bootstrap
- * @param {string}   [deps.timeZone]  the zone "today" is measured in (the sheet's zone before)
+ * @param {string}   [deps.timeZone]  the zone "today" is measured in
  * @param {Function} [deps.sendEmail] async (to, subject, body) — omit and reminders are off
  * @param {number}   [deps.hashIterations] PBKDF2 rounds for new password hashes
  */
@@ -163,7 +158,7 @@ function describeError(err) {
       return 'That record already exists.';
     case '23514':
       if (err.constraint_name === 'leases_check') return 'A lease cannot end before it starts.';
-      if (/meter_readings_check/.test(err.constraint_name || '')) return 'A reading cannot be lower than the previous one.';
+      if (err.constraint_name === 'leases_rent_day_check') return 'Rent day must be between the 1st and the 28th, or the last day of the month.';
       return 'A value is not allowed (' + (err.constraint_name || 'check') + ').';
     case '22P02': case '22003': case '22007': case '22008':
       return 'A value is not in the right format or is out of range.';
@@ -210,7 +205,6 @@ async function route(r, action, payload, token) {
     case 'generateInvoices': return ok(await withSnapshot(r, payload, user, await generateInvoices(r, payload, user)));
     case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
     case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
-    case 'billMeterReadings':return ok(await withSnapshot(r, payload, user, await billMeterReadings(r, payload, user)));
     case 'refreshStatuses':  requireRole(user, 'manager'); return ok(await withSnapshot(r, payload, user, await refreshStatuses(r, user)));
     case 'changePassword':   return ok(await changePassword(r, payload, user));
     case 'createUser':       return ok({ row: await createUser(r, payload, user) });
@@ -270,7 +264,7 @@ async function createRow(r, table, data, user, skipLog) {
   return saved;
 }
 
-/** Create many rows in one tab with a single write. */
+/** Create many rows in one table with a single write. */
 async function appendRows(r, table, list, user) {
   assertTable(table);
   requireRole(user, minRoleFor(table));
@@ -383,20 +377,18 @@ const CREATE_DEFAULTS = {
   Leases:      { frequency: 'Monthly', deposit_status: 'Pending' }
 };
 
-/** Rows in other tabs that point at this one. Deleting is blocked while any exist. */
+/** Rows in other tables that point at this one. Deleting is blocked while any exist. */
 const DEPENDENTS = {
   Properties: [['Units', 'property_id', 'unit'], ['Leases', 'property_id', 'lease'],
                ['Invoices', 'property_id', 'invoice'], ['Expenses', 'property_id', 'expense'],
-               ['Maintenance', 'property_id', 'maintenance ticket'], ['Documents', 'entity_id', 'document'],
-               ['MeterReadings', 'property_id', 'meter reading']],
+               ['Maintenance', 'property_id', 'maintenance ticket'], ['Documents', 'entity_id', 'document']],
   Units:      [['Leases', 'unit_id', 'lease'], ['Invoices', 'unit_id', 'invoice'],
                ['Maintenance', 'unit_id', 'maintenance ticket'], ['Expenses', 'unit_id', 'expense'],
-               ['MeterReadings', 'unit_id', 'meter reading'], ['Documents', 'entity_id', 'document']],
+               ['Documents', 'entity_id', 'document']],
   Tenants:    [['Leases', 'tenant_id', 'lease'], ['Invoices', 'tenant_id', 'invoice'],
                ['Payments', 'tenant_id', 'payment'], ['Maintenance', 'tenant_id', 'maintenance ticket'],
-               ['MeterReadings', 'tenant_id', 'meter reading'], ['Documents', 'entity_id', 'document']],
+               ['Documents', 'entity_id', 'document']],
   Leases:     [['Invoices', 'lease_id', 'invoice'], ['Payments', 'lease_id', 'payment'],
-               ['MeterReadings', 'lease_id', 'meter reading'],
                ['Documents', 'entity_id', 'document'], ['Leases', 'renewed_from', 'renewal']],
   Invoices:   [['Payments', 'invoice_id', 'payment']]
 };
@@ -406,9 +398,9 @@ async function assertNoDependents(r, table, id) {
   if (!refs) return;
   const blocking = [];
   let total = 0;
-  for (const [tab, key, noun] of refs) {
+  for (const [other, key, noun] of refs) {
     let n = 0;
-    (await readTable(r, tab)).forEach(row => { if (String(row[key]) === String(id)) n++; });
+    (await readTable(r, other)).forEach(row => { if (String(row[key]) === String(id)) n++; });
     if (n) { blocking.push(n + ' ' + noun + (n === 1 ? '' : 's')); total += n; }
   }
   if (blocking.length) {
@@ -538,6 +530,9 @@ async function writeRowLocked(r, op, table, payload, user) {
     }
     if (merged.start_date && merged.end_date && String(merged.end_date) < String(merged.start_date)) {
       throw new Error('A lease cannot end before it starts.');
+    }
+    if (data.rent_day !== undefined && data.rent_day !== '' && data.rent_day !== null && validRentDay(data.rent_day) === null) {
+      throw new Error('Rent day must be between the 1st and the 28th, or the last day of the month.');
     }
     data.status = deriveLeaseStatus(r, merged.start_date, merged.end_date, merged.status);
     merged.status = data.status;
@@ -964,7 +959,7 @@ async function renewLease(r, payload, user) {
     start_date: start, end_date: end, rent_amount: rent,
     deposit_amount: carry ? held : num(payload.deposit_amount),
     deposit_status: carry && held > 0 ? 'Held' : 'Pending',
-    frequency: payload.frequency || old.frequency, late_fee: old.late_fee, grace_days: old.grace_days,
+    frequency: payload.frequency || old.frequency, rent_day: old.rent_day, late_fee: old.late_fee, grace_days: old.grace_days,
     escalation_pct: payload.escalation_pct !== undefined && payload.escalation_pct !== ''
       ? payload.escalation_pct : old.escalation_pct,
     gst_rate: old.gst_rate, renewed_from: old.id,
@@ -1149,12 +1144,12 @@ export const uuid = () => crypto.randomUUID();
  * Password hashing.
  *
  *   v3$<iterations>$<b64>  PBKDF2-SHA256 — what every password is stored as now
- *   v2$<b64>               the Apps Script scheme: SHA-256 stretched 1,000 times
+ *   v2$<b64>               an older scheme: SHA-256 stretched 1,000 times
  *   <b64>                  the original single round
  *
- * Apps Script had no PBKDF2, which is why v2 existed. The older forms are
- * still verified, so nobody is locked out by the move, and each account is
- * re-hashed as v3 the next time its password is used.
+ * Accounts brought over from the earlier backend can still carry the older
+ * forms. They are still verified, so nobody is locked out, and each account
+ * is re-hashed as v3 the next time its password is used.
  */
 export const PBKDF2_ITERATIONS = 600000;
 const V2_ITERATIONS = 1000;
@@ -1311,7 +1306,7 @@ async function doLogin(r, payload) {
   const session = await issueSession(r, found, Date.now());
   await updateRow(r, 'Users', found.id, { last_login: now(r) }, { phone: found.phone, role: 'admin' }, true);
   const data = { token: session.token, user: session.user, settings: await readSettings(r) };
-  // Signing in is always followed by a request for the whole workbook; answer
+  // Signing in is always followed by a request for all the data; answer
   // both at once. Built through bootstrap(), so it obeys the same role limits.
   if (payload.withSnapshot) data.snapshot = await bootstrap(r, session.user);
   return ok(data);
@@ -1501,8 +1496,7 @@ async function setSetting(r, key, value) {
 const COLLECTIONS = {
   properties: 'Properties', units: 'Units', tenants: 'Tenants', leases: 'Leases',
   invoices: 'Invoices', invoiceItems: 'InvoiceItems', payments: 'Payments',
-  maintenance: 'Maintenance', expenses: 'Expenses', documents: 'Documents',
-  meterReadings: 'MeterReadings'
+  maintenance: 'Maintenance', expenses: 'Expenses', documents: 'Documents'
 };
 
 /**
@@ -1510,8 +1504,8 @@ const COLLECTIONS = {
  *
  * @param known the table versions the browser already holds. A table whose
  *   version still matches is left out and named in `unchanged`, so a save that
- *   touched one table does not send back all eleven — and here, unlike on the
- *   sheet, an unchanged table is not even read.
+ *   touched one table does not send back all of them — and an unchanged
+ *   table is not even read.
  */
 async function bootstrap(r, user, known) {
   await refreshIfStale(r, user);
@@ -1525,7 +1519,8 @@ async function bootstrap(r, user, known) {
     settings: await readSettings(r),
     hashes: {},
     unchanged: [],
-    timezones: { script: r.tz, sheet: r.tz },
+    // the zone "today" is measured in — dates change over at its midnight
+    timezone: r.tz,
     users: (user.role === 'admin' ? (await readTable(r, 'Users')).map(scrubUser) : []),
     activity: (ROLE_RANK[user.role] >= ROLE_RANK[readRoleFor('ActivityLog')]
       ? (await readTableTail(r, 'ActivityLog', 200)).reverse() : []),
@@ -1600,9 +1595,14 @@ async function generateInvoices(r, payload, user) {
     if (String(it.category) === 'Rent') rentLine[it.invoice_id] = true;
   });
   const billed = {};
+  // the last day each lease's rent is billed to, void or not — a voided
+  // period is not billed again
+  const billedThrough = {};
   invoices.forEach(inv => {
     if (inv.type === 'Rent' || (inv.lease_id && inv.period_start && rentLine[inv.id])) {
       billed[inv.lease_id + '|' + inv.period_start] = true;
+      const through = String(inv.period_end || '').slice(0, 10);
+      if (inv.lease_id && through > (billedThrough[inv.lease_id] || '')) billedThrough[inv.lease_id] = through;
     }
   });
 
@@ -1612,42 +1612,51 @@ async function generateInvoices(r, payload, user) {
     // The stored status is only as fresh as the last refresh; go by the dates too.
     if (String(lease.status) !== 'Active' &&
         deriveLeaseStatus(r, lease.start_date, lease.end_date, lease.status) !== 'Active') continue;
-    for (const period of periodsFor(lease, upto)) {
+    const onRentDay = usesRentDay(lease);
+    const periods = onRentDay ? rentDayPeriods(lease, upto, billedThrough[lease.id]) : periodsFor(lease, upto);
+    for (const period of periods) {
       const key = lease.id + '|' + period.start;
       if (billed[key]) continue;
       billed[key] = true;
-      const amount = round2(period.amount);
       // GST on rent follows the lease (18% on commercial property, nothing on a home)
       const rate = num(lease.gst_rate);
-      const gst = round2(amount * rate / 100);
+      const lines = (period.lines || [{ start: period.start, end: period.end, amount: round2(period.amount),
+                                        days: period.days, monthDays: null, whole: true }])
+        .map(l => ({ ...l, gst: round2(l.amount * rate / 100) }));
+      const amount = round2(lines.reduce((s, l) => s + l.amount, 0));
+      const gst = round2(lines.reduce((s, l) => s + l.gst, 0));
       const split = rate > 0 ? await gstSplit(r, lease, gst) : { cgst: '', sgst: '', igst: '', place_of_supply: '' };
       headers.push({
         lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id,
         property_id: lease.property_id, type: 'Rent',
         period_start: period.start, period_end: period.end,
-        issue_date: period.start, due_date: period.due,
+        issue_date: period.issue || period.start, due_date: period.due,
         amount, tax: gst, total: round2(amount + gst), amount_paid: 0, balance: round2(amount + gst),
         cgst: split.cgst, sgst: split.sgst, igst: split.igst, place_of_supply: split.place_of_supply,
         status: period.due < t ? 'Overdue' : 'Unpaid',
-        notes: period.prorated
-          ? 'Auto-generated part period — ' + period.days + ' of ' + period.fullDays + ' days'
-          : 'Auto-generated ' + lease.frequency + ' rent'
+        notes: onRentDay
+          ? (period.prorated ? 'Auto-generated rent for part of a month — ' + period.days + ' days'
+                             : 'Auto-generated rent · rent day ' + lease.rent_day)
+          : period.prorated
+            ? 'Auto-generated part period — ' + period.days + ' of ' + period.fullDays + ' days'
+            : 'Auto-generated ' + lease.frequency + ' rent'
       });
-      meta.push({ period, amount, rate, gst });
+      meta.push({ period, lines, rate });
     }
   }
 
   // two writes in total, however many periods are due
   const created = await appendRows(r, 'Invoices', headers, user);
-  await appendRows(r, 'InvoiceItems', created.map((row, n) => {
-    const period = meta[n].period;
-    return {
+  await appendRows(r, 'InvoiceItems', created.flatMap((row, n) => {
+    const { period, lines, rate } = meta[n];
+    return lines.map(l => ({
       invoice_id: row.id,
-      description: 'Rent · ' + period.start + ' to ' + period.end +
-                   (period.prorated ? ' (' + period.days + '/' + period.fullDays + ' days)' : ''),
-      category: 'Rent', quantity: 1, unit_amount: meta[n].amount, amount: meta[n].amount,
-      tax_rate: meta[n].rate || 0, tax_amount: meta[n].gst, notes: ''
-    };
+      description: period.lines ? rentLineText(l)
+        : 'Rent · ' + period.start + ' to ' + period.end +
+          (period.prorated ? ' (' + period.days + '/' + period.fullDays + ' days)' : ''),
+      category: 'Rent', quantity: 1, unit_amount: l.amount, amount: l.amount,
+      tax_rate: rate || 0, tax_amount: l.gst, notes: ''
+    }));
   }), user);
 
   // what was raised already overdue gets its late fee now, not on tomorrow's first load
@@ -1707,6 +1716,119 @@ export function periodsFor(lease, upto) {
     });
   }
   return out;
+}
+
+/** A lease bills on a fixed day of the month when it is monthly and has one. */
+export function usesRentDay(lease) {
+  return (lease.frequency || 'Monthly') === 'Monthly' && validRentDay(lease.rent_day) !== null;
+}
+
+/** 1–28, or 31 for "the last day of the month"; anything else is no rent day. */
+export function validRentDay(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isInteger(n) && ((n >= 1 && n <= 28) || n === 31) ? n : null;
+}
+
+/** The rent day in a month (months may overflow: -1 is last December). */
+function rentDayIn(year, month, rentDay) {
+  const first = new Date(year, month, 1);
+  const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+  return new Date(first.getFullYear(), first.getMonth(), Math.min(rentDay, last));
+}
+
+/**
+ * Billing cycles of a lease with a rent day. The rent day is the payment date:
+ * each cycle ends on it and is due on it. A cycle can be raised any time in
+ * the calendar month its rent day falls in — Generate rent on 1 Oct raises
+ * everything due in October — so tenants have the invoice before they pay.
+ * Grace days do not move the due date; they are the days after it before a
+ * late fee is added (see applyLateFees).
+ *
+ * A cycle runs from the day after one rent day to the next, and a whole cycle
+ * is one month's rent. A part cycle — from the lease start up to the first
+ * rent day, from where earlier billing stopped, or up to an end date that is
+ * not a rent day — is charged day by day, each calendar month at the rent
+ * divided by that month's own days: 21–30 Sep is 10/30 of a month and 1–10 Oct
+ * is 10/31. Each month is its own line on the invoice.
+ *
+ * @param upto the day invoices are being raised on: it is their invoice date,
+ *   and cycles ending by the end of its month are included
+ * @param billedThrough the last day already covered by a rent invoice on this
+ *   lease, so no day is ever billed twice — including when a rent day is set
+ *   on a lease that was billed the old way.
+ */
+export function rentDayPeriods(lease, upto, billedThrough) {
+  const out = [];
+  const start = parseDate(lease.start_date);
+  const end = lease.end_date ? parseDate(lease.end_date) : null;
+  const limit = parseDate(upto);
+  const rentDay = validRentDay(lease.rent_day);
+  if (!start || !limit || rentDay === null) return out;
+
+  const baseRent = parseFloat(lease.rent_amount || 0) || 0;
+  const escalation = parseFloat(lease.escalation_pct || 0) || 0;
+  const monthEnd = new Date(limit.getFullYear(), limit.getMonth() + 1, 0);
+
+  let cursor = start;
+  const covered = billedThrough ? parseDate(billedThrough) : null;
+  if (covered && addDays(covered, 1) > cursor) cursor = addDays(covered, 1);
+
+  for (let i = 0; i < 400; i++) {
+    if (end && cursor > end) break;
+    let close = rentDayIn(cursor.getFullYear(), cursor.getMonth(), rentDay);
+    if (close < cursor) close = rentDayIn(cursor.getFullYear(), cursor.getMonth() + 1, rentDay);
+    const cycleEnd = (end && close > end) ? new Date(end.getTime()) : close;
+    // raised ahead, from the start of the month it is due in
+    if (cycleEnd > monthEnd) break;
+
+    // the rent in force on the day the cycle starts
+    const years = Math.floor(monthsBetween(start, cursor) / 12);
+    const monthly = baseRent * Math.pow(1 + escalation / 100, years);
+
+    const previousClose = rentDayIn(close.getFullYear(), close.getMonth() - 1, rentDay);
+    const whole = fmtDate(cursor) === fmtDate(addDays(previousClose, 1)) && fmtDate(cycleEnd) === fmtDate(close);
+
+    const lines = [];
+    if (whole) {
+      lines.push({ start: fmtDate(cursor), end: fmtDate(cycleEnd), amount: round2(monthly),
+                   days: daysInclusive(cursor, cycleEnd), monthDays: null });
+    } else {
+      let from = cursor;
+      while (from <= cycleEnd) {
+        const lastOfMonth = new Date(from.getFullYear(), from.getMonth() + 1, 0);
+        const to = lastOfMonth < cycleEnd ? lastOfMonth : cycleEnd;
+        const days = daysInclusive(from, to);
+        const monthDays = lastOfMonth.getDate();
+        lines.push({ start: fmtDate(from), end: fmtDate(to), amount: round2(monthly * days / monthDays),
+                     days, monthDays });
+        from = addDays(to, 1);
+      }
+    }
+
+    out.push({
+      start: fmtDate(cursor), end: fmtDate(cycleEnd),
+      // dated the day it is raised, never before the days it covers begin
+      issue: fmtDate(limit < cursor ? cursor : limit), due: fmtDate(cycleEnd),
+      amount: round2(lines.reduce((t, l) => t + l.amount, 0)), prorated: !whole,
+      days: daysInclusive(cursor, cycleEnd), lines
+    });
+    cursor = addDays(cycleEnd, 1);
+  }
+  return out;
+}
+
+/** The first day a late fee may be added to an invoice due on `due`. */
+export function lateFeeFrom(lease, due) {
+  const d = parseDate(due);
+  if (!d) return '';
+  return fmtDate(addDays(d, (parseInt(lease.grace_days || 0, 10) || 0) + 1));
+}
+
+/** Description of one rent line: its dates, and for a part month its share. */
+function rentLineText(line) {
+  return 'Rent · ' + line.start + ' to ' + line.end +
+         (line.monthDays ? ' (' + line.days + '/' + line.monthDays + ' days)' : '');
 }
 
 /**
@@ -2106,6 +2228,7 @@ async function applyLateFees(r, actor) {
     if (String(it.category) === 'Late Fee') charged[it.invoice_id] = true;
   });
 
+  const t = today(r);
   let applied = 0;
   for (const inv of await readTable(r, 'Invoices')) {
     if (String(inv.status) !== 'Overdue') continue;
@@ -2115,6 +2238,10 @@ async function applyLateFees(r, actor) {
     if (!lease) continue;
     const fee = round2(parseFloat(lease.late_fee || 0) || 0);
     if (fee <= 0) continue;
+    // On a rent-day lease the invoice is due on the rent day itself and the
+    // grace days run after it: due the 10th with 5 days' grace, the fee is
+    // added from the 16th.
+    if (usesRentDay(lease) && lateFeeFrom(lease, inv.due_date) > t) continue;
 
     // a late fee on rent is taxed like the rent it is charged on
     const rate = num(lease.gst_rate);
@@ -2304,87 +2431,6 @@ async function sendReminders(r, user, opts) {
   }
   await log(r, user, 'send-reminders', 'Invoices', '', sent + ' sent, ' + skipped + ' skipped' + (scheduled ? ' (scheduled)' : ''));
   return { sent, skipped, invoices: reminded.length };
-}
-
-// ───────────────────────────────────────────────────────── meter readings ──
-
-const METER_CATEGORIES = ['Electricity', 'Water', 'Gas'];
-
-/**
- * Bill a round of meter readings for a property in one go. Each reading is
- * stored, so the next round starts from it; a unit with a live lease on the
- * reading date is invoiced for consumption × rate, a vacant one billed to nobody.
- */
-async function billMeterReadings(r, payload, user) {
-  requireRole(user, 'manager');
-  const property = await findRow(r, 'Properties', payload.property_id);
-  if (!property) throw new Error('Choose the property these readings are for.');
-  const category = String(payload.category || '');
-  if (METER_CATEGORIES.indexOf(category) < 0) throw new Error('Meter type must be one of ' + METER_CATEGORIES.join(', ') + '.');
-  const rate = round2(num(payload.rate));
-  if (!(rate > 0)) throw new Error('Enter the rate per unit.');
-  const date = String(payload.reading_date || today(r)).slice(0, 10);
-  const due = String(payload.due_date || date).slice(0, 10);
-  const t = today(r);
-
-  const units = {};
-  (await readTable(r, 'Units')).forEach(u => { if (String(u.property_id) === String(property.id)) units[u.id] = u; });
-  const leases = await readTable(r, 'Leases');
-
-  const readings = [], headers = [], meta = [], skipped = [];
-  for (const reading of (payload.readings || [])) {
-    if (reading.current_reading === '' || reading.current_reading === undefined || reading.current_reading === null) continue;
-    const unit = units[reading.unit_id];
-    if (!unit) throw new Error('Unit ' + reading.unit_id + ' is not part of ' + property.name + '.');
-    const previous = num(reading.previous_reading), current = num(reading.current_reading);
-    if (current < previous) {
-      throw new Error(unit.unit_number + ': the reading ' + current + ' is lower than the previous ' + previous + '.');
-    }
-    const consumption = Math.round((current - previous) * 1000) / 1000;
-    const amount = round2(consumption * rate);
-    let lease = null;
-    leases.forEach(l => {
-      if (String(l.unit_id) !== String(unit.id) || String(l.status) === 'Terminated') return;
-      if (String(l.start_date) <= date && (!l.end_date || String(l.end_date) >= date)) lease = l;
-    });
-
-    const row = {
-      property_id: property.id, unit_id: unit.id, lease_id: lease ? lease.id : '',
-      tenant_id: lease ? lease.tenant_id : '', category, reading_date: date,
-      previous_reading: previous, current_reading: current, consumption,
-      rate, amount, invoice_id: '', notes: ''
-    };
-    readings.push(row);
-
-    if (!lease) { skipped.push({ unit_id: unit.id, reason: 'no tenant on ' + date }); continue; }
-    if (amount <= 0) { skipped.push({ unit_id: unit.id, reason: 'no consumption' }); continue; }
-    headers.push({
-      lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: unit.id, property_id: property.id,
-      type: category, period_start: payload.period_start || '', period_end: payload.period_end || date,
-      issue_date: date, due_date: due, amount, tax: 0, total: amount,
-      amount_paid: 0, balance: amount, status: due < t ? 'Overdue' : 'Unpaid',
-      notes: category + ' meter · ' + previous + ' → ' + current
-    });
-    meta.push({ reading: row, unit, consumption, previous, current });
-  }
-  if (!readings.length) throw new Error('Enter at least one current reading.');
-
-  const invoices = await appendRows(r, 'Invoices', headers, user);
-  await appendRows(r, 'InvoiceItems', invoices.map((inv, n) => {
-    const m = meta[n];
-    m.reading.invoice_id = inv.id;
-    return {
-      invoice_id: inv.id, category, quantity: m.consumption, unit_amount: rate,
-      amount: inv.amount, tax_rate: 0, tax_amount: 0, notes: '',
-      description: category + ' · ' + m.unit.unit_number + ' · ' + m.previous + ' → ' + m.current +
-                   ' = ' + m.consumption + ' units'
-    };
-  }), user);
-  await appendRows(r, 'MeterReadings', readings, user);
-
-  await log(r, user, 'meter-readings', 'MeterReadings', property.id,
-            category + ' · ' + readings.length + ' read, ' + invoices.length + ' billed');
-  return { readings: readings.length, invoices, skipped };
 }
 
 // ───────────────────────────────────────────────────────────── date utils ──

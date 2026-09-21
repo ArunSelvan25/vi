@@ -12,7 +12,10 @@ export function parseHash() {
   const [pathPart, queryPart] = raw.split('?');
   const segments = pathPart.split('/').filter(Boolean);
   const query = Object.fromEntries(new URLSearchParams(queryPart || ''));
-  return { path: segments[0] || 'dashboard', id: segments[1] || null, segments, query };
+  // record links encode the id, so one with an odd character still round-trips
+  let id = segments[1] || null;
+  try { if (id) id = decodeURIComponent(id); } catch { /* keep it as typed */ }
+  return { path: segments[0] || 'dashboard', id, segments, query };
 }
 
 export function navigate(to, { replace = false } = {}) {
@@ -38,7 +41,7 @@ export function start(render) {
  * Draw the current screen again from the store, in place.
  *
  * Screens used to call location.reload() after a save, which threw away the
- * page and fetched the whole workbook a second time — after the save had
+ * page and fetched all the data a second time — after the save had
  * already brought the store up to date.
  */
 export function refreshView() {
