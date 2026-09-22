@@ -200,7 +200,13 @@ export function toast(message, tone = 'info', ms = 4000, action = null) {
 export function modal({ title, body, actions = [], width = 560, onClose }) {
   const backdrop = el('div', { class: 'backdrop' });
   const close = () => { backdrop.remove(); document.removeEventListener('keydown', onKey); onClose?.(); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  // with one dialog opened over another (a new tenant from the lease form),
+  // Escape closes only the one on top
+  const onKey = (e) => {
+    if (e.key !== 'Escape') return;
+    const open = document.querySelectorAll('.backdrop');
+    if (open[open.length - 1] === backdrop) close();
+  };
 
   const sheet = el('div', { class: 'modal', style: `max-width:${width}px` }, [
     el('header', { class: 'modal-head' }, [
@@ -242,10 +248,12 @@ export function confirmDialog({ title = 'Are you sure?', message, confirmLabel =
       title,
       width: 440,
       body: el('p', { class: 'muted', text: message }),
+      // resolve before closing: close() runs onClose, which would settle the
+      // promise as false first and turn every confirmation into a cancel
       actions: [
-        { label: 'Cancel', onClick: (e, close) => { close(); resolve(false); } },
+        { label: 'Cancel', onClick: (e, close) => { resolve(false); close(); } },
         { label: confirmLabel, variant: danger ? 'btn-danger' : 'btn-primary',
-          onClick: (e, close) => { close(); resolve(true); } }
+          onClick: (e, close) => { resolve(true); close(); } }
       ],
       onClose: () => resolve(false)
     });

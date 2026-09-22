@@ -51,6 +51,10 @@ export const TABLES = {
     billing_day: int, late_fee: num0, grace_days: int0, escalation_pct: num0, status: oneOf('Active'),
     notes: text, ...STAMPS, gst_rate: num0, renewed_from: text, rent_day: int } },
 
+  LeaseTenants: { sql: 'lease_tenants', prefix: 'LTN', cols: {
+    id: req, lease_id: text, tenant_id: text, role: oneOf('Co-tenant'), relationship: text,
+    move_in_date: date, move_out_date: date, notes: text, ...STAMPS } },
+
   Invoices: { sql: 'invoices', prefix: 'INV', cols: {
     id: req, lease_id: text, tenant_id: text, unit_id: text, property_id: text, type: req,
     period_start: date, period_end: date, issue_date: date, due_date: date, amount: num0, tax: num0,

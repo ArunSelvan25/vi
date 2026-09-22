@@ -21,7 +21,7 @@ import { PG_TYPES } from '../supabase/functions/api/schema.js';
 import { insertRows } from '../supabase/functions/api/db.js';
 
 /** Tables in the order their foreign keys allow them to be filled. */
-const SEED_ORDER = ['Properties', 'Units', 'Tenants', 'Leases', 'Invoices', 'InvoiceItems',
+const SEED_ORDER = ['Properties', 'Units', 'Tenants', 'Leases', 'LeaseTenants', 'Invoices', 'InvoiceItems',
                     'Payments', 'Maintenance', 'Expenses', 'Documents'];
 
 const SERVER_URL = process.env.TEST_DATABASE_URL || 'postgres://postgres:pw@localhost:55432/postgres';

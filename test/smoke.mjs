@@ -785,6 +785,78 @@ const rowAction = (rowText, title) => page.evaluate((txt, t) => {
   return true;
 }, rowText, title);
 
+await step('confirming a dialog answers yes, and cancelling answers no', async () => {
+  // regression: closing the dialog settled it as "no" before the button could
+  // say "yes", so every Delete and every confirmation silently did nothing
+  const answers = await page.evaluate(async () => {
+    const { confirmDialog } = await import('/assets/js/ui.js');
+    const ask = async (label) => {
+      const pending = confirmDialog({ title: 'Sure?', message: 'Test', confirmLabel: 'Yes please' });
+      [...document.querySelectorAll('.modal-foot button')].find(b => b.textContent === label).click();
+      return pending;
+    };
+    return [await ask('Yes please'), await ask('Cancel')];
+  });
+  if (answers[0] !== true || answers[1] !== false) throw new Error('answers ' + JSON.stringify(answers));
+});
+
+console.log('\n— lease occupants —');
+
+await step('a lease lists its primary tenant and everyone living with them', async () => {
+  await go('leases', 'Leases');
+  const row = await page.evaluate(() => [...document.querySelectorAll('.data-table tbody tr')]
+    .find(r => r.textContent.includes('LSE-00001'))?.textContent || '');
+  if (!/Anita Rao\s*\+1/.test(row)) throw new Error('lease row does not count the co-tenant: ' + row);
+  await page.evaluate(() => { location.hash = '#/leases/LSE-00001'; });
+  await page.waitForSelector('.occ-household', { timeout: 5000 });
+  const people = await page.$$eval('.occ-person-row', rows => rows.map(r => r.textContent));
+  if (people.length !== 2 || !/Anita Rao.*Primary/.test(people[0]) || !/Priya Shah.*Co-tenant.*Friend/.test(people[1])) {
+    throw new Error('household reads ' + JSON.stringify(people));
+  }
+});
+
+await step('occupants are added in the lease form and removed from the lease page', async () => {
+  await clickText('.head-actions .btn', /^\s*Edit$/);
+  await page.waitForSelector('.modal .occ-editor', { timeout: 5000 });
+  await clickText('.modal .occ-actions .btn', /Add a person/);
+  const rows = await page.$$('.modal .occ-row');
+  const last = rows[rows.length - 1];
+  await (await last.$('.occ-person')).select('TNT-00002');
+  await (await last.$('.occ-role')).select('Occupant');
+  await (await last.$('.occ-rel')).type('Colleague');
+  await clickText('.modal-foot .btn', /Save changes/);
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 8000 });
+  const added = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    return store.occupantsOf(store.byId('leases', 'LSE-00001')).map(o => o.tenant_id + ':' + o.role + ':' + o.relationship);
+  });
+  if (added.length !== 2 || !added.includes('TNT-00002:Occupant:Colleague')) throw new Error('saved ' + JSON.stringify(added));
+
+  // and off again, through the lease page's Manage dialog
+  await page.waitForSelector('.occ-household', { timeout: 5000 });
+  await page.evaluate(() => [...document.querySelectorAll('.panel')].find(p => /Occupants/.test(p.querySelector('h3').textContent))
+    .querySelector('.panel-head button').click());
+  await page.waitForSelector('.modal .occ-row', { timeout: 5000 });
+  await page.evaluate(() => [...document.querySelectorAll('.modal .occ-row')]
+    .find(r => r.querySelector('.occ-person').value === 'TNT-00002').querySelector('.icon-btn').click());
+  await clickText('.modal-foot .btn', /Save occupants/);
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 8000 });
+  const left = await page.evaluate(async () => {
+    const { store } = await import('/assets/js/store.js');
+    return store.occupantsOf(store.byId('leases', 'LSE-00001')).map(o => o.tenant_id);
+  });
+  if (left.length !== 1 || left[0] !== 'TNT-00003') throw new Error('left ' + JSON.stringify(left));
+});
+
+await step('a co-tenant\'s page says whose lease they live on', async () => {
+  await page.evaluate(() => { location.hash = '#/tenants/TNT-00003'; });
+  await page.waitForSelector('.stat-row', { timeout: 5000 });
+  const sub = await page.$eval('.detail-sub', e => e.textContent);
+  if (!/co-tenant on LSE-00001/i.test(sub)) throw new Error('subtitle reads ' + sub);
+  const notes = await page.$$eval('.notice', n => n.map(x => x.textContent).join(' '));
+  if (!/billed to the primary tenant, Anita Rao/.test(notes)) throw new Error('no billing note: ' + notes);
+});
+
 await step('the invoice editor prices GST per line', async () => {
   await go('billing', 'Billing');
   await clickText('button', /New invoice/);

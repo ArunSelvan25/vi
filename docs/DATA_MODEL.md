@@ -11,6 +11,7 @@ mean and the rules that keep them consistent.
 | `units` | Flats, shops, rooms — each belongs to a property |
 | `tenants` | People and businesses renting |
 | `leases` | Who rents which unit, from when, at what rent |
+| `lease_tenants` | Everyone else living on a lease besides its primary tenant |
 | `invoices` | What is owed. Amounts, paid and balance are derived from the lines and payments |
 | `invoice_items` | The lines of an invoice: rent, electricity (EB), water, late fee … |
 | `payments` | Money received, always against an invoice |
@@ -46,6 +47,22 @@ and "today" is measured in the `APP_TIMEZONE` of the API.
 - `deposit_status` — Pending · Held · Partially Refunded · Refunded · Forfeited ·
   Transferred. The last four are written by *Settle deposit* and *Renew*, which
   book the money that goes with them.
+
+## Lease tenants
+
+A lease's `tenant_id` is its **primary tenant**: the person billed, named on its
+invoices, statements and deposit. Everyone else living in the unit is a row in
+`lease_tenants`, pointing at their own `tenants` record.
+
+- `role` — `Co-tenant` (signed the agreement and shares responsibility) ·
+  `Occupant` (lives there, not a party to it).
+- `relationship` — free text: Friend, Spouse, Roommate …
+- `move_in_date` / `move_out_date` — when they joined or left, if different
+  from the lease; a blank move-out means still living there.
+- A person is on a lease at most once, and never as both its primary tenant
+  and an occupant. Nothing here is billed.
+- Deleting a lease removes its occupant rows; a tenant still listed on a lease
+  cannot be deleted.
 
 ## Users
 
@@ -104,11 +121,12 @@ property, known values only for statuses, nothing referenced can be deleted).
 | Deposits in the figures | Payments on Deposit invoices are not income, and Deposit Refund expenses are not operating expenses. Deposits held = received − applied at move-out − refunded |
 | Editing an invoice | Keeps its status (a void invoice stays void) and, for Rent and Deposit invoices, its type — so adding an electricity line to a month's rent never gets that month billed again |
 | Deleting a payment | Restores the invoice's paid amount, balance and status |
-| Deleting anything referenced | Refused, listing what still points at it. An invoice's own line items are the exception and are removed with it |
+| Deleting anything referenced | Refused, listing what still points at it. An invoice's own line items and a lease's occupant rows are the exceptions, and are removed with it |
 | Voiding | Refused while any payment is recorded against the invoice |
 | Late fees | Added once, when an invoice on a lease with a late fee turns overdue — after the grace days on a rent-day lease |
 | Sold / Inactive properties | Excluded from the dashboard headline figures. Their history stays in the reports |
-| Tenant status | Active while they hold a live lease, Past once every lease has ended |
+| Tenant status | Active while they hold a live lease or live on one as an occupant (until their move-out date), Past once every lease has ended |
+| Occupants | Saved with the lease in one transaction. A form only removes occupants it was opened with, so someone added meanwhile is kept, and a stale edit of one is refused. Making an occupant primary moves the previous primary into their place as a co-tenant. Renewing carries over everyone still living there |
 | Maintenance | Marking a ticket Resolved or Closed stamps today's completion date if left blank. A cost writes one Expense, referenced back to the ticket, so a repair is never counted twice |
 | Property attribution | An invoice and its payments inherit the property from the unit or lease when the form leaves it blank |
 | Deposits | Signing a lease with a deposit raises a Deposit invoice, unless the lease already says Held. `deposit_status` is Pending until that invoice is paid, then Held |

@@ -9,11 +9,18 @@ const field = (label, control, help) => el('div', { class: 'field' }, [
   el('label', {}, [label]), control, help ? el('small', { class: 'help', text: help }) : null
 ]);
 
-/** The tenant's unpaid invoices a deposit could settle, oldest first. */
+/**
+ * The unpaid invoices a deposit could settle, oldest first: the primary
+ * tenant's, and anything still owed on this lease by whoever was primary when
+ * it was billed — the same set settleDeposit applies it to.
+ */
 async function arrearsFor(lease) {
-  return store.everything('invoices', {
-    scope: { kind: 'tenant', id: lease.tenant_id }, preset: 'arrears', sort: 'due_date', dir: 'asc'
+  const query = (kind, id) => store.everything('invoices', {
+    scope: { kind, id }, preset: 'arrears', sort: 'due_date', dir: 'asc'
   });
+  const [mine, onLease] = await Promise.all([query('tenant', lease.tenant_id), query('lease', lease.id)]);
+  const byId = new Map([...mine, ...onLease].map(i => [i.id, i]));
+  return [...byId.values()].sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
 }
 
 /**
@@ -165,6 +172,9 @@ export function openRenewLease(lease, { onDone } = {}) {
                                   value: round2(pct ? finalRent * (1 + pct / 100) : finalRent) });
   const escInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01', value: lease.escalation_pct ?? '' });
   const carry = el('input', { type: 'checkbox', checked: held > 0 || null, disabled: held > 0 ? null : true });
+  // whoever is still living there when the lease ends renews with it
+  const staying = store.occupantsOf(lease).filter(o => !o.move_out_date || !lease.end_date || o.move_out_date > lease.end_date);
+  const carryPeople = el('input', { type: 'checkbox', checked: true });
 
   const body = el('div', { class: 'stack' }, [
     error,
@@ -176,7 +186,10 @@ export function openRenewLease(lease, { onDone } = {}) {
       field('Annual escalation %', escInput)
     ]),
     el('label', { class: 'check' }, [carry,
-      held > 0 ? ` Carry the deposit of ${money(held)} over to the new lease` : ' No deposit is held to carry over'])
+      held > 0 ? ` Carry the deposit of ${money(held)} over to the new lease` : ' No deposit is held to carry over']),
+    staying.length ? el('label', { class: 'check' }, [carryPeople,
+      ` Keep ${staying.map(o => store.label('tenants', o.tenant_id)).join(', ')} on the new lease as ` +
+      (staying.length === 1 ? 'an occupant' : 'occupants')]) : null
   ]);
 
   return modal({
@@ -195,7 +208,8 @@ export function openRenewLease(lease, { onDone } = {}) {
           try {
             const res = await store.act('renewLease', {
               id: lease.id, start_date: startInput.value, end_date: endInput.value,
-              rent_amount: rentInput.value, escalation_pct: escInput.value, carry_deposit: carry.checked
+              rent_amount: rentInput.value, escalation_pct: escInput.value, carry_deposit: carry.checked,
+              carry_occupants: carryPeople.checked
             });
             toast(`Renewed as ${res.lease.id}`, 'ok');
             close();

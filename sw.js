@@ -48,6 +48,7 @@ const SHELL = [
   './assets/js/components/detail.js',
   './assets/js/components/form.js',
   './assets/js/components/hovercard.js',
+  './assets/js/components/occupants.js',
   './assets/js/components/table.js',
   './assets/js/views/billing.js',
   './assets/js/views/crud.js',

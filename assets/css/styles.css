@@ -693,6 +693,68 @@ label { display: block; font-size: var(--t-base); font-weight: 550; color: var(-
   .deduction-row { grid-template-columns: minmax(0, 1fr) 100px 32px; }
 }
 
+/* ── lease occupants ──────────────────────────────────────────────────── */
+.occ-field {
+  border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3); background: var(--surface-2);
+}
+.occ-field-head { display: flex; flex-direction: column; gap: 2px; margin-bottom: var(--s3); }
+.occ-field-title { font-weight: 600; font-size: var(--t-md); }
+.occ-editor { display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.occ-rows { display: flex; flex-direction: column; gap: var(--s2); }
+.occ-row {
+  display: flex; flex-direction: column; gap: var(--s2); min-width: 0;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--s2);
+}
+.occ-row.is-past { opacity: .7; }
+.occ-main {
+  display: grid; grid-template-columns: minmax(0, 1fr) 128px 148px 32px; gap: var(--s2); align-items: center;
+}
+.occ-dates { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); }
+.occ-date { display: flex; align-items: center; gap: var(--s2); min-width: 0; }
+.occ-date .input { width: auto; min-width: 0; max-width: 170px; padding-top: 4px; padding-bottom: 4px; }
+.occ-actions { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.occ-empty { margin: 0; }
+.occ-note { margin: 0; padding: var(--s2) var(--s3); border-radius: var(--r-sm); background: var(--info-weak); color: var(--info); }
+@media (max-width: 600px) {
+  .occ-main { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px; }
+  .occ-main .occ-person { grid-column: 1 / -1; }
+  .occ-dates { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s2); }
+  .occ-date { flex-direction: column; align-items: stretch; gap: 2px; }
+  .occ-date .input { width: 100%; max-width: none; }
+}
+
+.occ-more {
+  display: inline-flex; align-items: center; margin-left: 4px; padding: 0 6px; border-radius: var(--r-full);
+  background: var(--surface-3); color: var(--text-2); font-size: var(--t-xs); font-weight: 600; line-height: 18px;
+  white-space: nowrap; cursor: default;
+}
+.ref-with-more { display: inline-flex; align-items: center; min-width: 0; }
+
+.occ-household { display: flex; flex-direction: column; }
+.occ-person-row {
+  display: flex; align-items: center; gap: var(--s3); padding: var(--s3) 0; min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+.occ-household > .occ-person-row:last-child { border-bottom: 0; }
+.occ-person-row.is-past { opacity: .65; }
+.occ-person-main { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
+.occ-person-name { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); font-weight: 600; min-width: 0; }
+.occ-person-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px var(--s3); min-width: 0; }
+.occ-missing { color: var(--warn); }
+.occ-person-actions { display: flex; gap: var(--s2); flex: none; }
+.occ-subhead { margin: var(--s3) 0 0; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+.occ-alone { margin: var(--s3) 0 0; }
+.occ-also { display: flex; flex-direction: column; gap: var(--s2); padding-top: var(--s3); border-top: 1px solid var(--border); }
+.occ-also-list { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.occ-chip {
+  display: inline-flex; align-items: center; gap: var(--s2); padding: 2px 4px 2px 10px; min-width: 0;
+  border: 1px solid var(--border); border-radius: var(--r-full); background: var(--surface-2);
+}
+@media (max-width: 520px) {
+  .occ-person-row { flex-wrap: wrap; }
+  .occ-person-actions { width: 100%; padding-left: 52px; }
+}
+
 /* ── modal ────────────────────────────────────────────────────────────── */
 .backdrop {
   position: fixed; inset: 0; z-index: 100;

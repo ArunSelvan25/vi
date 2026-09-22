@@ -97,7 +97,7 @@ await check('with no CRON_SECRET configured the endpoint is closed', async () =>
 });
 
 console.log('\n— the tables cannot be reached around the backend —');
-const TABLES = ['app_users', 'properties', 'units', 'tenants', 'leases', 'invoices', 'invoice_items', 'payments',
+const TABLES = ['app_users', 'properties', 'units', 'tenants', 'leases', 'lease_tenants', 'invoices', 'invoice_items', 'payments',
                 'maintenance', 'expenses', 'documents', 'settings', 'activity_log',
                 'id_counters', 'table_versions', 'app_state', 'login_throttle'];
 

@@ -44,6 +44,22 @@
 - **A unit cannot be let twice.** An overlapping lease on a unit that is already
   let is refused, naming the lease in the way.
 - A lease that ends before it starts is refused.
+- **More than one person per lease.** Each lease has one **primary tenant** —
+  the person rent is billed to — and any number of others living in the unit:
+  two friends sharing a room, a couple, a family. Each is a tenant record of
+  their own (phone, ID proof, emergency contact), added to the lease as a
+  *Co-tenant* (signed the agreement) or an *Occupant* (lives there, not a party
+  to it), with how they relate to the primary tenant and when they moved in or
+  out. They are added straight from the lease form — including someone not yet
+  on record, through *New person* — or from *Manage* on the lease page.
+- **Change the primary tenant** from the lease page: an occupant becomes the
+  person billed and the previous primary stays on as a co-tenant. Invoices
+  already raised stay with whoever they were billed to; settling the deposit
+  still clears them.
+- A co-tenant's own page says whose lease they live on and who pays; lists and
+  unit cards show *Anita Rao +1*, and searching for any occupant's name finds
+  the lease. Renewing a lease keeps everyone still living there, and a person
+  who is on someone's lease cannot be deleted.
 - Expiring-lease alerts on the dashboard, with a configurable window.
 
 ## Rent & billing
@@ -91,7 +107,7 @@
   *Deposits held* is what is still owed back to tenants, worked out from the
   records.
 - **Settle a deposit at move-out** in one step: apply it to the tenant's unpaid
-  invoices, charge deductions (repainting, damage) on a *Deposit Deduction*
+  invoices (and anything still owed on that lease), charge deductions (repainting, damage) on a *Deposit Deduction*
   invoice paid from the deposit, refund the rest, and optionally end the lease.
   What is kept becomes income through the invoices it pays; deductions larger
   than the deposit leave the tenant owing the difference.

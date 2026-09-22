@@ -18,7 +18,8 @@ const LOCK_KEY = 727274;
 
 /** Tables a delete can change behind the memo's back, through ON DELETE rules. */
 const CASCADES = {
-  Invoices: ['InvoiceItems']
+  Invoices: ['InvoiceItems'],
+  Leases: ['LeaseTenants']
 };
 
 /**

@@ -1,6 +1,7 @@
 import { el, modal, toast } from '../ui.js';
 import { store, REMOTE } from '../store.js';
 import { entities, formFields, GSTIN_PATTERN } from '../schema.js';
+import { occupantEditor } from './occupants.js';
 
 /**
  * A choice among a growing table's rows — a payment's invoice. The browser
@@ -124,6 +125,32 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
     unitSelect.value = values.unit_id || '';
   }
 
+  // A lease lists everyone else living in the unit right under its primary
+  // tenant, and saves them in the same request as the lease itself.
+  let occupants = null;
+  if (entity === 'leases' && controls['tenant_id']) {
+    const primarySelect = controls['tenant_id'];
+    occupants = occupantEditor({
+      occupants: isEdit ? store.occupantsOf(row) : [],
+      primary: () => primarySelect.value,
+      // the term as saved; the server checks move dates against the term being saved
+      lease: isEdit ? row : {},
+      createPerson: (done) => openEntityForm('tenants', null, { onSaved: (tenant) => {
+        // the primary tenant's list offers the new person too
+        primarySelect.append(el('option', { value: tenant.id }, [store.label('tenants', tenant.id)]));
+        done(tenant);
+      } })
+    });
+    primarySelect.addEventListener('change', () => occupants.syncPrimary());
+    wrappers['tenant_id'].after(el('div', { class: 'field field-wide occ-field' }, [
+      el('div', { class: 'occ-field-head' }, [
+        el('span', { class: 'occ-field-title', text: 'Occupants' }),
+        el('small', { class: 'help', text: 'Everyone else living in the unit. Only the primary tenant is billed.' })
+      ]),
+      occupants.el
+    ]));
+  }
+
   // Picking a unit fills rent/deposit from the unit record.
   if (unitSelect && controls['rent_amount']) {
     unitSelect.addEventListener('change', () => {
@@ -181,6 +208,12 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
             error.textContent = 'End date cannot be before the start date.';
             return;
           }
+          const occupantProblem = occupants && occupants.validate();
+          if (occupantProblem) {
+            error.hidden = false;
+            error.textContent = occupantProblem;
+            return;
+          }
           const badGstin = fields.find(f => f.pattern === 'gstin' && data[f.key] &&
             !GSTIN_PATTERN.test(String(data[f.key]).replace(/\s+/g, '').toUpperCase()));
           if (badGstin) {
@@ -194,9 +227,10 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
           btn.textContent = 'Saving…';
           try {
             // the version the form was opened on: a save over someone else's is refused
+            const extra = occupants ? { occupants: occupants.value(), occupants_seen: occupants.seen } : undefined;
             const saved = isEdit
-              ? await store.update(entity, row.id, data, { expectedVersion: row._v })
-              : await store.create(entity, data);
+              ? await store.update(entity, row.id, data, { expectedVersion: row._v, extra })
+              : await store.create(entity, data, { extra });
             toast(`${def.singular} ${isEdit ? 'updated' : 'created'}`, 'ok');
             close();
             onSaved?.(saved);

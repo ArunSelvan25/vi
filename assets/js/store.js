@@ -202,9 +202,13 @@ export const store = {
 
   cascades(entity) { return REMOTE.has(entity) || this.CASCADING.has(entity); },
 
-  async create(entity, data) {
+  /**
+   * @param extra further payload fields the server reads beside the row — a
+   *   lease's occupants, saved in the same transaction as the lease
+   */
+  async create(entity, data, { extra } = {}) {
     const cascades = this.cascades(entity);
-    const res = await api('create', { table: tableOf(entity), data,
+    const res = await api('create', { table: tableOf(entity), data, ...(extra || {}),
                                       ...(cascades ? this.snapshotRequest() : {}) });
     if (REMOTE.has(entity)) this.touch();
     else { this[entity] = [...this[entity], res.row]; this.forget(entity); }
@@ -215,10 +219,11 @@ export const store = {
   /**
    * @param opts.expectedVersion the `_v` of the row the form was opened on;
    *   the server refuses the save if someone else has changed it since.
+   * @param opts.extra further payload fields, as for create
    */
-  async update(entity, id, data, { expectedVersion } = {}) {
+  async update(entity, id, data, { expectedVersion, extra } = {}) {
     const cascades = this.cascades(entity);
-    const res = await api('update', { table: tableOf(entity), id, data,
+    const res = await api('update', { table: tableOf(entity), id, data, ...(extra || {}),
                                       expected_version: expectedVersion,
                                       ...(cascades ? this.snapshotRequest() : {}) });
     if (REMOTE.has(entity)) this.touch();
@@ -314,6 +319,67 @@ export const store = {
 
   activeLeaseForUnit(unitId) {
     return this.leases.find(l => l.unit_id === unitId && l.status === 'Active') || null;
+  },
+
+  // ── who lives on a lease ────────────────────────────────────────────────
+  //
+  // A lease has one primary tenant (tenant_id), the person billed, and any
+  // number of others living there (_occupants, sent by the server with it).
+
+  /** Everyone on a lease besides the primary tenant, moved-out included. */
+  occupantsOf(lease) { return (lease && lease._occupants) || []; },
+
+  /** Whether an occupant still lives there: no move-out date, or one not yet reached. */
+  isLivingThere(occupant, on = isoDate()) { return !occupant.move_out_date || occupant.move_out_date >= on; },
+
+  /** The occupants still living there. */
+  currentOccupants(lease) { return this.occupantsOf(lease).filter(o => this.isLivingThere(o)); },
+
+  /**
+   * The household: the primary tenant first, then everyone still living there.
+   * Each entry is { tenant_id, role, occupant } — occupant is null for the primary.
+   */
+  householdOf(lease) {
+    if (!lease) return [];
+    return [{ tenant_id: lease.tenant_id, role: 'Primary', occupant: null },
+            ...this.currentOccupants(lease).map(o => ({ tenant_id: o.tenant_id, role: o.role, occupant: o }))];
+  },
+
+  /** Leases a tenant lives on without being the primary tenant, newest first, with their row on each. */
+  sharedLeasesOf(tenantId) {
+    const out = [];
+    for (const l of this.leases) {
+      const o = this.occupantsOf(l).find(x => x.tenant_id === tenantId);
+      if (o) out.push({ lease: l, occupant: o });
+    }
+    return out.sort((a, b) => String(b.lease.start_date || '').localeCompare(String(a.lease.start_date || '')));
+  },
+
+  /** The live lease a tenant holds or shares right now, and how: { lease, role } or null. */
+  homeOf(tenantId) {
+    const own = this.leases.find(l => l.tenant_id === tenantId && l.status === 'Active');
+    if (own) return { lease: own, role: 'Primary' };
+    const shared = this.sharedLeasesOf(tenantId)
+      .find(s => s.lease.status === 'Active' && this.isLivingThere(s.occupant));
+    return shared ? { lease: shared.lease, role: shared.occupant.role } : null;
+  },
+
+  /** Names of the people living on a lease besides the primary tenant. */
+  occupantNames(lease) {
+    return this.currentOccupants(lease).map(o => this.label('tenants', o.tenant_id));
+  },
+
+  /**
+   * Replace a lease's occupants with `occupants`.
+   * @param seen the occupant ids the editor opened with; only these can be removed
+   */
+  async saveOccupants(leaseId, occupants, seen) {
+    return this.act('saveOccupants', { lease_id: leaseId, occupants, occupants_seen: seen });
+  },
+
+  /** Make one of a lease's occupants its primary tenant; the previous primary becomes a co-tenant. */
+  async setPrimaryTenant(lease, tenantId) {
+    return this.act('setPrimaryTenant', { lease_id: lease.id, tenant_id: tenantId, expected_version: lease._v });
   },
 
   /** What a tenant, unit or property owes now, worked out by the server. */

@@ -11,6 +11,7 @@ import { detailPage, stat, statRow, panel, props, schemaProps, facts, notice, ta
 import { recordPaymentFor, showInvoice, showReceipt, openInvoiceForm, voidInvoiceFor,
          invoiceMessage } from './invoices.js';
 import { openRenewLease, openSettleDeposit } from './leases.js';
+import { householdList, openOccupants } from '../components/occupants.js';
 
 // ── shared by every record page ─────────────────────────────────────────────
 
@@ -257,6 +258,11 @@ function leasePage(lease, s, ctx) {
   const again = () => refreshView();
   const canRenew = store.can('manager') && lease.end_date && lease.status !== 'Terminated' && !renewedTo;
   const alertDays = Number(store.settings.lease_expiry_alert_days || 45);
+  const others = store.currentOccupants(lease);
+  const manageOccupants = () => openOccupants(lease, {
+    onDone: again,
+    createPerson: (done) => openEntityForm('tenants', null, { onSaved: done })
+  });
 
   let t = null;
   const overview = () => el('div', { class: 'tab-stack' }, [
@@ -283,9 +289,14 @@ function leasePage(lease, s, ctx) {
     ])),
     nextRentPanel(lease),
     el('div', { class: 'grid-2' }, [
-      panel('Tenant', tenantCard(tenant)),
+      panel('Primary tenant', tenantCard(tenant)),
       panel('Unit', unitCard(unit))
     ]),
+    panel('Occupants', householdList(lease, { onChanged: again }), {
+      count: 1 + others.length,
+      action: store.can('manager') ? el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: manageOccupants },
+                                        [icon('users', 14), ' Manage']) : null
+    }),
     panel('Security deposit', el('div', { class: 'stack' }, [
       facts([
         ['Agreed', money(lease.deposit_amount)],
@@ -328,7 +339,10 @@ function leasePage(lease, s, ctx) {
     title: id,
     badges: [badge(lease.status), lease.deposit_status ? badge('Deposit ' + lease.deposit_status.toLowerCase(),
              { Held: 'info', Refunded: 'ok', Pending: 'warn' }[lease.deposit_status] || 'muted') : null],
-    subtitle: [ref('tenants', lease.tenant_id), ' · ', ref('units', lease.unit_id)],
+    subtitle: [ref('tenants', lease.tenant_id),
+               others.length ? el('span', { class: 'occ-more', title: store.occupantNames(lease).join(', ') },
+                                  [' +' + others.length]) : null,
+               ' · ', ref('units', lease.unit_id)],
     meta: [
       copyable(id, { label: 'Lease ID', mono: true }),
       [icon('clock', 14), `${date(lease.start_date)} – ${lease.end_date ? date(lease.end_date) : 'open-ended'}`],
@@ -353,7 +367,9 @@ function leasePage(lease, s, ctx) {
     aside: [
       panel('Lease details', props([
         ['Lease ID', copyable(id, { label: 'Lease ID', mono: true })],
-        ['Tenant', ref('tenants', lease.tenant_id)],
+        ['Primary tenant', ref('tenants', lease.tenant_id)],
+        ['Occupants', others.length ? el('span', {}, others.flatMap((o, i) => [i ? ', ' : '', ref('tenants', o.tenant_id)]))
+                                    : 'Primary tenant only'],
         ['Property', ref('properties', lease.property_id)],
         ['Unit', ref('units', lease.unit_id, { short: true })],
         ['Start date', date(lease.start_date)],

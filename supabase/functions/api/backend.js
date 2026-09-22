@@ -251,6 +251,8 @@ async function route(r, action, payload, token) {
     case 'generateInvoices': return ok(await withSnapshot(r, payload, user, await generateInvoices(r, payload, user)));
     case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
     case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
+    case 'saveOccupants':    return ok(await withSnapshot(r, payload, user, await saveOccupants(r, payload, user)));
+    case 'setPrimaryTenant': return ok(await withSnapshot(r, payload, user, await setPrimaryTenant(r, payload, user)));
     case 'refreshStatuses':  requireRole(user, 'manager'); return ok(await withSnapshot(r, payload, user, await refreshStatuses(r, user)));
     case 'createUser':       return ok({ row: await createUser(r, payload, user) });
     case 'resetPassword':    return ok(await resetPassword(r, payload, user));
@@ -435,8 +437,8 @@ async function deleteRow(r, table, id, user) {
   // Deleting money received has to put the invoice back where it was, or the
   // ledger keeps showing it as settled.
   if (affectedInvoice) await applyInvoiceTotals(r, affectedInvoice, user);
-  // Removing a lease frees its unit.
-  if (table === 'Leases' || table === 'Units') await refreshStatuses(r, user, true);
+  // Removing a lease frees its unit; removing an occupant may end their tenancy.
+  if (table === 'Leases' || table === 'Units' || table === 'LeaseTenants') await refreshStatuses(r, user, true);
 
   return id;
 }
@@ -461,7 +463,8 @@ const DEPENDENTS = {
   Units:      [['Leases', 'unit_id', 'lease'], ['Invoices', 'unit_id', 'invoice'],
                ['Maintenance', 'unit_id', 'maintenance ticket'], ['Expenses', 'unit_id', 'expense'],
                ['Documents', 'entity_id', 'document']],
-  Tenants:    [['Leases', 'tenant_id', 'lease'], ['Invoices', 'tenant_id', 'invoice'],
+  Tenants:    [['Leases', 'tenant_id', 'lease'], ['LeaseTenants', 'tenant_id', 'shared lease'],
+               ['Invoices', 'tenant_id', 'invoice'],
                ['Payments', 'tenant_id', 'payment'], ['Maintenance', 'tenant_id', 'maintenance ticket'],
                ['Documents', 'entity_id', 'document']],
   Leases:     [['Invoices', 'lease_id', 'invoice'], ['Payments', 'lease_id', 'payment'],
@@ -562,6 +565,13 @@ async function writeRowLocked(r, op, table, payload, user) {
     });
   }
 
+  // An occupant saved on its own (the lease form saves them with the lease).
+  if (table === 'LeaseTenants') {
+    const row = await writeOccupant(r, op, payload.id, data, user, payload.expected_version);
+    await refreshStatuses(r, user, true);
+    return (await findRow(r, table, row.id)) || row;
+  }
+
   if (table === 'Tenants' && data.gstin !== undefined) data.gstin = assertGstin(data.gstin, 'The tenant\'s GSTIN');
   if (table === 'Settings' && String(payload.id || data.key) === 'gstin' && data.value !== undefined) {
     data.value = assertGstin(data.value, 'Your GSTIN');
@@ -642,6 +652,22 @@ async function writeRowLocked(r, op, table, payload, user) {
       await applyInvoiceTotals(r, paymentBefore.invoice_id, user);
     }
   }
+  // Everyone else living on the lease, saved in the same transaction: a lease
+  // is never left with half its household. A form that does not send the list
+  // leaves the occupants as they are — except that a new primary tenant can no
+  // longer be listed as an occupant of their own lease.
+  if (table === 'Leases') {
+    if (Array.isArray(payload.occupants)) {
+      await syncOccupants(r, row.id, payload.occupants, user, payload.occupants_seen);
+    } else if (before && String(before.tenant_id) !== String(row.tenant_id)) {
+      for (const o of await occupantsOf(r, row.id)) {
+        if (String(o.tenant_id) !== String(row.tenant_id)) continue;
+        await removeRow(r, 'LeaseTenants', o.id);
+        await log(r, user, 'occupant-removed', 'Leases', row.id, o.tenant_id + ' · now the primary tenant');
+      }
+    }
+  }
+
   // Occupancy is derived from leases, so it has to be re-derived as soon as one
   // changes — not left until the next page load.
   if (table === 'Leases' || table === 'Units') await refreshStatuses(r, user, true);
@@ -962,8 +988,11 @@ async function settleDeposit(r, payload, user) {
   };
 
   if (payload.apply_to_arrears) {
+    // the primary tenant's arrears, and anything still owed on this lease by
+    // whoever was primary when it was billed
     const owing = (await readTable(r, 'Invoices'))
-      .filter(i => String(i.tenant_id) === String(lease.tenant_id) && String(i.type) !== 'Deposit' &&
+      .filter(i => (String(i.tenant_id) === String(lease.tenant_id) || String(i.lease_id) === String(lease.id)) &&
+                   String(i.type) !== 'Deposit' &&
                    ['Unpaid', 'Partial', 'Overdue'].indexOf(String(i.status)) >= 0 && num(i.balance) > 0)
       .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
     for (const inv of owing) {
@@ -1062,8 +1091,192 @@ async function renewLease(r, payload, user) {
   if (carry && held > 0) {
     await updateRow(r, 'Leases', old.id, { deposit_status: 'Transferred' }, SYSTEM_ACTOR, true);
   }
-  await log(r, user, 'lease-renewed', 'Leases', renewed.id, 'from ' + old.id + ' · rent ' + rent);
+
+  // The household renews with the lease: everyone still living there when it
+  // ended moves onto the new one. Someone who moved out stays on the old lease.
+  let carried = 0;
+  if (payload.carry_occupants !== false) {
+    for (const o of await occupantsOf(r, old.id)) {
+      if (o.move_out_date && String(o.move_out_date) <= String(old.end_date)) continue;
+      await writeOccupant(r, 'create', null, {
+        lease_id: renewed.id, tenant_id: o.tenant_id, role: o.role, relationship: o.relationship, notes: o.notes
+      }, user, null, true);
+      carried++;
+    }
+    if (carried) await refreshStatuses(r, user, true);
+  }
+
+  await log(r, user, 'lease-renewed', 'Leases', renewed.id, 'from ' + old.id + ' · rent ' + rent +
+            (carried ? ' · ' + carried + ' occupant' + (carried === 1 ? '' : 's') + ' carried over' : ''));
   return { lease: await findRow(r, 'Leases', renewed.id), previous: await findRow(r, 'Leases', old.id) };
+}
+
+// ── lease occupants ─────────────────────────────────────────────────────────
+//
+// A lease has one primary tenant (leases.tenant_id) — the person billed — and
+// any number of others living there, each a LeaseTenants row pointing at their
+// own tenant record. Nothing about billing reads these rows.
+
+const OCCUPANT_ROLES = ['Co-tenant', 'Occupant'];
+const OCCUPANT_FIELDS = ['tenant_id', 'role', 'relationship', 'move_in_date', 'move_out_date', 'notes'];
+
+/** More than any real household; a guard against a runaway client, not a business rule. */
+export const MAX_OCCUPANTS = 20;
+
+/** The occupants of one lease, in the order they were added. */
+async function occupantsOf(r, leaseId) {
+  return (await readTable(r, 'LeaseTenants')).filter(o => String(o.lease_id) === String(leaseId));
+}
+
+/** Everything that must hold for one occupant row, checked against the row as it will be saved. */
+async function assertOccupantAllowed(r, row, selfId) {
+  if (!row.lease_id) throw new Error('Choose the lease this person lives on.');
+  if (!row.tenant_id) throw new Error('Choose the person living on the lease.');
+  const lease = await findRow(r, 'Leases', row.lease_id);
+  if (!lease) throw new Error('Lease ' + row.lease_id + ' does not exist.');
+  const tenant = await findRow(r, 'Tenants', row.tenant_id);
+  if (!tenant) throw new Error('Tenant ' + row.tenant_id + ' does not exist.');
+  const who = tenant.full_name || tenant.id;
+
+  if (String(lease.tenant_id) === String(row.tenant_id)) {
+    throw new Error(who + ' is the primary tenant on ' + lease.id + ', so they cannot also be listed as an occupant.');
+  }
+  if (row.role && OCCUPANT_ROLES.indexOf(String(row.role)) < 0) {
+    throw new Error('An occupant is either a Co-tenant or an Occupant, not "' + row.role + '".');
+  }
+  const moveIn = String(row.move_in_date || ''), moveOut = String(row.move_out_date || '');
+  if (moveIn && moveOut && moveOut < moveIn) throw new Error(who + ' cannot move out before they move in.');
+  if (moveOut && lease.start_date && moveOut < String(lease.start_date)) {
+    throw new Error(who + '\'s move-out date is before ' + lease.id + ' starts on ' + lease.start_date + '.');
+  }
+  if (moveIn && lease.end_date && moveIn > String(lease.end_date)) {
+    throw new Error(who + '\'s move-in date is after ' + lease.id + ' ends on ' + lease.end_date + '.');
+  }
+
+  const others = (await occupantsOf(r, lease.id)).filter(o => String(o.id) !== String(selfId || ''));
+  if (others.some(o => String(o.tenant_id) === String(row.tenant_id))) {
+    throw new Error(who + ' is already on ' + lease.id + '.');
+  }
+  if (!selfId && others.length >= MAX_OCCUPANTS) {
+    throw new Error(lease.id + ' already has ' + MAX_OCCUPANTS + ' occupants besides the primary tenant.');
+  }
+}
+
+/**
+ * Create or update one occupant, validated. Statuses are left to the caller,
+ * which re-derives them once for however many rows it wrote.
+ */
+async function writeOccupant(r, op, id, data, user, expectedVersion, skipLog) {
+  requireRole(user, minRoleFor('LeaseTenants'));
+  const clean = {};
+  for (const k of OCCUPANT_FIELDS.concat('lease_id')) if (data[k] !== undefined) clean[k] = data[k];
+  if (clean.relationship !== undefined) clean.relationship = String(clean.relationship || '').trim().slice(0, 60);
+  if (op === 'create') {
+    if (!clean.role) clean.role = 'Co-tenant';
+    await assertOccupantAllowed(r, clean, null);
+    const row = await createRow(r, 'LeaseTenants', clean, user, true);
+    if (!skipLog) await log(r, user, 'occupant-added', 'Leases', row.lease_id, row.tenant_id + ' · ' + row.role);
+    return row;
+  }
+  const before = await findRow(r, 'LeaseTenants', id);
+  if (!before) throw new Error('Occupant ' + id + ' not found — someone may have removed them. Reopen the lease to see who is on it.');
+  // an occupant cannot be moved to another lease; remove and add them instead
+  delete clean.lease_id;
+  await assertOccupantAllowed(r, { ...before, ...clean }, id);
+  const row = await updateRow(r, 'LeaseTenants', id, clean, user, true, expectedVersion);
+  if (!skipLog) await log(r, user, 'occupant-updated', 'Leases', row.lease_id, row.tenant_id + ' · ' + row.role);
+  return row;
+}
+
+/**
+ * Make a lease's occupants match `list`. A row with an `id` is updated (and
+ * refused if it changed since `_v`), one without is added, and one that was on
+ * the lease but is no longer listed is removed.
+ *
+ * @param seen the occupant ids the form was opened with. When given, only those
+ *   can be removed, so someone added by another user meanwhile is kept rather
+ *   than silently dropped.
+ */
+async function syncOccupants(r, leaseId, list, user, seen) {
+  requireRole(user, minRoleFor('LeaseTenants'));
+  if (!Array.isArray(list)) throw new Error('Occupants must be a list.');
+  if (list.length > MAX_OCCUPANTS) throw new Error('A lease can list at most ' + MAX_OCCUPANTS + ' occupants besides the primary tenant.');
+
+  const people = new Set();
+  for (const o of list) {
+    const t = String((o && o.tenant_id) || '');
+    if (!t) throw new Error('Choose a person for every occupant, or remove the empty row.');
+    if (people.has(t)) {
+      const tenant = await findRow(r, 'Tenants', t);
+      throw new Error((tenant ? tenant.full_name : t) + ' is listed twice.');
+    }
+    people.add(t);
+  }
+
+  const current = await occupantsOf(r, leaseId);
+  const listed = new Set(list.filter(o => o.id).map(o => String(o.id)));
+  const removable = Array.isArray(seen) ? new Set(seen.map(String)) : null;
+  // removals first, so someone taken off and added back never meets their old row
+  for (const o of current) {
+    if (listed.has(String(o.id))) continue;
+    if (removable && !removable.has(String(o.id))) continue;
+    await removeRow(r, 'LeaseTenants', o.id);
+    await log(r, user, 'occupant-removed', 'Leases', leaseId, o.tenant_id);
+  }
+  const mine = new Set(current.map(o => String(o.id)));
+  for (const o of list) {
+    const data = { ...o, lease_id: leaseId };
+    if (o.id) {
+      if (!mine.has(String(o.id))) {
+        throw new Error('Occupant ' + o.id + ' is not on ' + leaseId + ' — someone may have removed them. ' +
+                        'Reopen the lease to see who is on it.');
+      }
+      await writeOccupant(r, 'update', o.id, data, user, o._v);
+    } else {
+      await writeOccupant(r, 'create', null, data, user);
+    }
+  }
+  return occupantsOf(r, leaseId);
+}
+
+/** The lease page's "Manage occupants": the whole list, saved at once. */
+async function saveOccupants(r, payload, user) {
+  requireRole(user, 'manager');
+  const lease = await findRow(r, 'Leases', payload.lease_id);
+  if (!lease) throw new Error('Lease ' + payload.lease_id + ' not found');
+  const occupants = await syncOccupants(r, lease.id, payload.occupants || [], user, payload.occupants_seen);
+  await refreshStatuses(r, user, true);
+  return { lease: await findRow(r, 'Leases', lease.id), occupants };
+}
+
+/**
+ * Hand the lease to one of its occupants: they become the primary tenant, and
+ * the previous primary takes their place among the occupants as a Co-tenant.
+ * Invoices already raised stay with whoever they were billed to; rent from now
+ * on is billed to the new primary.
+ */
+async function setPrimaryTenant(r, payload, user) {
+  requireRole(user, 'manager');
+  const lease = await findRow(r, 'Leases', payload.lease_id);
+  if (!lease) throw new Error('Lease ' + payload.lease_id + ' not found');
+  if (['Terminated', 'Expired'].indexOf(String(lease.status)) >= 0) {
+    throw new Error(lease.id + ' has ended, so its primary tenant can no longer change.');
+  }
+  const occupant = (await occupantsOf(r, lease.id)).find(o => String(o.tenant_id) === String(payload.tenant_id));
+  if (!occupant) throw new Error('That person is not on ' + lease.id + '. Add them as an occupant first.');
+  if (occupant.move_out_date && String(occupant.move_out_date) < today(r)) {
+    throw new Error('They moved out on ' + occupant.move_out_date + ', so they cannot become the primary tenant.');
+  }
+  const previous = lease.tenant_id;
+  // the lease first, with the version the page was opened on: a change made
+  // meanwhile is refused before anything is written
+  await updateRow(r, 'Leases', lease.id, { tenant_id: occupant.tenant_id }, user, true, payload.expected_version);
+  await updateRow(r, 'LeaseTenants', occupant.id, {
+    tenant_id: previous, role: 'Co-tenant', move_in_date: '', move_out_date: ''
+  }, user, true);
+  await refreshStatuses(r, user, true);
+  await log(r, user, 'primary-tenant-changed', 'Leases', lease.id, previous + ' → ' + occupant.tenant_id);
+  return { lease: await findRow(r, 'Leases', lease.id), occupants: await occupantsOf(r, lease.id) };
 }
 
 /** The monthly rent in force on a date, with annual escalation compounded from the lease start. */
@@ -1711,13 +1924,13 @@ const DERIVED_FROM = {
   properties: ['properties', 'invoices'],
   units:      ['units', 'invoices'],
   tenants:    ['tenants', 'invoices'],
-  leases:     ['leases', 'invoices', 'invoice_items', 'payments', 'expenses']
+  leases:     ['leases', 'lease_tenants', 'invoices', 'invoice_items', 'payments', 'expenses']
 };
 
 /**
  * Figures the cards show that depend on invoices and payments the browser no
  * longer holds: what each tenant, unit and property owes, where each lease's
- * deposit stands, and how far its rent has been billed.
+ * deposit stands, how far its rent has been billed, and who else lives on it.
  */
 async function derivedFigures(r) {
   const owed = { tenant_id: {}, unit_id: {}, property_id: {} };
@@ -1739,7 +1952,15 @@ async function derivedFigures(r) {
     if (end > (billed[inv.lease_id] || '')) billed[inv.lease_id] = end;
   }
   const ledgers = await depositLedgers(r, await readTable(r, 'Leases'));
-  return { owed, billed, ledgers };
+  // everyone besides the primary tenant living on each lease
+  const occupants = {};
+  for (const o of await readTable(r, 'LeaseTenants')) {
+    (occupants[o.lease_id] = occupants[o.lease_id] || []).push({
+      id: o.id, tenant_id: o.tenant_id, role: o.role, relationship: o.relationship,
+      move_in_date: o.move_in_date, move_out_date: o.move_out_date, notes: o.notes, _v: o._v
+    });
+  }
+  return { owed, billed, ledgers, occupants };
 }
 
 const DERIVED = {
@@ -1747,7 +1968,8 @@ const DERIVED = {
   units:      (row, f) => ({ ...row, _owed: f.owed.unit_id[row.id] || 0 }),
   tenants:    (row, f) => ({ ...row, _owed: f.owed.tenant_id[row.id] || 0 }),
   leases:     (row, f) => ({ ...row, _billed_through: f.billed[row.id] || '',
-                             _deposit: f.ledgers[row.id] || { received: 0, applied: 0, refunded: 0, held: 0 } })
+                             _deposit: f.ledgers[row.id] || { received: 0, applied: 0, refunded: 0, held: 0 },
+                             _occupants: f.occupants[row.id] || [] })
 };
 
 /**
@@ -2467,12 +2689,21 @@ async function refreshStatusesLocked(r, user, quiet) {
   }
 
   // A tenant is Active while they hold a live lease and Past once every lease
-  // has ended. Someone with no lease at all is left alone — a Prospect.
-  const live = {}, everLeased = {};
+  // has ended. Someone with no lease at all is left alone — a Prospect. Living
+  // on someone else's lease counts, until the day they move out.
+  const live = {}, everLeased = {}, leaseById = {};
   (await readTable(r, 'Leases')).forEach(l => {
+    leaseById[l.id] = l;
     if (!l.tenant_id) return;
     everLeased[l.tenant_id] = true;
     if (['Active', 'Upcoming'].indexOf(String(l.status)) >= 0) live[l.tenant_id] = true;
+  });
+  (await readTable(r, 'LeaseTenants')).forEach(o => {
+    const l = leaseById[o.lease_id];
+    if (!l || !o.tenant_id) return;
+    everLeased[o.tenant_id] = true;
+    const stillThere = !o.move_out_date || String(o.move_out_date) >= t;
+    if (stillThere && ['Active', 'Upcoming'].indexOf(String(l.status)) >= 0) live[o.tenant_id] = true;
   });
   for (const tenant of await readTable(r, 'Tenants')) {
     if (!everLeased[tenant.id]) continue;

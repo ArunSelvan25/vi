@@ -56,12 +56,17 @@ const seed = {
   ],
   Tenants: [
     { id:'TNT-00001', full_name:'Anita Rao', email:'anita@example.com', phone:'+91 98800 11111', id_type:'Aadhaar', id_number:'XXXX1234', occupation:'Designer', emergency_name:'R Rao', emergency_phone:'+91 98800 22222', status:'Active' },
-    { id:'TNT-00002', full_name:'Karthik Menon', email:'', phone:'+91 99400 33333', id_type:'PAN', id_number:'ABCDE1234F', occupation:'Engineer', emergency_name:'S Menon', emergency_phone:'+91 99400 44444', status:'Active' }
+    { id:'TNT-00002', full_name:'Karthik Menon', email:'', phone:'+91 99400 33333', id_type:'PAN', id_number:'ABCDE1234F', occupation:'Engineer', emergency_name:'S Menon', emergency_phone:'+91 99400 44444', status:'Active' },
+    // shares A-101 with Anita Rao, who is billed
+    { id:'TNT-00003', full_name:'Priya Shah', email:'', phone:'+91 98450 55555', id_type:'Aadhaar', id_number:'XXXX5678', occupation:'Analyst', emergency_name:'M Shah', emergency_phone:'+91 98450 66666', status:'Active' }
   ],
   // deposits collected before the app existed, so marked Held by hand
   Leases: [
     { id:'LSE-00001', property_id:'PRP-00001', unit_id:'UNT-00001', tenant_id:'TNT-00001', start_date:monthDay(-11, 1), end_date:monthEnd(6), rent_amount:28000, deposit_amount:150000, deposit_status:'Held', frequency:'Monthly', late_fee:500, grace_days:5, escalation_pct:5, status:'Active' },
     { id:'LSE-00002', property_id:'PRP-00002', unit_id:'UNT-00003', tenant_id:'TNT-00002', start_date:monthDay(-3, 1), end_date:inDays(30), rent_amount:75000, deposit_amount:450000, deposit_status:'Held', frequency:'Monthly', late_fee:1000, grace_days:5, escalation_pct:0, status:'Active' }
+  ],
+  LeaseTenants: [
+    { id:'LTN-00001', lease_id:'LSE-00001', tenant_id:'TNT-00003', role:'Co-tenant', relationship:'Friend', move_in_date:monthDay(-11, 1) }
   ],
   Invoices: [
     { id:'INV-00001', lease_id:'LSE-00001', tenant_id:'TNT-00001', unit_id:'UNT-00001', property_id:'PRP-00001', type:'Rent', period_start:monthDay(-2, 1), period_end:monthEnd(-2), issue_date:monthDay(-2, 1), due_date:monthDay(-2, 6), amount:28000, tax:0, total:28000, amount_paid:28000, balance:0, status:'Paid' },

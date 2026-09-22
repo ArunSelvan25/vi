@@ -100,8 +100,10 @@ const SCOPES = {
     Invoices:    (tx, id) => tx`t.tenant_id = ${id}`,
     Payments:    (tx, id) => tx`t.tenant_id = ${id}`,
     Maintenance: (tx, id) => tx`t.tenant_id = ${id}`,
+    // their own documents, and those of every lease they hold or share
     Documents:   (tx, id) => tx`(${docsOf(tx, 'Tenant', id)}
-      or (t.entity_type = 'Lease' and t.entity_id in (select id from leases where tenant_id = ${id})))`
+      or (t.entity_type = 'Lease' and (t.entity_id in (select id from leases where tenant_id = ${id})
+                                       or t.entity_id in (select lease_id from lease_tenants where tenant_id = ${id}))))`
   },
   lease: {
     Invoices:    (tx, id) => tx`t.lease_id = ${id}`,

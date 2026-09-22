@@ -43,6 +43,8 @@ jobs:
       - run: npm install --no-audit --no-fund
       - name: Billing logic tests
         run: npm run test:backend
+      - name: Lease occupant tests
+        run: npm run test:occupants
       - name: Server-side paging tests
         run: npm run test:paging
       - name: Security tests

@@ -17,8 +17,23 @@ export const STATUS_COLORS = {
   Overdue: 'danger', Terminated: 'danger', Expired: 'danger', Urgent: 'danger', High: 'danger',
   Void: 'muted', Inactive: 'muted', Past: 'muted', Sold: 'muted',
   Low: 'muted', Medium: 'info', Held: 'info', Refunded: 'ok', 'Partially Refunded': 'warn',
-  Forfeited: 'muted', Transferred: 'muted', Pending: 'warn'
+  Forfeited: 'muted', Transferred: 'muted', Pending: 'warn',
+  Primary: 'ok', 'Co-tenant': 'info', Occupant: 'muted', 'Moved out': 'muted'
 };
+
+/**
+ * Everyone on a lease besides the primary tenant (the person billed):
+ *   Co-tenant  signed the agreement and shares responsibility for it
+ *   Occupant   lives there, but is not a party to the agreement
+ */
+export const OCCUPANT_ROLES = [
+  { value: 'Co-tenant', label: 'Co-tenant', help: 'Signed the agreement and shares responsibility' },
+  { value: 'Occupant', label: 'Occupant', help: 'Lives there, not a party to the agreement' }
+];
+
+/** Suggested; any short description can be typed. */
+export const RELATIONSHIPS = ['Friend', 'Roommate', 'Spouse', 'Partner', 'Family', 'Parent', 'Child', 'Sibling',
+                              'Colleague', 'Employee', 'Other'];
 
 /** A GSTIN: 2-digit state code, PAN, entity number, Z, checksum. */
 export const GSTIN_PATTERN = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$/;
@@ -145,7 +160,9 @@ export const entities = {
       { key: 'unit_id', label: 'Unit', type: 'ref', optionsFrom: 'units', required: true, table: true,
         short: true, dependsOn: 'property_id',
         help: 'A unit can only be on one live lease at a time.' },
-      { key: 'tenant_id', label: 'Tenant', type: 'ref', optionsFrom: 'tenants', required: true, table: true },
+      { key: 'tenant_id', label: 'Primary tenant', type: 'ref', optionsFrom: 'tenants', required: true, table: true,
+        occupants: true,
+        help: 'The person the rent is billed to. Add anyone else living in the unit under Occupants below.' },
       { key: 'start_date', label: 'Start date', type: 'date', required: true, table: true },
       { key: 'end_date', label: 'End date', type: 'date', table: true },
       // The backend bills rent_amount × months per period, so this must be the

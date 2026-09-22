@@ -39,6 +39,14 @@ function cellContent(entity, field, row) {
   }
   if (raw === '' || raw === null || raw === undefined) return cellValue(field, row);
   if (field.type === 'ref' && DETAIL_ENTITIES.has(field.optionsFrom)) {
+    // a lease's primary tenant, with a count of everyone else living there
+    const others = field.occupants ? store.currentOccupants(row).length : 0;
+    if (others) {
+      return el('span', { class: 'ref-with-more' }, [
+        ref(field.optionsFrom, raw, { short: field.short }),
+        el('span', { class: 'occ-more', title: store.occupantNames(row).join(', ') }, [' +' + others])
+      ]);
+    }
     return ref(field.optionsFrom, raw, { short: field.short });
   }
   if (field.key === 'id' && DETAIL_ENTITIES.has(entity)) {
@@ -146,9 +154,12 @@ export function dataTable({
     let out = rows.slice();
     if (state.q) {
       const keys = def.search || cols.map(c => c.key);
+      // a lease is found by the name of anyone living on it, not only the primary tenant
+      const occupantsIn = cols.some(c => c.occupants);
       out = out.filter(r =>
         keys.some(k => String(r[k] ?? '').toLowerCase().includes(state.q)) ||
-        cols.some(c => cellValue(c, r).toLowerCase().includes(state.q))
+        cols.some(c => cellValue(c, r).toLowerCase().includes(state.q)) ||
+        (occupantsIn && store.occupantNames(r).some(n => n.toLowerCase().includes(state.q)))
       );
     }
     for (const [k, v] of Object.entries(state.facets)) {

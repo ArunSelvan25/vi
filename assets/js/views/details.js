@@ -38,7 +38,11 @@ function unitTile(u) {
     el('p', {}, [el('strong', { text: money(lease ? store.currentRent(lease) : u.rent_amount) }),
                  el('small', { class: 'muted', text: ' / month' })]),
     tenant
-      ? el('div', { class: 'unit-card-tenant' }, [icon('user', 13), ref('tenants', tenant.id)])
+      ? el('div', { class: 'unit-card-tenant' }, [icon('user', 13), ref('tenants', tenant.id),
+          store.currentOccupants(lease).length
+            ? el('span', { class: 'occ-more', title: store.occupantNames(lease).join(', ') },
+                 [' +' + store.currentOccupants(lease).length])
+            : null])
       : el('span', { class: 'muted small', text: 'No active tenant' }),
     lease?.end_date || due > 0
       ? el('div', { class: 'unit-card-foot' }, [
@@ -211,7 +215,18 @@ function unitPage(unit, s, ctx) {
         : lastEnded ? `Vacant since ${date(lastEnded.end_date)}.` : 'This unit is vacant.'
     ].flat(), 'info', newLease ? btn('New lease', 'plus', newLease) : null) : null,
     el('div', { class: 'grid-2' }, [
-      panel('Current tenant', tenant ? tenantCard(tenant) : el('p', { class: 'muted', text: 'No one is living here right now.' })),
+      panel('Current tenant', tenant ? el('div', { class: 'stack' }, [
+        tenantCard(tenant),
+        store.currentOccupants(lease).length
+          ? el('div', { class: 'occ-also' }, [
+              el('span', { class: 'muted small', text: 'Also living here' }),
+              el('div', { class: 'occ-also-list' }, store.currentOccupants(lease).map(o =>
+                el('span', { class: 'occ-chip' }, [ref('tenants', o.tenant_id), badge(o.role)])))
+            ])
+          : null
+      ]) : el('p', { class: 'muted', text: 'No one is living here right now.' }), {
+        count: tenant ? 1 + store.currentOccupants(lease).length : undefined
+      }),
       panel('Current lease', lease ? leaseCard(lease) : el('p', { class: 'muted', text: 'No active lease.' }))
     ]),
     el('div', { class: 'grid-2' }, [
@@ -238,7 +253,7 @@ function unitPage(unit, s, ctx) {
     { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
     { key: 'activity', label: 'Activity',
       render: () => awaiting(() => store.history('units', id), (h) =>
-        panel('Activity', timeline(eventsFor({ leases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),
+        panel('Activity', timeline(eventsFor({ leases: allLeases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),
         { inline: true }) }
   ], { active: ctx.query?.tab, base: hrefFor('units', id) });
 
@@ -312,8 +327,16 @@ function tenantPage(tenant, s, ctx) {
   const overdue = unpaid.filter(i => i.due_date && i.due_date < today());
   const paid = s.collected;
   const activeLease = leases.find(l => l.status === 'Active');
+  // leases they live on without being billed: a flatmate, a spouse, family
+  const shared = store.sharedLeasesOf(id);
+  const sharedHome = activeLease ? null
+    : shared.find(x => x.lease.status === 'Active' && store.isLivingThere(x.occupant)) || null;
+  const allLeases = [...leases, ...shared.map(x => x.lease)].sort(newestFirst('start_date'));
   const depositHeld = leases.reduce((s, l) => s + store.depositLedger(l).held, 0);
-  const since = leases.length ? leases[leases.length - 1].start_date : tenant.created_at;
+  // the day they first lived anywhere with us, as primary tenant or not
+  const firstDay = [...leases.map(l => l.start_date),
+                    ...shared.map(x => x.occupant.move_in_date || x.lease.start_date)].filter(Boolean).sort()[0];
+  const since = firstDay || tenant.created_at;
   const left = activeLease?.end_date ? daysBetween(today(), activeLease.end_date) : null;
   const again = () => refreshView();
 
@@ -338,8 +361,13 @@ function tenantPage(tenant, s, ctx) {
         canPay(inv) ? el('button', { class: 'btn btn-ghost btn-sm', onClick: () => recordPaymentFor(inv, again) },
                          [icon('card', 14), ' Record payment']) : null
       ]))), { flush: true, count: unpaid.length }) : null,
+    sharedHome
+      ? notice([`Lives on ${sharedHome.lease.id} as ${sharedHome.occupant.role === 'Occupant' ? 'an occupant' : 'a co-tenant'}` +
+                (sharedHome.occupant.relationship ? ` (${sharedHome.occupant.relationship.toLowerCase()})` : '') +
+                ' — rent is billed to the primary tenant, ', ref('tenants', sharedHome.lease.tenant_id), '.'], 'info')
+      : null,
     el('div', { class: 'grid-2' }, [
-      panel('Current lease', activeLease ? leaseCard(activeLease) : el('div', { class: 'stack' }, [
+      panel('Current lease', activeLease ? leaseCard(activeLease) : sharedHome ? leaseCard(sharedHome.lease) : el('div', { class: 'stack' }, [
         el('p', { class: 'muted', text: 'No active lease.' }),
         store.can('manager') ? el('div', {}, [btn('New lease', 'plus', () => openEntityForm('leases', null,
           { overrides: { tenant_id: id }, onSaved: again }))]) : null
@@ -349,7 +377,19 @@ function tenantPage(tenant, s, ctx) {
           ['Unit', ref('units', activeLease.unit_id, { short: true })],
           ['Property', ref('properties', activeLease.property_id)],
           ['Deposit held', money(store.depositLedger(activeLease).held)],
-          ['Tenant since', since ? date(since) : null]
+          ['Tenant since', since ? date(since) : null],
+          store.currentOccupants(activeLease).length
+            ? ['Lives with', el('span', {}, store.currentOccupants(activeLease)
+                .flatMap((o, i) => [i ? ', ' : '', ref('tenants', o.tenant_id)]))]
+            : null
+        ])
+      ]) : sharedHome ? el('div', { class: 'stack' }, [
+        facts([
+          ['Unit', ref('units', sharedHome.lease.unit_id, { short: true })],
+          ['Property', ref('properties', sharedHome.lease.property_id)],
+          ['Role', badge(sharedHome.occupant.role)],
+          ['Primary tenant', ref('tenants', sharedHome.lease.tenant_id)],
+          ['Moved in', date(sharedHome.occupant.move_in_date || sharedHome.lease.start_date)]
         ])
       ]) : el('p', { class: 'muted', text: 'Not renting a unit right now.' }))
     ]),
@@ -368,7 +408,9 @@ function tenantPage(tenant, s, ctx) {
       render: () => invoiceTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-invoices' }) },
     { key: 'payments', label: 'Payments', count: counts.payments,
       render: () => paymentTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-payments' }) },
-    { key: 'leases', label: 'Leases', count: leases.length, render: () => leaseTable(leases, { hide: ['tenant_id'] }) },
+    // a shared lease names its primary tenant, so the column stays when there is one
+    { key: 'leases', label: 'Leases', count: allLeases.length,
+      render: () => leaseTable(allLeases, { hide: shared.length ? [] : ['tenant_id'] }) },
     { key: 'maintenance', label: 'Maintenance', count: counts.maintenance, render: () => ticketTable({ scope }) },
     { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
     { key: 'activity', label: 'Activity',
@@ -385,7 +427,10 @@ function tenantPage(tenant, s, ctx) {
     badges: [badge(tenant.status), overdue.length ? badge('Overdue', 'danger') : null],
     subtitle: activeLease
       ? [ref('units', activeLease.unit_id), ' · lease ', ref('leases', activeLease.id, { text: activeLease.id })]
-      : 'No active lease',
+      : sharedHome
+        ? [ref('units', sharedHome.lease.unit_id), ' · ', sharedHome.occupant.role.toLowerCase(), ' on ',
+           ref('leases', sharedHome.lease.id, { text: sharedHome.lease.id })]
+        : 'No active lease',
     meta: [
       copyable(id, { label: 'Tenant ID', mono: true }),
       tenant.phone ? [icon('phone', 14), copyable(tenant.phone, { label: 'Phone', href: telHref(tenant.phone) })] : null,
@@ -404,7 +449,7 @@ function tenantPage(tenant, s, ctx) {
       activeLease ? stat('Rent', money(store.currentRent(activeLease)), null, 'per month') : null,
       depositHeld ? stat('Deposit held', money(depositHeld)) : null,
       left !== null ? stat('Lease ends', date(activeLease.end_date), left < 45 ? 'warn' : null, `in ${left} days`) : null,
-      stat('Invoices', String(counts.invoices), null, `${leases.length} lease${leases.length === 1 ? '' : 's'}`)
+      stat('Invoices', String(counts.invoices), null, `${allLeases.length} lease${allLeases.length === 1 ? '' : 's'}`)
     ]),
     main: t.el,
     aside: [

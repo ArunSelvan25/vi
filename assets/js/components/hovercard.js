@@ -34,15 +34,18 @@ const person = (name) => el('div', { class: 'avatar-tile avatar-sm avatar-person
 /** Per collection: what the card says. Each returns { lead, title, sub, badge, rows }. */
 const CARDS = {
   tenants(t) {
-    const lease = store.leases.find(l => l.tenant_id === t.id && l.status === 'Active');
+    // the lease they hold, or the one they share with its primary tenant
+    const home = store.homeOf(t.id);
+    const lease = home && home.role === 'Primary' ? home.lease : null;
     const owed = store.owedBy('tenants', t.id);
     return {
       lead: person(t.full_name), title: t.full_name,
-      sub: lease ? store.label('units', lease.unit_id) : 'No active lease',
+      sub: home ? store.label('units', home.lease.unit_id) + (lease ? '' : ' · ' + home.role.toLowerCase()) : 'No active lease',
       badge: t.status,
       rows: [
         row('Phone', t.phone), row('Email', t.email),
         lease ? row('Rent', money(store.currentRent(lease)) + ' / mo') : null,
+        home && !lease ? row('Rent billed to', store.label('tenants', home.lease.tenant_id)) : null,
         row('Outstanding', el('span', { class: owed > 0 ? 'neg' : 'pos', text: money(owed) }))
       ]
     };
@@ -85,6 +88,7 @@ const CARDS = {
       sub: store.label('tenants', l.tenant_id), badge: l.status,
       rows: [
         row('Unit', store.label('units', l.unit_id)),
+        store.currentOccupants(l).length ? row('Occupants', store.occupantNames(l).join(', ')) : null,
         row('Term', `${date(l.start_date)} – ${date(l.end_date)}`),
         row('Rent', money(store.currentRent(l)) + ' / mo' + (l.frequency && l.frequency !== 'Monthly' ? ` · billed ${l.frequency.toLowerCase()}` : '')),
         l.rent_day ? row('Rent day', rentDayLabel(l.rent_day)) : null,
