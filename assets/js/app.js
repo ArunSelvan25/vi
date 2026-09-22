@@ -1,5 +1,6 @@
 import { el, icon, toast, clear, skeletonDashboard } from './ui.js';
 import { config } from './config.js';
+import { api } from './api.js';
 import { store } from './store.js';
 import { start, navigate, parseHash } from './router.js';
 import { crudView } from './views/crud.js';
@@ -58,6 +59,20 @@ function applyTheme() {
   document.documentElement.dataset.theme = config.theme;
 }
 
+/**
+ * End the session on the server as well, so the token stops working now rather
+ * than when it expires. Offline, or if the server is slow, the device is still
+ * signed out; that token then lapses on its own.
+ */
+async function signOut() {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 5000);
+  try { await api('logout', {}, { signal: ctl.signal }); } catch (e) { /* signed out locally regardless */ }
+  clearTimeout(timer);
+  config.clearSession();
+  location.reload();
+}
+
 function shell() {
   const user = config.user || {};
   const sidebar = el('aside', { class: 'sidebar', id: 'sidebar' }, [
@@ -87,7 +102,7 @@ function shell() {
       ]),
       el('button', {
         class: 'icon-btn', title: 'Sign out',
-        onClick: () => { config.clearSession(); location.reload(); }
+        onClick: signOut
       }, [icon('logout', 18)])
     ])
   ]);
@@ -141,8 +156,6 @@ function render() {
     a.classList.toggle('active', active);
     if (active) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
-  const titleEl = layout.querySelector('#page-title');
-  if (titleEl) titleEl.textContent = PAGE_TITLES[ctx.path] || '';
   const main = layout.querySelector('#main');
   clear(main);
   const handler = routeHandler(ctx.path);
@@ -156,13 +169,26 @@ function render() {
     ]));
   }
   main.scrollTop = 0;
+  settle();
+}
+
+/**
+ * Title the page and watch its heading. Runs again when a page that waited
+ * for its data arrives (`view:ready`), since only then does it have a heading.
+ */
+function settle() {
+  if (!layout || !layout.isConnected) return;
+  const ctx = parseHash();
+  const main = layout.querySelector('#main');
+  const titleEl = layout.querySelector('#page-title');
   // a record's page is titled by the record, not by the list it belongs to
   const recordTitle = ctx.id ? main.querySelector('.detail-head h1')?.textContent : '';
-  if (titleEl && recordTitle) titleEl.textContent = recordTitle;
-  watchHeading(main, layout.querySelector('#page-title'));
+  if (titleEl) titleEl.textContent = recordTitle || PAGE_TITLES[ctx.path] || '';
+  watchHeading(main, titleEl);
   document.title = (recordTitle || PAGE_TITLES[ctx.path] || 'Not found') + ' · ' +
     (store.settings.org_name || 'Property Manager');
 }
+document.addEventListener('view:ready', settle);
 
 let headingObserver = null;
 

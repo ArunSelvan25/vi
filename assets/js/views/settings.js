@@ -164,7 +164,27 @@ export function settingsView() {
           close();
         }
       })
-    }, ['Change password'])
+    }, ['Change password']),
+    el('button', {
+      class: 'btn btn-ghost',
+      onClick: async () => {
+        const ok = await confirmDialog({
+          title: 'Sign out other devices?',
+          message: 'Every other phone or computer signed in as you is signed out now. This device stays signed in.',
+          confirmLabel: 'Sign them out'
+        });
+        if (!ok) return;
+        try {
+          const res = await api('endSessions', {});
+          // this device's own session ended with the rest; keep the replacement
+          if (res && res.token) {
+            config.token = res.token;
+            if (res.user) config.user = res.user;
+          }
+          toast('Other devices signed out', 'ok');
+        } catch (err) { toast(err.message, 'danger'); }
+      }
+    }, ['Sign out other devices'])
   ])));
 
   // ── users (admin only) ──────────────────────────────────────────────────
@@ -220,6 +240,21 @@ export function settingsView() {
               }
             })
           }, ['Role']),
+          isMe ? null : el('button', {
+            class: 'btn btn-ghost btn-sm', title: 'End every session this user has open',
+            onClick: async () => {
+              const ok = await confirmDialog({
+                title: 'Sign out ' + (u.name || u.phone) + '?',
+                message: 'They are signed out on every device now, and can sign in again with their password.',
+                confirmLabel: 'Sign out'
+              });
+              if (!ok) return;
+              try {
+                await api('endSessions', { id: u.id });
+                toast((u.name || u.phone) + ' signed out everywhere', 'ok');
+              } catch (err) { toast(err.message, 'danger'); }
+            }
+          }, ['Sign out']),
           isMe ? null : el('button', {
             class: 'btn btn-ghost btn-sm' + (disabled ? '' : ' danger-text'),
             onClick: async () => {
@@ -282,10 +317,11 @@ export function settingsView() {
         el('span', { text: 'API endpoint' }),
         el('code', { class: 'mono-sm', text: config.apiUrl.slice(0, 60) + '…' })
       ]),
+      // invoices, payments and the rest load a page at a time and are not kept
       el('div', { class: 'kv' }, [
-        el('span', { text: 'Records cached' }),
-        el('strong', { text: String(['properties', 'units', 'tenants', 'leases', 'invoices', 'payments',
-          'maintenance', 'expenses', 'documents'].reduce((s, k) => s + store[k].length, 0)) })
+        el('span', { text: 'Kept on this device' }),
+        el('strong', { text: String(['properties', 'units', 'tenants', 'leases']
+          .reduce((s, k) => s + store[k].length, 0)) + ' properties, units, tenants and leases' })
       ])
     ]),
     el('div', { class: 'btn-row' }, [
@@ -293,7 +329,7 @@ export function settingsView() {
         class: 'btn btn-ghost',
         onClick: async (e) => {
           e.target.disabled = true;
-          try { const r = await api('refreshStatuses', { withSnapshot: true }); await store.syncFrom(r);
+          try { const r = await store.act('refreshStatuses', {});
                 toast(`${r.changes} row(s) synced`, 'ok'); }
           catch (err) { toast(err.message, 'danger'); }
           finally { e.target.disabled = false; }
@@ -315,17 +351,51 @@ export function settingsView() {
   ])));
 
   // ── audit trail ─────────────────────────────────────────────────────────
-  if (store.activity.length && store.can('manager')) {
-    wrap.append(panel('Recent activity',
-      el('ul', { class: 'list list-compact' }, store.activity.slice(0, 40).map(a =>
-        el('li', { class: 'list-row' }, [
-          el('span', {}, [
-            el('code', { class: 'mono-sm', text: a.action }), ' ',
-            el('span', { text: `${a.entity} ${a.entity_id || ''}` })
-          ]),
-          el('small', { class: 'muted', text: `${a.actor} · ${String(a.timestamp).replace('T', ' ')}` })
-        ])))));
-  }
+  // newest first, a page at a time from the server
+  if (store.can('manager')) wrap.append(activityPanel());
 
   return wrap;
+}
+
+const ACTIVITY_PAGE = 40;
+
+/** The audit trail, newest first, with the next page on request. */
+function activityPanel() {
+  const list = el('ul', { class: 'list list-compact' });
+  const more = el('button', { class: 'btn btn-ghost btn-sm', type: 'button', hidden: true }, ['Show more']);
+  const count = el('span', { class: 'panel-count' });
+  const status = el('p', { class: 'muted small' });
+  let page = 0;
+
+  const entry = (a) => el('li', { class: 'list-row' }, [
+    el('span', {}, [
+      el('code', { class: 'mono-sm', text: a.action }), ' ',
+      el('span', { text: `${a.entity || ''} ${a.entity_id || ''}` })
+    ]),
+    el('small', { class: 'muted', text: `${a.actor} · ${String(a.timestamp).replace('T', ' ')}` })
+  ]);
+
+  async function next() {
+    more.disabled = true;
+    status.textContent = 'Loading…';
+    try {
+      const res = await store.page('activity', { page: page + 1, pageSize: ACTIVITY_PAGE });
+      page = res.page;
+      res.rows.forEach(a => list.append(entry(a)));
+      count.textContent = String(res.total);
+      status.textContent = res.total ? '' : 'Nothing recorded yet.';
+      more.hidden = page * ACTIVITY_PAGE >= res.total;
+    } catch (err) {
+      status.textContent = 'Could not load the activity: ' + err.message;
+    } finally {
+      more.disabled = false;
+    }
+  }
+  more.addEventListener('click', next);
+  next();
+
+  return el('section', { class: 'panel' }, [
+    el('header', { class: 'panel-head' }, [el('h3', {}, ['Recent activity', count])]),
+    el('div', { class: 'panel-body' }, [list, status, more])
+  ]);
 }

@@ -1,4 +1,4 @@
-import { el, icon, money, num, date, badge, debounce, downloadCsv, emptyState, isoDate, safeUrl } from '../ui.js';
+import { el, icon, money, num, date, badge, debounce, downloadCsv, emptyState, isoDate, safeUrl, toast } from '../ui.js';
 import { store } from '../store.js';
 import { entities, tableFields } from '../schema.js';
 import { DETAIL_ENTITIES, ref, copyable } from './detail.js';
@@ -57,25 +57,36 @@ function isStatusField(field) {
 /**
  * Generic sortable / searchable / filterable table with paging, CSV export
  * and row actions. Used by every list view.
+ *
+ * Two ways to fill it:
+ *   rows     the rows themselves — for the small tables the browser keeps
+ *   source   { scope, preset, filters } — the server searches, filters, sorts
+ *            and pages (store.page), and the table only ever holds one page.
+ *            An export asks for every matching row.
+ *
+ * @param onTotal called with the number of matching rows after each load
  */
 export function dataTable({
   entity,
   rows,
+  source,
   columns,
   onRowClick,
   actions = [],
   emptyMessage = 'Nothing here yet.',
   filters = [],
-  exportName
+  exportName,
+  onTotal
 }) {
   const def = entities[entity];
   const cols = columns || tableFields(entity);
+  const remote = !!source;
   const state = { q: '', sort: null, dir: 1, page: 1, facets: {} };
 
-  const host = el('div', { class: 'table-wrap' });
+  const host = el('div', { class: 'table-wrap' + (remote ? ' is-remote' : '') });
   const searchInput = el('input', {
     class: 'input search-input', type: 'search', placeholder: `Search ${def.title.toLowerCase()}…`,
-    onInput: debounce(e => { state.q = e.target.value.toLowerCase(); state.page = 1; draw(); }, 200)
+    onInput: debounce(e => { state.q = e.target.value.trim().toLowerCase(); state.page = 1; draw(); }, remote ? 300 : 200)
   });
 
   const facetBar = el('div', { class: 'facets' });
@@ -88,17 +99,23 @@ export function dataTable({
     facetBar.append(select);
   }
 
+  const exportBtn = el('button', {
+    class: 'btn btn-ghost btn-sm', type: 'button', title: 'Export matching rows to CSV',
+    onClick: async () => {
+      const name = (exportName || def.title.toLowerCase()) + '-' + isoDate() + '.csv';
+      const columnsOut = cols.map(c => ({ label: c.label, value: r => cellValue(c, r) }));
+      if (!remote) { downloadCsv(name, filtered(), columnsOut); return; }
+      exportBtn.disabled = true;
+      try { downloadCsv(name, await store.everything(entity, query()), columnsOut); }
+      catch (err) { toast(err.message, 'danger'); }
+      finally { exportBtn.disabled = false; }
+    }
+  }, [icon('download', 15), ' CSV']);
+
   const toolbar = el('div', { class: 'table-toolbar' }, [
     el('div', { class: 'search-box' }, [icon('search', 16), searchInput]),
     facetBar,
-    el('button', {
-      class: 'btn btn-ghost btn-sm', type: 'button', title: 'Export visible rows to CSV',
-      onClick: () => downloadCsv(
-        (exportName || def.title.toLowerCase()) + '-' + isoDate() + '.csv',
-        filtered(),
-        cols.map(c => ({ label: c.label, value: r => cellValue(c, r) }))
-      )
-    }, [icon('download', 15), ' CSV'])
+    exportBtn
   ]);
 
   const tableEl = el('table', { class: 'data-table' });
@@ -112,6 +129,18 @@ export function dataTable({
 
   host.append(toolbar, scrollEl, emptyHost,
               el('div', { class: 'table-foot' }, [info, pager]));
+
+  const narrowed = () => !!state.q || Object.values(state.facets).some(Boolean);
+
+  /** What the server is asked for: the table's own limits, then the reader's. */
+  function query() {
+    const facets = Object.fromEntries(Object.entries(state.facets).filter(([, v]) => v));
+    return {
+      scope: source.scope, preset: source.preset,
+      filters: { ...(source.filters || {}), ...facets },
+      q: state.q, sort: state.sort || undefined, dir: state.dir === 1 ? 'asc' : 'desc'
+    };
+  }
 
   function filtered() {
     let out = rows.slice();
@@ -138,11 +167,45 @@ export function dataTable({
     return out;
   }
 
+  // a newer request supersedes one still in flight
+  let requestNo = 0;
+
   function draw() {
-    const all = filtered();
-    const pages = Math.max(1, Math.ceil(all.length / PAGE_SIZE));
-    state.page = Math.min(state.page, pages);
-    const page = all.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
+    if (!remote) {
+      const all = filtered();
+      const pages = Math.max(1, Math.ceil(all.length / PAGE_SIZE));
+      state.page = Math.min(state.page, pages);
+      render(all.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE), all.length);
+      return;
+    }
+    const mine = ++requestNo;
+    host.classList.add('is-loading');
+    host.setAttribute('aria-busy', 'true');
+    store.page(entity, { ...query(), page: state.page, pageSize: PAGE_SIZE })
+      .then(res => {
+        if (mine !== requestNo) return;
+        state.page = res.page;
+        render(res.rows, res.total);
+        if (onTotal) onTotal(res.total, narrowed());
+      })
+      .catch(err => {
+        if (mine !== requestNo) return;
+        scrollEl.hidden = true;
+        emptyHost.hidden = false;
+        emptyHost.textContent = '';
+        emptyHost.append(el('p', { class: 'form-error', text: 'Could not load ' + def.title.toLowerCase() + ': ' + err.message }));
+        info.textContent = '';
+      })
+      .finally(() => {
+        if (mine !== requestNo) return;
+        host.classList.remove('is-loading');
+        host.removeAttribute('aria-busy');
+      });
+  }
+
+  /** Draw one page of rows, out of `total` that match. */
+  function render(page, total) {
+    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
     tableEl.textContent = '';
     const head = el('tr');
@@ -153,6 +216,7 @@ export function dataTable({
         class: 'sortable' + (active ? ' sorted' : ''),
         onClick: () => {
           if (state.sort === c.key) state.dir *= -1; else { state.sort = c.key; state.dir = 1; }
+          state.page = 1;
           draw();
         }
       }, [c.label, active ? (state.dir === 1 ? ' ▲' : ' ▼') : '']));
@@ -161,12 +225,13 @@ export function dataTable({
     tableEl.append(el('thead', {}, [head]));
 
     emptyHost.textContent = '';
-    if (!all.length) {
+    if (!total) {
       // Column headers over nothing are noise, and they are what forced the
       // sideways scrollbar on an empty table.
       scrollEl.hidden = true;
       emptyHost.hidden = false;
-      emptyHost.append(emptyState(rows.length ? 'No rows match your filters.' : emptyMessage));
+      const anyRows = remote ? narrowed() : rows.length;
+      emptyHost.append(emptyState(anyRows ? 'No rows match your filters.' : emptyMessage));
     } else {
       scrollEl.hidden = false;
       emptyHost.hidden = true;
@@ -197,8 +262,8 @@ export function dataTable({
       tableEl.append(body);
     }
 
-    info.textContent = all.length
-      ? `${(state.page - 1) * PAGE_SIZE + 1}–${Math.min(state.page * PAGE_SIZE, all.length)} of ${all.length}`
+    info.textContent = total
+      ? `${(state.page - 1) * PAGE_SIZE + 1}–${Math.min(state.page * PAGE_SIZE, total)} of ${total}`
       : '0 rows';
 
     pager.textContent = '';
@@ -213,6 +278,11 @@ export function dataTable({
     }
   }
 
+  if (remote) {
+    // nothing to show until the first page arrives
+    scrollEl.hidden = true;
+    emptyHost.append(el('div', { class: 'loading' }, [el('div', { class: 'spinner' }), el('span', { text: 'Loading…' })]));
+  }
   draw();
   return host;
 }

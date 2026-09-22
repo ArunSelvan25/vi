@@ -1316,3 +1316,8 @@ a.rec-row:hover { background: var(--surface-2); text-decoration: none; }
   }
   .toasts { bottom: max(var(--s4), var(--safe-bottom)); }
 }
+
+/* ── server-paged tables and pages drawn once their data arrives ─────────── */
+.table-wrap.is-loading .table-scroll { opacity: .55; transition: opacity .15s ease; }
+.awaiting .loading { padding: var(--s7) 0; justify-content: center; }
+.load-error { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s2); padding: var(--s4) 0; }

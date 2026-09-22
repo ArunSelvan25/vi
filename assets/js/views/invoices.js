@@ -15,10 +15,20 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
  * own GST rate, because rent on a shop and the electricity passed through with
  * it are taxed differently.
  */
-export function openInvoiceForm(invoice = null, { onSaved } = {}) {
+export async function openInvoiceForm(invoice = null, { onSaved, items } = {}) {
+  // an invoice being edited opens with its line items: the ones its page
+  // already has, or else fetched now
+  let existing = [];
+  if (invoice) {
+    try { existing = items || (await store.detail('invoices', invoice.id)).items || []; }
+    catch (err) { toast(err.message, 'danger'); return null; }
+  }
+  return invoiceForm(invoice, existing, { onSaved });
+}
+
+function invoiceForm(invoice, existing, { onSaved } = {}) {
   const isEdit = !!invoice;
   const isDraft = isEdit && invoice.status === 'Draft';
-  const existing = isEdit ? store.itemsOfInvoice(invoice.id) : [];
   const defaultRate = Number(store.settings.default_gst_rate || 0);
   // an invoice from before line rates keeps its flat, typed tax
   const legacyTax = isEdit && Number(invoice.tax) > 0 && !existing.some(i => Number(i.tax_rate) > 0);
@@ -245,7 +255,7 @@ export function recordPaymentFor(invoice, onDone) {
       const res = await store.act('recordPayment', { invoice_id: invoice.id, ...data });
       close();
       toast('Payment recorded', 'ok', 6000, res.payment
-        ? { label: 'Receipt', onClick: () => showReceipt(store.byId('payments', res.payment.id) || res.payment) }
+        ? { label: 'Receipt', onClick: () => showReceipt(res.payment) }
         : null);
       onDone?.(res);
     }
@@ -300,13 +310,21 @@ export function invoiceMessage(invoice) {
   return lines.filter(l => l !== null).join('\n');
 }
 
-/** Printable invoice / receipt in a modal — uses the browser's own print. */
-export function showInvoice(invoice) {
+/**
+ * Printable invoice / receipt in a modal — uses the browser's own print.
+ * @param related its `items` and `payments`, when the caller has them already
+ */
+export async function showInvoice(invoice, related = null) {
+  let payments, lines;
+  try {
+    const d = related || await store.detail('invoices', invoice.id);
+    payments = d.payments || [];
+    lines = d.items || [];
+    if (d.row) invoice = d.row;
+  } catch (err) { toast(err.message, 'danger'); return; }
   const tenant = tenantOf(invoice);
   const unit = store.byId('units', invoice.unit_id);
   const property = store.byId('properties', invoice.property_id);
-  const payments = store.paymentsOfInvoice(invoice.id);
-  const lines = store.itemsOfInvoice(invoice.id);
   const s = store.settings;
   const gstLines = lines.some(it => Number(it.tax_rate) > 0);
   // a registered supplier charging GST issues a "Tax invoice", by that name
@@ -429,13 +447,16 @@ export function showInvoice(invoice) {
 }
 
 /** A printable receipt for one payment, with what is still owed after it. */
-export function showReceipt(payment) {
+export async function showReceipt(payment) {
+  let invoice = null;
+  try { invoice = payment.invoice_id ? await store.fetchRow('invoices', payment.invoice_id) : null; }
+  catch (err) { toast(err.message, 'danger'); return; }
   const s = store.settings;
   const tenant = tenantOf(payment);
-  const invoice = store.byId('invoices', payment.invoice_id);
   const property = store.byId('properties', payment.property_id);
   const deposit = invoice?.type === 'Deposit';
-  const owedNow = store.arrears(i => i.tenant_id === payment.tenant_id)[0]?.balance || 0;
+  // everything the tenant still owes, as the server last worked it out
+  const owedNow = store.owedBy('tenants', payment.tenant_id);
 
   const kv = (k, v) => v ? el('div', { class: 'kv' }, [el('span', { text: k }), el('strong', { text: v })]) : null;
   const doc = el('div', { class: 'invoice-doc', id: 'printable' }, [

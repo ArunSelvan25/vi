@@ -5,6 +5,8 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Every action is pinned to a commit, not a tag: the deploy job holds the
+# Supabase access token and database password, and a tag can be moved.
 permissions:
   contents: read
   pages: write
@@ -34,13 +36,15 @@ jobs:
       # the runner ships with Chrome pre-installed
       CHROME_PATH: /usr/bin/google-chrome
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - run: npm install --no-audit --no-fund
       - name: Billing logic tests
         run: npm run test:backend
+      - name: Server-side paging tests
+        run: npm run test:paging
       - name: Security tests
         run: npm run test:security
       - name: Production-readiness tests
@@ -68,7 +72,7 @@ jobs:
       SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
       SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Stop rather than publish a site ahead of a database it has not updated.
       - name: Check the Supabase secrets are set
         run: |
@@ -80,7 +84,7 @@ jobs:
             echo "::error::Add these repository secrets (Settings → Secrets and variables → Actions):$missing"
             exit 1
           fi
-      - uses: supabase/setup-cli@v1
+      - uses: supabase/setup-cli@ab058987d8d6c725971f6cf9d0b5c98467e30bd1 # v1.7.1
         with:
           version: 2.117.0
       - name: Migrations waiting to run
@@ -97,8 +101,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       # Optional: set a VIPM_API_URL repository secret to skip the setup wizard
@@ -113,10 +117,10 @@ jobs:
       # release up instead of serving the last one from cache.
       - name: Stamp service worker build
         run: node scripts/stamp-build.mjs
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
           # the whole repo is the site — there is no build step
           path: .
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4

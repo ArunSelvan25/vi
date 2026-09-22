@@ -1,5 +1,5 @@
 import { el, icon, confirmDialog, toast } from '../ui.js';
-import { store } from '../store.js';
+import { store, REMOTE } from '../store.js';
 import { entities, tableFields, fieldByKey } from '../schema.js';
 import { dataTable } from '../components/table.js';
 import { openEntityForm } from '../components/form.js';
@@ -56,11 +56,23 @@ export function crudView(entity, {
     }
   ];
 
+  // a growing table is paged by the server, which says how many rows it has
+  const remote = REMOTE.has(entity);
+  const countText = (n) => n === null ? '' : `${n} record${n === 1 ? '' : 's'}`;
+
   function rerender() {
     wrap.textContent = '';
-    const recordCount = store[entity].length;
+    const recordCount = remote ? null : store[entity].length;
+    const pill = el('span', { class: 'page-pill' }, [countText(recordCount)]);
+    const sub = el('p', { class: 'muted', text: recordCount === null ? '' : `${countText(recordCount)} in this workspace` });
+    // shown once the first page (unfiltered) says how many there are
+    const onTotal = (total, narrowed) => {
+      if (narrowed) return;
+      pill.textContent = countText(total);
+      sub.textContent = `${countText(total)} in this workspace`;
+    };
     const quickMeta = [
-      el('span', { class: 'page-pill' }, [recordCount + ' record' + (recordCount === 1 ? '' : 's')]),
+      pill,
       store.can('manager') ? el('span', { class: 'page-pill page-pill-ok' }, ['Ready to update']) : null
     ];
 
@@ -76,7 +88,7 @@ export function crudView(entity, {
       el('div', { class: 'view-head' }, [
         el('div', {}, [
           el('h1', { text: def.title }),
-          el('p', { class: 'muted', text: `${recordCount} record${recordCount === 1 ? '' : 's'} in this workspace` })
+          sub
         ]),
         el('div', { class: 'head-actions' }, [
           ...headerActions,
@@ -90,7 +102,7 @@ export function crudView(entity, {
       ]),
       dataTable({
         entity,
-        rows: store[entity],
+        ...(remote ? { source: {}, onTotal } : { rows: store[entity] }),
         columns: columns || tableFields(entity),
         filters,
         actions,

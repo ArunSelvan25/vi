@@ -312,6 +312,7 @@ npm test          # everything below
 | Suite | What it proves |
 |---|---|
 | `test:backend` | Rent periods, rent-day cycles and part months, late-fee grace |
+| `test:paging` | Server-side paging, search and scopes, and every server-computed figure checked against the old in-browser arithmetic |
 | `test:security` | The attacks above, and that accounts with older password hashes still sign in |
 | `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, a failed request leaving nothing behind |
 | `test:http` | The HTTP surface, the cron secret, and that the public REST roles can reach no table |

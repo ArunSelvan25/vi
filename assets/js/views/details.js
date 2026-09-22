@@ -1,5 +1,5 @@
 import { el, icon, money, date, badge, daysBetween, today, modal, whatsappLink,
-         printDocument, isoDate } from '../ui.js';
+         printDocument, isoDate, toast } from '../ui.js';
 import { store } from '../store.js';
 import { navigate, refreshView } from '../router.js';
 import { dataTable } from '../components/table.js';
@@ -8,10 +8,10 @@ import { barChart } from '../components/charts.js';
 import { tableFields } from '../schema.js';
 import { detailPage, stat, statRow, panel, props, facts, notice, tabs, recordList, invoiceRow, paymentRow,
          leaseRow, ticketRow, documentRow, termProgress, timeline, eventsFor, ref, copyable, avatar,
-         hrefFor } from '../components/detail.js';
+         hrefFor, awaiting } from '../components/detail.js';
 import { recordPaymentFor } from './invoices.js';
-import { OPEN, sum, newestFirst, owed, canPay, country, telHref, btn, managerBtn, linkBtn, viewAll, missing,
-         deleteBtn, docsFor, invoiceTable, paymentTable, leaseTable, ticketTable, expenseTable, documentTable,
+import { OPEN, sum, newestFirst, canPay, country, telHref, btn, managerBtn, linkBtn, viewAll, missing,
+         deleteBtn, invoiceTable, paymentTable, leaseTable, ticketTable, expenseTable, documentTable,
          expenseRow, tenantCard, leaseCard } from './records.js';
 
 const byUnitNumber = (a, b) => String(a.unit_number).localeCompare(String(b.unit_number), undefined, { numeric: true });
@@ -23,7 +23,7 @@ const ACTIVE_TICKET = ['Open', 'In Progress', 'On Hold'];
 function unitTile(u) {
   const lease = store.activeLeaseForUnit(u.id);
   const tenant = lease ? store.byId('tenants', lease.tenant_id) : null;
-  const due = owed(store.invoices.filter(i => i.unit_id === u.id));
+  const due = store.owedBy('units', u.id);
   const open = () => navigate('units/' + u.id);
   return el('div', {
     class: 'unit-card clickable', role: 'link', tabindex: '0', 'aria-label': 'Unit ' + u.unit_number,
@@ -52,24 +52,23 @@ function unitTile(u) {
 export function propertyDetail(id, ctx = {}) {
   const property = store.byId('properties', id);
   if (!property) return missing('properties');
+  return awaiting(() => store.detail('properties', id), (summary) => propertyPage(property, summary, ctx));
+}
 
+/** @param s the property's summary from the server (store.detail) */
+function propertyPage(property, s, ctx) {
+  const id = property.id;
+  const scope = { kind: 'property', id };
   const units = store.unitsOfProperty(id).slice().sort(byUnitNumber);
-  const unitIds = units.map(u => u.id);
   const leases = store.leases.filter(l => l.property_id === id);
-  const leaseIds = leases.map(l => l.id);
-  const invoices = store.invoices.filter(i => i.property_id === id);
-  const payments = store.payments.filter(p => p.property_id === id).sort(newestFirst('payment_date'));
-  const expenses = store.expenses.filter(e => e.property_id === id).sort(newestFirst('date'));
-  const tickets = store.maintenance.filter(m => m.property_id === id);
-  const openTickets = tickets.filter(t => ACTIVE_TICKET.includes(t.status));
-  const docs = [...docsFor('Property', id), ...docsFor('Unit', unitIds), ...docsFor('Lease', leaseIds)];
+  const counts = s.counts;
 
-  // deposits are held for tenants, so neither receiving nor returning one is income or spend
-  const collected = sum(store.incomePayments(payments));
-  // a completed ticket's cost is written to Expenses, so it is already counted
-  const spent = sum(store.operatingExpenses(expenses));
-  const depositsHeld = leases.reduce((s, l) => s + store.depositLedger(l).held, 0);
-  const outstanding = owed(invoices);
+  // deposits are held for tenants, so neither receiving nor returning one is
+  // income or spend; a completed ticket's cost is already an expense
+  const collected = s.collected;
+  const spent = s.spent;
+  const depositsHeld = leases.reduce((sum, l) => sum + store.depositLedger(l).held, 0);
+  const outstanding = s.outstanding;
   const occupied = units.filter(u => u.status === 'Occupied').length;
   const vacant = units.filter(u => u.status === 'Vacant').length;
   const occPct = units.length ? Math.round(occupied / units.length * 100) : 0;
@@ -92,20 +91,20 @@ export function propertyDetail(id, ctx = {}) {
         : null
     }),
     el('div', { class: 'grid-2' }, [
-      panel('Collected vs spent', barChart(store.monthlySeries(6, { match: r => r.property_id === id }), { height: 200 })),
-      panel('Open maintenance', recordList(openTickets, ticketRow, { limit: 6, empty: 'Nothing open.' }), {
-        flush: true, count: openTickets.length,
-        action: tickets.length ? viewAll(() => t.select('maintenance')) : null
+      panel('Collected vs spent', barChart(store.labelSeries(s.series), { height: 200 })),
+      panel('Open maintenance', recordList(s.openTickets, ticketRow, { limit: 6, empty: 'Nothing open.' }), {
+        flush: true, count: counts.openTickets,
+        action: counts.maintenance ? viewAll(() => t.select('maintenance')) : null
       })
     ]),
     el('div', { class: 'grid-2' }, [
-      panel('Recent payments', recordList(payments, paymentRow, { limit: 5, empty: 'No payments yet.' }), {
-        flush: true, count: payments.length,
-        action: payments.length > 5 ? viewAll(() => t.select('payments')) : null
+      panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }), {
+        flush: true, count: counts.payments,
+        action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null
       }),
-      panel('Recent expenses', recordList(expenses, expenseRow, { limit: 5, empty: 'No expenses recorded.' }), {
-        flush: true, count: expenses.length,
-        action: expenses.length > 5 ? viewAll(() => t.select('expenses')) : null
+      panel('Recent expenses', recordList(s.recentExpenses, expenseRow, { limit: 5, empty: 'No expenses recorded.' }), {
+        flush: true, count: counts.expenses,
+        action: counts.expenses > 5 ? viewAll(() => t.select('expenses')) : null
       })
     ])
   ]);
@@ -116,13 +115,13 @@ export function propertyDetail(id, ctx = {}) {
         entity: 'units', rows: units, columns: tableFields('units').filter(c => c.key !== 'property_id'),
         onRowClick: (r) => navigate('units/' + r.id), emptyMessage: 'No units yet.' }) },
     { key: 'leases', label: 'Leases', count: leases.length, render: () => leaseTable(leases, { hide: ['property_id'] }) },
-    { key: 'invoices', label: 'Invoices', count: invoices.length,
-      render: () => invoiceTable(invoices, { hide: ['property_id'], exportName: 'property-' + id + '-invoices' }) },
-    { key: 'payments', label: 'Payments', count: payments.length,
-      render: () => paymentTable(payments, { hide: ['property_id'], exportName: 'property-' + id + '-payments' }) },
-    { key: 'expenses', label: 'Expenses', count: expenses.length, render: () => expenseTable(expenses, { hide: ['property_id'] }) },
-    { key: 'maintenance', label: 'Maintenance', count: tickets.length, render: () => ticketTable(tickets, { hide: ['property_id'] }) },
-    { key: 'documents', label: 'Documents', count: docs.length, render: () => documentTable(docs) }
+    { key: 'invoices', label: 'Invoices', count: counts.invoices,
+      render: () => invoiceTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-invoices' }) },
+    { key: 'payments', label: 'Payments', count: counts.payments,
+      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-payments' }) },
+    { key: 'expenses', label: 'Expenses', count: counts.expenses, render: () => expenseTable({ scope }, { hide: ['property_id'] }) },
+    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance, render: () => ticketTable({ scope }, { hide: ['property_id'] }) },
+    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) }
   ], { active: ctx.query?.tab, base: hrefFor('properties', id) });
 
   return detailPage({
@@ -181,21 +180,20 @@ export function propertyDetail(id, ctx = {}) {
 export function unitDetail(id, ctx = {}) {
   const unit = store.byId('units', id);
   if (!unit) return missing('units');
+  return awaiting(() => store.detail('units', id), (summary) => unitPage(unit, summary, ctx));
+}
 
+/** @param s the unit's summary from the server (store.detail) */
+function unitPage(unit, s, ctx) {
+  const id = unit.id;
+  const scope = { kind: 'unit', id };
+  const counts = s.counts;
   const leases = store.leases.filter(l => l.unit_id === id).sort(newestFirst('start_date'));
-  const leaseIds = new Set(leases.map(l => l.id));
   const lease = store.activeLeaseForUnit(id);
   const upcoming = leases.find(l => l.status === 'Upcoming');
   const tenant = lease ? store.byId('tenants', lease.tenant_id) : null;
-  const invoices = store.invoices.filter(i => i.unit_id === id);
-  const invIds = new Set(invoices.map(i => i.id));
-  const payments = store.payments.filter(p => invIds.has(p.invoice_id) || (p.lease_id && leaseIds.has(p.lease_id)))
-    .sort(newestFirst('payment_date'));
-  const tickets = store.maintenance.filter(m => m.unit_id === id);
-  const openTickets = tickets.filter(m => ACTIVE_TICKET.includes(m.status));
-  const docs = [...docsFor('Unit', id), ...docsFor('Lease', [...leaseIds])];
-  const outstanding = owed(invoices);
-  const collected = sum(store.incomePayments(payments));
+  const outstanding = s.outstanding;
+  const collected = s.collected;
   const left = lease?.end_date ? daysBetween(today(), lease.end_date) : null;
   const lastEnded = !lease ? leases.find(l => ['Expired', 'Terminated'].includes(l.status) && l.end_date) : null;
   const again = () => refreshView();
@@ -217,29 +215,31 @@ export function unitDetail(id, ctx = {}) {
       panel('Current lease', lease ? leaseCard(lease) : el('p', { class: 'muted', text: 'No active lease.' }))
     ]),
     el('div', { class: 'grid-2' }, [
-      panel('Recent invoices', recordList(invoices.slice().sort(newestFirst('due_date')), invoiceRow,
+      panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices for this unit yet.' }),
-        { flush: true, count: invoices.length, action: invoices.length > 5 ? viewAll(() => t.select('invoices')) : null }),
-      panel('Recent payments', recordList(payments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: payments.length, action: payments.length > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: counts.invoices, action: counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+      panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
+        { flush: true, count: counts.payments, action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
     ]),
-    panel('Open maintenance', recordList(openTickets, ticketRow, { limit: 5, empty: 'Nothing open.' }),
-      { flush: true, count: openTickets.length, action: tickets.length ? viewAll(() => t.select('maintenance')) : null })
+    panel('Open maintenance', recordList(s.openTickets, ticketRow, { limit: 5, empty: 'Nothing open.' }),
+      { flush: true, count: counts.openTickets, action: counts.maintenance ? viewAll(() => t.select('maintenance')) : null })
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
-    { key: 'invoices', label: 'Invoices', count: invoices.length,
-      render: () => invoiceTable(invoices, { hide: ['property_id', 'unit_id'], exportName: 'unit-' + id + '-invoices' }) },
-    { key: 'payments', label: 'Payments', count: payments.length,
-      render: () => paymentTable(payments, { hide: ['property_id'], exportName: 'unit-' + id + '-payments' }) },
+    { key: 'invoices', label: 'Invoices', count: counts.invoices,
+      render: () => invoiceTable({ scope }, { hide: ['property_id', 'unit_id'], exportName: 'unit-' + id + '-invoices' }) },
+    { key: 'payments', label: 'Payments', count: counts.payments,
+      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'unit-' + id + '-payments' }) },
     { key: 'leases', label: 'Lease history', count: leases.length,
       render: () => leaseTable(leases, { hide: ['property_id', 'unit_id'] }) },
-    { key: 'maintenance', label: 'Maintenance', count: tickets.length,
-      render: () => ticketTable(tickets, { hide: ['property_id', 'unit_id'] }) },
-    { key: 'documents', label: 'Documents', count: docs.length, render: () => documentTable(docs) },
+    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance,
+      render: () => ticketTable({ scope }, { hide: ['property_id', 'unit_id'] }) },
+    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
     { key: 'activity', label: 'Activity',
-      render: () => panel('Activity', timeline(eventsFor({ leases, invoices, payments, tickets }))) }
+      render: () => awaiting(() => store.history('units', id), (h) =>
+        panel('Activity', timeline(eventsFor({ leases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),
+        { inline: true }) }
   ], { active: ctx.query?.tab, base: hrefFor('units', id) });
 
   const property = store.byId('properties', unit.property_id);
@@ -297,17 +297,20 @@ export function unitDetail(id, ctx = {}) {
 export function tenantDetail(id, ctx = {}) {
   const tenant = store.byId('tenants', id);
   if (!tenant) return missing('tenants');
+  return awaiting(() => store.detail('tenants', id), (summary) => tenantPage(tenant, summary, ctx));
+}
 
+/** @param s the tenant's summary from the server (store.detail) */
+function tenantPage(tenant, s, ctx) {
+  const id = tenant.id;
+  const scope = { kind: 'tenant', id };
+  const counts = s.counts;
   const leases = store.leases.filter(l => l.tenant_id === id).sort(newestFirst('start_date'));
-  const invoices = store.invoicesOfTenant(id);
-  const payments = store.payments.filter(p => p.tenant_id === id).sort(newestFirst('payment_date'));
-  const tickets = store.maintenance.filter(m => m.tenant_id === id);
-  const docs = [...docsFor('Tenant', id), ...docsFor('Lease', leases.map(l => l.id))];
-  const unpaid = invoices.filter(i => OPEN.includes(i.status) && Number(i.balance) > 0)
-    .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
-  const outstanding = owed(invoices);
+  // every unpaid invoice, oldest first
+  const unpaid = s.unpaid;
+  const outstanding = s.outstanding;
   const overdue = unpaid.filter(i => i.due_date && i.due_date < today());
-  const paid = sum(store.incomePayments(payments));
+  const paid = s.collected;
   const activeLease = leases.find(l => l.status === 'Active');
   const depositHeld = leases.reduce((s, l) => s + store.depositLedger(l).held, 0);
   const since = leases.length ? leases[leases.length - 1].start_date : tenant.created_at;
@@ -351,25 +354,27 @@ export function tenantDetail(id, ctx = {}) {
       ]) : el('p', { class: 'muted', text: 'Not renting a unit right now.' }))
     ]),
     el('div', { class: 'grid-2' }, [
-      panel('Recent invoices', recordList(invoices.slice().sort(newestFirst('due_date')), invoiceRow,
+      panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices yet.' }),
-        { flush: true, count: invoices.length, action: invoices.length > 5 ? viewAll(() => t.select('invoices')) : null }),
-      panel('Recent payments', recordList(payments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: payments.length, action: payments.length > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: counts.invoices, action: counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+      panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
+        { flush: true, count: counts.payments, action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
     ])
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
-    { key: 'invoices', label: 'Invoices', count: invoices.length,
-      render: () => invoiceTable(invoices, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-invoices' }) },
-    { key: 'payments', label: 'Payments', count: payments.length,
-      render: () => paymentTable(payments, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-payments' }) },
+    { key: 'invoices', label: 'Invoices', count: counts.invoices,
+      render: () => invoiceTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-invoices' }) },
+    { key: 'payments', label: 'Payments', count: counts.payments,
+      render: () => paymentTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-payments' }) },
     { key: 'leases', label: 'Leases', count: leases.length, render: () => leaseTable(leases, { hide: ['tenant_id'] }) },
-    { key: 'maintenance', label: 'Maintenance', count: tickets.length, render: () => ticketTable(tickets) },
-    { key: 'documents', label: 'Documents', count: docs.length, render: () => documentTable(docs) },
+    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance, render: () => ticketTable({ scope }) },
+    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
     { key: 'activity', label: 'Activity',
-      render: () => panel('Activity', timeline(eventsFor({ leases, invoices, payments, tickets }))) }
+      render: () => awaiting(() => store.history('tenants', id), (h) =>
+        panel('Activity', timeline(eventsFor({ leases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),
+        { inline: true }) }
   ], { active: ctx.query?.tab, base: hrefFor('tenants', id) });
 
   return detailPage({
@@ -395,11 +400,11 @@ export function tenantDetail(id, ctx = {}) {
     stats: statRow([
       stat('Outstanding', money(outstanding), outstanding > 0 ? 'danger' : 'ok',
            unpaid.length ? `${unpaid.length} unpaid invoice${unpaid.length === 1 ? '' : 's'}` : 'all settled'),
-      stat('Paid to date', money(paid), 'ok', `${payments.length} payment${payments.length === 1 ? '' : 's'}`),
+      stat('Paid to date', money(paid), 'ok', `${counts.payments} payment${counts.payments === 1 ? '' : 's'}`),
       activeLease ? stat('Rent', money(store.currentRent(activeLease)), null, 'per month') : null,
       depositHeld ? stat('Deposit held', money(depositHeld)) : null,
       left !== null ? stat('Lease ends', date(activeLease.end_date), left < 45 ? 'warn' : null, `in ${left} days`) : null,
-      stat('Invoices', String(invoices.length), null, `${leases.length} lease${leases.length === 1 ? '' : 's'}`)
+      stat('Invoices', String(counts.invoices), null, `${leases.length} lease${leases.length === 1 ? '' : 's'}`)
     ]),
     main: t.el,
     aside: [
@@ -412,7 +417,10 @@ export function tenantDetail(id, ctx = {}) {
         ['Tenant since', since ? date(since) : null]
       ])),
       panel('Identity', props([
-        [tenant.id_type || 'ID number', tenant.id_number ? copyable(tenant.id_number, { label: (tenant.id_type || 'ID') + ' number', mono: true }) : null],
+        // a viewer is sent the number masked by the server; nothing to copy
+        [tenant.id_type || 'ID number', !tenant.id_number ? null
+          : store.can('manager') ? copyable(tenant.id_number, { label: (tenant.id_type || 'ID') + ' number', mono: true })
+          : el('span', { class: 'mono', title: 'Only managers and administrators see the full number', text: tenant.id_number })],
         ['GSTIN', tenant.gstin ? copyable(tenant.gstin, { label: 'GSTIN', mono: true }) : null]
       ])),
       tenant.emergency_name || tenant.emergency_phone ? panel('Emergency contact', props([
@@ -432,7 +440,11 @@ export function tenantDetail(id, ctx = {}) {
  * deposit stands. Invoices are what is owed and payments what reduces it, so
  * the closing balance is exactly what the tenant's invoices still show.
  */
-export function showStatement(tenant) {
+export async function showStatement(tenant) {
+  // every invoice and payment the tenant has, which the statement's range picks from
+  let history;
+  try { history = await store.history('tenants', tenant.id); }
+  catch (err) { toast(err.message, 'danger'); return; }
   const s = store.settings;
   const first = new Date(); first.setMonth(first.getMonth() - 6); first.setDate(1);
   const state = { from: isoDate(first), to: today() };
@@ -446,13 +458,13 @@ export function showStatement(tenant) {
 
   function entries() {
     const out = [];
-    for (const inv of store.invoicesOfTenant(tenant.id)) {
+    for (const inv of history.invoices) {
       if (['Void', 'Draft'].includes(inv.status)) continue;
       out.push({ date: String(inv.issue_date || inv.due_date || '').slice(0, 10), kind: 'invoice',
                  text: `${inv.id} · ${inv.type || 'Invoice'}${inv.period_start ? ' · ' + date(inv.period_start) + ' – ' + date(inv.period_end) : ''}`,
                  debit: Number(inv.total || inv.amount || 0), credit: 0 });
     }
-    for (const p of store.payments.filter(x => x.tenant_id === tenant.id)) {
+    for (const p of history.payments) {
       out.push({ date: String(p.payment_date || '').slice(0, 10), kind: 'payment',
                  text: `${p.id} · ${p.method || 'Payment'}${p.reference && p.method !== 'Deposit Adjustment' ? ' · ' + p.reference : ''}` +
                        (p.invoice_id ? ' → ' + p.invoice_id : ''),

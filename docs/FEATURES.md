@@ -200,6 +200,10 @@
 - **Audit log** — every create, update, delete, payment, password reset and
   failed sign-in, with who and when.
 - Every table: full-text search, column sort, faceted filters, paging, CSV export.
+  Invoices, payments, expenses, maintenance, documents and the audit log are
+  paged by the server — searched, sorted and filtered there, a page at a time —
+  so signing in stays quick however much history builds up. Dashboard, report
+  and record-page figures are worked out on the server too.
 - Light and dark themes; works on phones and tablets.
 - **Installs as an app** — add it to a phone's home screen and it runs full
   screen with its own icon, opens instantly from an on-device cache, and starts

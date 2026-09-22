@@ -74,7 +74,8 @@ assets/
   js/
     app.js               shell, routing, boot sequence
     schema.js            ⭐ every entity definition — drives forms, tables, filters
-    store.js             client-side cache of the data, joins and derived views
+    store.js             the small tables (properties, units, tenants, leases) kept in
+                         the browser; pages and summaries of the rest from the API
     api.js               the API transport (text/plain POST, no CORS preflight)
     components/          form builder · data table · charts · record pages · hover cards
     views/               one module per screen
@@ -109,6 +110,7 @@ does live. Sign in with phone `9000012345` / password `password123`.
 | Suite | What it proves |
 |---|---|
 | `test:backend` | Rent periods, rent-day cycles and part months, late-fee grace |
+| `test:paging` | Server-side paging, search and scopes, and every server-computed figure checked against the old in-browser arithmetic |
 | `test:security` | Setup takeover, brute force, enumeration, forged tokens, role escalation |
 | `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, rollback |
 | `test:http` | The HTTP surface, and that Supabase's public REST roles can reach no table |

@@ -152,7 +152,7 @@ export function loginView(onSignedIn) {
       btn.disabled = true; btn.textContent = 'Signing in…';
       try {
         const data = await api('login', { phone: phone.value.trim(), password: password.value,
-                                          withSnapshot: true });
+                                          withSnapshot: true, lean: true });
         config.token = data.token;
         config.user = data.user;
         onSignedIn(data.snapshot);

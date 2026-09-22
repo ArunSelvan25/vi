@@ -2,6 +2,12 @@
 <html lang="en" data-theme="light">
 <head>
   <meta charset="utf-8">
+  <!-- GitHub Pages cannot send headers, so the policy lives here. Scripts come
+       only from this site: an injected script tag or inline handler never runs,
+       and the session token in localStorage stays out of reach. The API is the
+       Supabase function (the setup wizard accepts no other address). Inline styles
+       stay allowed because the UI sets widths and colours through them. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://*.supabase.co; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Property Manager</title>
   <meta name="description" content="Property and tenancy management: leases, rent, invoices and payments.">

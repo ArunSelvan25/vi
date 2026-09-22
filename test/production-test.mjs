@@ -918,9 +918,10 @@ await probe('the backend never drops, truncates or bulk-deletes tables', async (
   const banned = [/\btruncate\b/i, /\bdrop\s+(table|database|schema)\b/i, /\balter\s+table\b/i];
   const hits = banned.filter(re => re.test(code)).map(String);
   if (hits.length) return 'found: ' + hits.join(', ');
-  // deletes are by primary key, or confined to the audit trail and the sign-in throttle
+  // deletes are by primary key, or confined to the audit trail, the sign-in
+  // throttle and expired session revocations
   const deletes = [...code.matchAll(/delete from ([^\s`]+)/g)].map(m => m[1]);
-  const allowed = ['activity_log', 'login_throttle', '${r.tx(t.sql)}'];
+  const allowed = ['activity_log', 'login_throttle', 'revoked_sessions', '${r.tx(t.sql)}'];
   const other = deletes.filter(t => !allowed.includes(t));
   return other.length ? 'unexpected delete from: ' + other.join(', ') : null;
 });

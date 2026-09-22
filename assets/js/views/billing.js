@@ -1,11 +1,11 @@
-import { el, icon, money, date, toast, confirmDialog, today, addDays, whatsappLink } from '../ui.js';
+import { el, icon, money, toast, confirmDialog, today, whatsappLink } from '../ui.js';
 import { store } from '../store.js';
 import { tableFields, fieldByKey } from '../schema.js';
 import { navigate, refreshView } from '../router.js';
 import { dataTable } from '../components/table.js';
 import { tabs } from '../components/detail.js';
 import { openInvoiceForm, recordPaymentFor, showInvoice, voidInvoiceFor, invoiceMessage } from './invoices.js';
-import { OPEN, sum, newestFirst, canPay, country, paymentTable } from './records.js';
+import { canPay, country, paymentTable } from './records.js';
 
 /**
  * Billing: invoices and the payments received against them, on one screen.
@@ -18,34 +18,22 @@ import { OPEN, sum, newestFirst, canPay, country, paymentTable } from './records
  * same view.
  */
 
+/**
+ * Each figure is a filter the server applies by name (queries.js PRESETS):
+ * outstanding, overdue and due-this-week invoices, and the income collected
+ * this month (deposits are held for tenants, not earned).
+ */
 const FILTERS = {
-  outstanding: { tab: 'invoices', label: 'Outstanding', test: (i) => OPEN.includes(i.status) },
-  overdue: { tab: 'invoices', label: 'Overdue', test: (i) => OPEN.includes(i.status) && i.due_date && i.due_date < today() },
-  week: { tab: 'invoices', label: 'Due in the next 7 days',
-          test: (i) => OPEN.includes(i.status) && i.due_date >= today() && i.due_date <= addDays(today(), 7) },
+  outstanding: { tab: 'invoices', label: 'Outstanding' },
+  overdue: { tab: 'invoices', label: 'Overdue' },
+  week: { tab: 'invoices', label: 'Due in the next 7 days' },
   month: { tab: 'payments', label: 'Collected this month' }
 };
-
-const thisMonth = () => today().slice(0, 7);
-/** Deposits are held for tenants, not earned — the same rule as the dashboard. */
-const collectedThisMonth = () => store.incomePayments()
-  .filter(p => String(p.payment_date || '').slice(0, 7) === thisMonth());
-
-/** Invoices with the date their last payment came in, for the "Paid on" column. */
-function withLastPaid(invoices) {
-  const last = new Map();
-  for (const p of store.payments) {
-    if (!p.invoice_id) continue;
-    const d = String(p.payment_date || '');
-    if (d > (last.get(p.invoice_id) || '')) last.set(p.invoice_id, d);
-  }
-  return invoices.map(i => ({ ...i, last_paid: last.get(i.id) || '' }));
-}
 
 /**
  * Unit already names its property ("Sunrise Residency · A-101"), so the
  * Property column goes; the paid amount is total less balance, so "Paid"
- * gives way to when it was paid.
+ * gives way to when it was paid (the server works out `last_paid`).
  */
 function invoiceColumns() {
   const cols = tableFields('invoices').filter(c => !['property_id', 'amount_paid'].includes(c.key))
@@ -57,7 +45,8 @@ function invoiceColumns() {
 
 function invoiceActions() {
   const again = () => refreshView();
-  const invoiceOf = (row) => store.byId('invoices', row.id) || row;
+  // each row is the whole invoice, as the server sent it
+  const invoiceOf = (row) => row;
   const tenantOf = (row) => store.byId('tenants', row.tenant_id);
   return [
     { label: 'View / print', icon: 'receipt', onClick: (row) => showInvoice(invoiceOf(row)) },
@@ -150,11 +139,12 @@ export function billingView(ctx = {}) {
     return str ? '?' + str : '';
   })();
 
-  const invoices = store.invoices;
-  const outstanding = invoices.filter(FILTERS.outstanding.test);
-  const overdue = invoices.filter(FILTERS.overdue.test);
-  const week = invoices.filter(FILTERS.week.test);
-  const collected = collectedThisMonth();
+  const figures = store.billing;
+  const none = { count: 0, sum: 0 };
+  const outstanding = figures.outstanding || none;
+  const overdue = figures.overdue || none;
+  const week = figures.week || none;
+  const collected = figures.month || none;
 
   // a figure that is already the filter clears it; any other sets it
   const figure = (key, label, value, sub, tone) => {
@@ -181,17 +171,17 @@ export function billingView(ctx = {}) {
       ])
     : null;
 
-  const invoiceRows = withLastPaid(show && FILTERS[show].test ? invoices.filter(FILTERS[show].test) : invoices)
-    .sort(newestFirst('due_date'));
-  const paymentRows = (show === 'month' ? collected : store.payments).slice();
+  const invoicePreset = show && FILTERS[show].tab === 'invoices' ? show : undefined;
+  const invoiceCount = invoicePreset ? figures[invoicePreset]?.count ?? 0 : figures.invoices ?? 0;
+  const paymentCount = show === 'month' ? collected.count : figures.payments ?? 0;
 
   const t = tabs([
     {
-      key: 'invoices', label: 'Invoices', count: invoiceRows.length,
+      key: 'invoices', label: 'Invoices', count: invoiceCount,
       render: () => el('div', { class: 'tab-stack' }, [
         tab === 'invoices' ? filterChip : null,
         dataTable({
-          entity: 'invoices', rows: invoiceRows, columns: invoiceColumns(),
+          entity: 'invoices', source: { preset: invoicePreset }, columns: invoiceColumns(),
           filters: [
             { key: 'status', label: 'All statuses', options: fieldByKey('invoices', 'status').options },
             { key: 'type', label: 'All types', options: fieldByKey('invoices', 'type').options }
@@ -205,11 +195,11 @@ export function billingView(ctx = {}) {
       ])
     },
     {
-      key: 'payments', label: 'Payments received', count: paymentRows.length,
+      key: 'payments', label: 'Payments received', count: paymentCount,
       render: () => el('div', { class: 'tab-stack' }, [
         tab === 'payments' ? filterChip : null,
         el('p', { class: 'muted small', text: 'Payments are recorded from the invoice they pay — use Record payment on an invoice.' }),
-        paymentTable(paymentRows, { exportName: 'payments' })
+        paymentTable({ preset: show === 'month' ? 'month' : undefined }, { exportName: 'payments' })
       ])
     }
   ], { active: tab, urlFor: (key) => address(key, key === tab ? show : '') });
@@ -222,24 +212,24 @@ export function billingView(ctx = {}) {
         el('p', { class: 'muted', text: 'Invoices you have raised and the payments received against them.' })
       ]),
       el('div', { class: 'page-meta' }, [
-        el('span', { class: 'page-pill' }, [plural(invoices.length, 'invoice')]),
-        el('span', { class: 'page-pill' }, [plural(store.payments.length, 'payment')])
+        el('span', { class: 'page-pill' }, [plural(figures.invoices || 0, 'invoice')]),
+        el('span', { class: 'page-pill' }, [plural(figures.payments || 0, 'payment')])
       ])
     ]),
     el('div', { class: 'view-head' }, [
       el('div', {}, [
         el('h1', { text: 'Billing' }),
-        el('p', { class: 'muted', text: `${money(sum(outstanding, 'balance'))} still to collect` })
+        el('p', { class: 'muted', text: `${money(outstanding.sum)} still to collect` })
       ]),
       el('div', { class: 'head-actions' }, bulkActions())
     ]),
     el('div', { class: 'stat-row stat-row-buttons' }, [
-      figure('outstanding', 'Outstanding', money(sum(outstanding, 'balance')), plural(outstanding.length, 'invoice'),
-             outstanding.length ? 'warn' : 'ok'),
-      figure('overdue', 'Overdue', money(sum(overdue, 'balance')), plural(overdue.length, 'invoice'),
-             overdue.length ? 'danger' : null),
-      figure('week', 'Due in 7 days', money(sum(week, 'balance')), plural(week.length, 'invoice')),
-      figure('month', 'Collected this month', money(sum(collected)), plural(collected.length, 'payment'), 'ok')
+      figure('outstanding', 'Outstanding', money(outstanding.sum), plural(outstanding.count, 'invoice'),
+             outstanding.count ? 'warn' : 'ok'),
+      figure('overdue', 'Overdue', money(overdue.sum), plural(overdue.count, 'invoice'),
+             overdue.count ? 'danger' : null),
+      figure('week', 'Due in 7 days', money(week.sum), plural(week.count, 'invoice')),
+      figure('month', 'Collected this month', money(collected.sum), plural(collected.count, 'payment'), 'ok')
     ]),
     t.el
   ]);

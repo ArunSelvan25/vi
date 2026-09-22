@@ -10,11 +10,10 @@ const field = (label, control, help) => el('div', { class: 'field' }, [
 ]);
 
 /** The tenant's unpaid invoices a deposit could settle, oldest first. */
-function arrearsFor(lease) {
-  return store.invoices
-    .filter(i => i.tenant_id === lease.tenant_id && i.type !== 'Deposit' &&
-                 ['Unpaid', 'Partial', 'Overdue'].includes(i.status) && Number(i.balance) > 0)
-    .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
+async function arrearsFor(lease) {
+  return store.everything('invoices', {
+    scope: { kind: 'tenant', id: lease.tenant_id }, preset: 'arrears', sort: 'due_date', dir: 'asc'
+  });
 }
 
 /**
@@ -22,10 +21,12 @@ function arrearsFor(lease) {
  * deductions, and refund the rest — with the arithmetic shown as it is typed,
  * so the refund amount is never a surprise.
  */
-export function openSettleDeposit(lease, { onDone } = {}) {
+export async function openSettleDeposit(lease, { onDone } = {}) {
   const ledger = store.depositLedger(lease);
   const tenant = store.byId('tenants', lease.tenant_id);
-  const arrears = arrearsFor(lease);
+  let arrears;
+  try { arrears = await arrearsFor(lease); }
+  catch (err) { toast(err.message, 'danger'); return; }
   const owed = round2(arrears.reduce((s, i) => s + Number(i.balance), 0));
 
   const error = el('p', { class: 'form-error', hidden: true });

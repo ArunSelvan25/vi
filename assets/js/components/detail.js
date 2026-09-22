@@ -1,5 +1,5 @@
 import { el, icon, badge, toast, copyText, initials, money, date, today, daysBetween, safeUrl, emptyState } from '../ui.js';
-import { store } from '../store.js';
+import { store, REMOTE } from '../store.js';
 import { entities } from '../schema.js';
 
 /**
@@ -57,19 +57,58 @@ export function copyable(value, { label = 'Value', display, href, mono = false, 
 
 /**
  * A link to another record, with a hover card. Falls back to plain text when
- * the record has no page or is not in the store (deleted, or not visible to
- * this user).
+ * the record has no page, or is one of the small tables the browser keeps and
+ * is not there (deleted, or not visible to this user). A growing table's row
+ * is fetched when it is opened, so it is linked whether or not it has been
+ * seen yet.
  */
 export function ref(entity, id, { text, short = false, className } = {}) {
   if (!id) return el('span', { class: 'muted', text: '—' });
   const label = text ?? (short ? store.shortLabel(entity, id) : store.label(entity, id));
-  if (!DETAIL_ENTITIES.has(entity) || !store.byId(entity, id)) return el('span', { text: label });
+  if (!DETAIL_ENTITIES.has(entity) || (!REMOTE.has(entity) && !store.byId(entity, id))) return el('span', { text: label });
   return el('a', {
     class: 'ref' + (className ? ' ' + className : ''), href: hrefFor(entity, id),
     dataset: { hc: entity + ':' + id },
     // a link inside a clickable table row opens the link, not the row
     onClick: (e) => e.stopPropagation()
   }, [label]);
+}
+
+/**
+ * Something drawn once its data arrives from the server: a spinner until then,
+ * and the error with a retry if the request fails. A page (the default) says
+ * so when it is ready, so the shell can title it; `inline` is for a panel or
+ * tab inside a page.
+ *
+ * @param load   () => Promise of the data
+ * @param render (data) => the node to show
+ */
+export function awaiting(load, render, { inline = false, label = 'Loading…' } = {}) {
+  const host = el('div', { class: inline ? 'awaiting' : 'view awaiting', 'aria-busy': 'true' });
+  const spin = () => {
+    host.textContent = '';
+    host.append(el('div', { class: 'loading' }, [el('div', { class: 'spinner' }), el('span', { text: label })]));
+  };
+  const run = () => {
+    spin();
+    Promise.resolve().then(load).then((data) => {
+      // gone already: the reader moved on before it arrived
+      if (!host.parentNode) return;
+      const node = render(data);
+      host.replaceWith(node);
+      if (!inline) document.dispatchEvent(new CustomEvent('view:ready'));
+    }).catch((err) => {
+      if (!host.parentNode) return;
+      host.removeAttribute('aria-busy');
+      host.textContent = '';
+      host.append(el('div', { class: 'load-error' }, [
+        el('p', { class: 'form-error', text: 'Could not load this: ' + err.message }),
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', onClick: () => { host.setAttribute('aria-busy', 'true'); run(); } }, ['Try again'])
+      ]));
+    });
+  };
+  run();
+  return host;
 }
 
 /** Initials in a circle for people, an icon tile for things. */
@@ -310,7 +349,7 @@ export function invoiceRow(inv) {
 }
 
 export function paymentRow(p) {
-  const deposit = store.isDepositPayment(p);
+  const deposit = store.isDepositPayment(p);  // marked by the server
   return el('a', { class: 'rec-row', href: hrefFor('payments', p.id) }, [
     el('span', { class: 'rec-icon tone-ok' }, [icon('card', 15)]),
     el('span', { class: 'rec-main' }, [

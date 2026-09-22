@@ -103,6 +103,12 @@ ok('the apple-touch-icon exists', exists('assets/icons/apple-touch-icon.png'));
 ok('declares itself web-app capable', /name="apple-mobile-web-app-capable"/.test(html));
 ok('references no absolute paths', !/(?:href|src)="\//.test(html),
    'an absolute path breaks the app under a GitHub Pages project subpath');
+const csp = (html.match(/<meta http-equiv="Content-Security-Policy" content="([^"]+)">/) || [])[1] || '';
+const scriptSrc = (csp.match(/script-src ([^;]+)/) || [])[1] || '';
+ok('sets a Content-Security-Policy', !!csp);
+ok('the policy lets scripts come from this site only', scriptSrc.trim() === "'self'", 'script-src is: ' + scriptSrc);
+ok('the policy blocks plugins and <base> hijacking', /object-src 'none'/.test(csp) && /base-uri 'self'/.test(csp));
+ok('index.html has no inline script the policy would block', !/<script(?![^>]*\bsrc=)[^>]*>/.test(html));
 
 // a preload for a file that has gone is a 404 on every launch; a module left
 // off the list is merely slower, but the list is only worth having if whole

@@ -1,5 +1,5 @@
 import { el, icon, badge, money, date, today, daysBetween, initials } from '../ui.js';
-import { store } from '../store.js';
+import { store, REMOTE } from '../store.js';
 import { entities, rentDayLabel } from '../schema.js';
 import { hrefFor } from './detail.js';
 
@@ -17,14 +17,13 @@ const HIDE_DELAY = 180;
 
 let card = null;
 let anchor = null;
+/** The link a card is on its way for, so a slow fetch does not open a card the pointer has left. */
+let pending = null;
 let showTimer = 0;
 let hideTimer = 0;
 let installed = false;
 
 const OPEN = ['Unpaid', 'Partial', 'Overdue'];
-const owedBy = (pred) => store.invoices
-  .filter(i => pred(i) && OPEN.includes(i.status))
-  .reduce((s, i) => s + Number(i.balance || 0), 0);
 
 const row = (label, value) => (value === null || value === undefined || value === '' ? null
   : el('div', { class: 'hc-row' }, [el('span', { text: label }), el('strong', {}, [value instanceof Node ? value : String(value)])]));
@@ -36,7 +35,7 @@ const person = (name) => el('div', { class: 'avatar-tile avatar-sm avatar-person
 const CARDS = {
   tenants(t) {
     const lease = store.leases.find(l => l.tenant_id === t.id && l.status === 'Active');
-    const owed = owedBy(i => i.tenant_id === t.id);
+    const owed = store.owedBy('tenants', t.id);
     return {
       lead: person(t.full_name), title: t.full_name,
       sub: lease ? store.label('units', lease.unit_id) : 'No active lease',
@@ -59,7 +58,7 @@ const CARDS = {
       rows: [
         row('Units', `${occupied} of ${units.length} occupied`),
         row('Rent roll', money(roll) + ' / mo'),
-        row('Outstanding', money(owedBy(i => i.property_id === p.id))),
+        row('Outstanding', money(store.owedBy('properties', p.id))),
         p.owner_name ? row('Owner', p.owner_name) : null
       ]
     };
@@ -180,9 +179,16 @@ function place(target) {
   card.style.left = Math.round(Math.max(gap, left)) + 'px';
 }
 
-function show(target) {
+async function show(target) {
   const [entity, ...rest] = String(target.dataset.hc || '').split(':');
-  const content = build(entity, rest.join(':'));
+  const id = rest.join(':');
+  // a growing table's row may not have been fetched on this page yet
+  if (REMOTE.has(entity) && !store.byId(entity, id)) {
+    try { await store.fetchRow(entity, id); } catch (e) { return; }
+    // the pointer may have moved on while it loaded
+    if (!target.isConnected || pending !== target) return;
+  }
+  const content = build(entity, id);
   if (!content) return;
   if (!card) {
     card = el('div', { class: 'hovercard', role: 'tooltip', id: 'hovercard' });
@@ -209,10 +215,12 @@ function scheduleShow(target) {
   clearTimeout(showTimer);
   // moving straight from one link to another swaps the card at once
   const delay = card && card.classList.contains('open') ? 60 : SHOW_DELAY;
+  pending = target;
   showTimer = setTimeout(() => { if (target.isConnected) show(target); }, delay);
 }
 
 function scheduleHide() {
+  pending = null;
   clearTimeout(showTimer);
   clearTimeout(hideTimer);
   hideTimer = setTimeout(hideHovercard, HIDE_DELAY);

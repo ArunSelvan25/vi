@@ -36,7 +36,7 @@ export function assertTable(name) {
   return name;
 }
 
-function mapRow(table, raw) {
+export function mapRow(table, raw) {
   const out = {};
   for (const c of Object.keys(TABLES[table].cols)) out[c] = fromDb(table, c, raw[c]);
   if (raw.row_version !== undefined) out._v = String(raw.row_version);

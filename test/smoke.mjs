@@ -156,10 +156,13 @@ await step('charts render as SVG', async () => {
 });
 await step('cash-flow months align with their data (timezone regression)', async () => {
   // A toISOString()-based month key shifts every bucket back one month in +offset zones.
+  // The server buckets the months; the browser only names them.
   const series = await page.evaluate(async () => {
     const { store } = await import('/assets/js/store.js');
-    return store.monthlySeries(6).map(m => ({ key: m.key, label: m.label, income: m.income, expense: m.expense }));
+    return store.labelSeries(store.dashboard.series).map(m => ({ key: m.key, label: m.label, income: m.income, expense: m.expense }));
   });
+  const expectLabel = (key) => new Date(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1).toLocaleDateString('en', { month: 'short' });
+  for (const m of series) if (m.label !== expectLabel(m.key)) throw new Error(`${m.key} labelled ${m.label}`);
   console.log('    ' + series.map(m => `${m.label}(${m.key}) in=${m.income} out=${m.expense}`).join(' '));
   // the dev data is dated relative to today: rent paid two months ago, tax last
   // month, a part payment and a repair this month
@@ -300,6 +303,35 @@ await step('column sort works', async () => {
   const desc = await page.$eval('.data-table tbody tr td', e => e.textContent);
   if (!/INV-00001/.test(asc)) throw new Error('ascending sort gave: ' + asc);
   if (!/INV-00003/.test(desc)) throw new Error('descending sort gave: ' + desc);
+});
+
+await step('a long list is paged, searched and sorted by the server', async () => {
+  // 40 expenses, so the list runs to a second page
+  const lean = await page.evaluate(async () => {
+    const { api } = await import('/assets/js/api.js');
+    const jobs = [];
+    for (let i = 1; i <= 40; i++) {
+      jobs.push(api('create', { table: 'Expenses', data: { property_id: 'PRP-00002', category: 'Cleaning', amount: 1000 + i,
+        date: '2025-03-' + String(1 + (i % 27)).padStart(2, '0'), description: (i === 17 ? 'Gutter clearance ' : 'Sweep ') + i } }));
+    }
+    await Promise.all(jobs);
+    // what signing in sends now: the small tables, not the growing ones
+    const snap = await api('bootstrap', { lean: true });
+    return { expenses: 'expenses' in snap, invoices: 'invoices' in snap, payments: 'payments' in snap };
+  });
+  if (lean.expenses || lean.invoices || lean.payments) throw new Error('the start-up snapshot still carries whole tables: ' + JSON.stringify(lean));
+  await go('expenses', 'Expenses');
+  const info = () => page.$eval('.table-info', e => e.textContent);
+  await page.waitForFunction(() => /^1–25 of \d+$/.test(document.querySelector('.table-info')?.textContent || ''), { timeout: 5000 });
+  const total = Number((await info()).split(' of ')[1]);
+  if (total < 40) throw new Error('expected at least 40 expenses, list says ' + total);
+  if ((await page.$$eval('.data-table tbody tr', r => r.length)) !== 25) throw new Error('more than one page of rows in the page');
+  await page.evaluate(() => [...document.querySelectorAll('.pager .btn')].find(b => /Next/.test(b.textContent)).click());
+  await page.waitForFunction(() => /^26–/.test(document.querySelector('.table-info')?.textContent || ''), { timeout: 5000 });
+  await page.type('.search-input', 'gutter');
+  await page.waitForFunction(() => /^1–1 of 1$/.test(document.querySelector('.table-info')?.textContent || ''), { timeout: 5000 });
+  const found = await page.$eval('.data-table tbody tr', e => e.textContent);
+  if (!/Gutter clearance 17/.test(found)) throw new Error('search found ' + found);
 });
 
 console.log('\n— write paths —');
@@ -619,13 +651,15 @@ await step('invoices and payments share one Billing screen; the old addresses le
 await step('the Billing figures filter the list, and clicking again clears it', async () => {
   await go('billing', 'Billing');
   const all = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.length);
+  // counted here from every invoice, not from the filter under test
   const want = await page.evaluate(async () => {
     const { store } = await import('/assets/js/store.js');
     const t = new Date(); const today = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
-    return store.invoices.filter(i => ['Unpaid', 'Partial', 'Overdue'].includes(i.status) && i.due_date < today).length;
+    return (await store.everything('invoices')).filter(i => ['Unpaid', 'Partial', 'Overdue'].includes(i.status) && i.due_date < today).length;
   });
   await page.evaluate(() => [...document.querySelectorAll('.stat-button')].find(b => /Overdue/.test(b.textContent)).click());
-  await page.waitForFunction(() => location.hash === '#/billing?show=overdue' && !!document.querySelector('.filter-chip'), { timeout: 5000 });
+  await page.waitForFunction(() => location.hash === '#/billing?show=overdue' && !!document.querySelector('.filter-chip') &&
+    !document.querySelector('.table-wrap[aria-busy]') && !!document.querySelector('.tab-panel:not([hidden]) .data-table tbody'), { timeout: 5000 });
   const rows = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.map(x => x.textContent));
   if (rows.length !== want) throw new Error(`overdue filter shows ${rows.length}, expected ${want}`);
   if (rows.some(r => !/Overdue/.test(r))) throw new Error('a row that is not overdue: ' + rows.join(' | '));
@@ -634,7 +668,8 @@ await step('the Billing figures filter the list, and clicking again clears it', 
     document.querySelectorAll('.tab-panel:not([hidden]) .data-table tbody tr').length === n, { timeout: 5000 }, all);
   // "Collected this month" opens the payments tab with just this month's
   await page.evaluate(() => [...document.querySelectorAll('.stat-button')].find(b => /Collected/.test(b.textContent)).click());
-  await page.waitForFunction(() => location.hash === '#/billing?tab=payments&show=month', { timeout: 5000 });
+  await page.waitForFunction(() => location.hash === '#/billing?tab=payments&show=month' &&
+    !document.querySelector('.table-wrap[aria-busy]') && !!document.querySelector('.tab-panel:not([hidden]) .data-table tbody'), { timeout: 5000 });
   const sub = await page.$eval('.stat-button.is-active .stat-sub', e => e.textContent);
   const shown = await page.$$eval('.tab-panel:not([hidden]) .data-table tbody tr', r => r.length);
   if (parseInt(sub, 10) !== shown) throw new Error(`figure says ${sub}, list shows ${shown}`);
@@ -842,8 +877,9 @@ await step('a deposit is settled at move-out: deductions, refund, lease ended', 
   const after = await page.evaluate(async () => {
     const { store } = await import('/assets/js/store.js');
     const l = store.byId('leases', 'LSE-00001');
+    const refunds = await store.everything('expenses', { filters: { category: 'Deposit Refund', reference: 'LSE-00001' } });
     return { status: l.status, deposit: l.deposit_status, held: store.depositLedger(l).held,
-             refund: store.expenses.filter(e => e.category === 'Deposit Refund' && e.reference === 'LSE-00001').map(e => e.amount) };
+             refund: refunds.map(e => e.amount) };
   });
   if (after.status !== 'Terminated' || after.held !== 0 || !after.refund.length) throw new Error(JSON.stringify(after));
 });

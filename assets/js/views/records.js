@@ -7,7 +7,7 @@ import { dataTable } from '../components/table.js';
 import { openEntityForm } from '../components/form.js';
 import { detailPage, stat, statRow, panel, props, schemaProps, facts, notice, tabs, recordList, invoiceRow,
          paymentRow, leaseRow, ticketRow, documentRow, termProgress, entityCard, timeline, eventsFor, ref,
-         copyable, avatar, hrefFor, DOC_ENTITY } from '../components/detail.js';
+         copyable, avatar, hrefFor, DOC_ENTITY, awaiting } from '../components/detail.js';
 import { recordPaymentFor, showInvoice, showReceipt, openInvoiceForm, voidInvoiceFor,
          invoiceMessage } from './invoices.js';
 import { openRenewLease, openSettleDeposit } from './leases.js';
@@ -66,11 +66,6 @@ export function deleteBtn(entity, row) {
   }, [icon('trash', 16), ' Delete']);
 }
 
-export const docsFor = (type, ids) => {
-  const set = new Set([].concat(ids));
-  return store.documents.filter(d => d.entity_type === type && set.has(d.entity_id));
-};
-
 // ── related-record tables, used inside tabs ─────────────────────────────────
 
 const columnsWithout = (entity, hide) => tableFields(entity).filter(c => !hide.includes(c.key));
@@ -79,9 +74,12 @@ const facet = (entity, key, label) => {
   return f && f.options ? [{ key, label, options: f.options }] : [];
 };
 
-export function invoiceTable(rows, { hide = [], exportName } = {}) {
+// Each takes `source` — { scope, preset, filters } — and the server pages it,
+// newest first unless the reader sorts by a column.
+
+export function invoiceTable(source, { hide = [], exportName } = {}) {
   return dataTable({
-    entity: 'invoices', rows: rows.slice().sort(newestFirst('due_date')),
+    entity: 'invoices', source,
     columns: columnsWithout('invoices', hide), filters: facet('invoices', 'status', 'All statuses'),
     onRowClick: (r) => navigate('invoices/' + r.id), exportName, emptyMessage: 'No invoices yet.',
     actions: [
@@ -91,9 +89,9 @@ export function invoiceTable(rows, { hide = [], exportName } = {}) {
   });
 }
 
-export function paymentTable(rows, { hide = [], exportName } = {}) {
+export function paymentTable(source, { hide = [], exportName } = {}) {
   return dataTable({
-    entity: 'payments', rows: rows.slice().sort(newestFirst('payment_date')),
+    entity: 'payments', source,
     columns: columnsWithout('payments', hide), filters: facet('payments', 'method', 'All methods'),
     onRowClick: (r) => navigate('payments/' + r.id), exportName, emptyMessage: 'No payments yet.',
     actions: [{ label: 'Receipt', icon: 'receipt', onClick: (r) => showReceipt(r) }]
@@ -108,25 +106,25 @@ export function leaseTable(rows, { hide = [] } = {}) {
   });
 }
 
-export function ticketTable(rows, { hide = [] } = {}) {
+export function ticketTable(source, { hide = [] } = {}) {
   return dataTable({
-    entity: 'maintenance', rows: rows.slice().sort(newestFirst('reported_date')),
+    entity: 'maintenance', source,
     columns: columnsWithout('maintenance', hide), filters: facet('maintenance', 'status', 'All statuses'),
     onRowClick: (r) => navigate('maintenance/' + r.id), emptyMessage: 'No maintenance tickets.'
   });
 }
 
-export function expenseTable(rows, { hide = [] } = {}) {
+export function expenseTable(source, { hide = [] } = {}) {
   return dataTable({
-    entity: 'expenses', rows: rows.slice().sort(newestFirst('date')),
+    entity: 'expenses', source,
     columns: columnsWithout('expenses', hide), filters: facet('expenses', 'category', 'All categories'),
     onRowClick: (r) => navigate('expenses/' + r.id), emptyMessage: 'No expenses recorded.'
   });
 }
 
-export function documentTable(rows) {
+export function documentTable(source) {
   return dataTable({
-    entity: 'documents', rows: rows.slice().sort(newestFirst('issue_date')),
+    entity: 'documents', source,
     filters: facet('documents', 'category', 'All categories'),
     onRowClick: (r) => navigate('documents/' + r.id), emptyMessage: 'No documents linked.'
   });
@@ -150,7 +148,7 @@ export function expenseRow(e) {
 
 export function tenantCard(tenant) {
   if (!tenant) return el('p', { class: 'muted', text: 'No tenant on record.' });
-  const due = owed(store.invoicesOfTenant(tenant.id));
+  const due = store.owedBy('tenants', tenant.id);
   return entityCard({
     entity: 'tenants', id: tenant.id, lead: avatar({ name: tenant.full_name, size: 'md' }),
     title: tenant.full_name, sub: tenant.occupation || tenant.status,
@@ -240,19 +238,21 @@ function nextRentPanel(lease) {
 export function leaseDetail(id, ctx = {}) {
   const lease = store.byId('leases', id);
   if (!lease) return missing('leases');
+  return awaiting(() => store.detail('leases', id), (summary) => leasePage(lease, summary, ctx));
+}
+
+/** @param s the lease's summary from the server (store.detail) */
+function leasePage(lease, s, ctx) {
+  const id = lease.id;
+  const scope = { kind: 'lease', id };
   const tenant = store.byId('tenants', lease.tenant_id);
   const unit = store.byId('units', lease.unit_id);
-  const invoices = store.invoices.filter(i => i.lease_id === id);
-  const invIds = new Set(invoices.map(i => i.id));
-  const payments = store.payments.filter(p => p.lease_id === id || invIds.has(p.invoice_id))
-    .sort(newestFirst('payment_date'));
   const ledger = store.depositLedger(lease);
-  const outstanding = owed(invoices);
-  const collected = sum(store.incomePayments(payments));
+  const outstanding = s.outstanding;
+  const collected = s.collected;
   const rentNow = store.currentRent(lease);
   const left = lease.end_date ? daysBetween(today(), lease.end_date) : null;
   const renewedTo = store.leases.find(l => l.renewed_from === id);
-  const docs = docsFor('Lease', id);
   const escalation = nextEscalation(lease);
   const again = () => refreshView();
   const canRenew = store.can('manager') && lease.end_date && lease.status !== 'Terminated' && !renewedTo;
@@ -301,23 +301,24 @@ export function leaseDetail(id, ctx = {}) {
         : null
     }),
     el('div', { class: 'grid-2' }, [
-      panel('Recent invoices', recordList(invoices.slice().sort(newestFirst('due_date')), invoiceRow,
+      panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices on this lease yet.' }),
-        { flush: true, count: invoices.length, action: invoices.length > 5 ? viewAll(() => t.select('invoices')) : null }),
-      panel('Recent payments', recordList(payments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: payments.length, action: payments.length > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: s.counts.invoices, action: s.counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+      panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
+        { flush: true, count: s.counts.payments, action: s.counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
     ])
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
-    { key: 'invoices', label: 'Invoices', count: invoices.length,
-      render: () => invoiceTable(invoices, { hide: ['tenant_id', 'property_id', 'unit_id'], exportName: 'lease-' + id + '-invoices' }) },
-    { key: 'payments', label: 'Payments', count: payments.length,
-      render: () => paymentTable(payments, { hide: ['tenant_id', 'property_id'], exportName: 'lease-' + id + '-payments' }) },
-    { key: 'documents', label: 'Documents', count: docs.length, render: () => documentTable(docs) },
+    { key: 'invoices', label: 'Invoices', count: s.counts.invoices,
+      render: () => invoiceTable({ scope }, { hide: ['tenant_id', 'property_id', 'unit_id'], exportName: 'lease-' + id + '-invoices' }) },
+    { key: 'payments', label: 'Payments', count: s.counts.payments,
+      render: () => paymentTable({ scope }, { hide: ['tenant_id', 'property_id'], exportName: 'lease-' + id + '-payments' }) },
+    { key: 'documents', label: 'Documents', count: s.counts.documents, render: () => documentTable({ scope }) },
     { key: 'activity', label: 'Activity',
-      render: () => panel('Activity', timeline(eventsFor({ leases: [lease], invoices, payments }))) }
+      render: () => awaiting(() => store.history('leases', id), (h) =>
+        panel('Activity', timeline(eventsFor({ leases: [lease], invoices: h.invoices, payments: h.payments }))), { inline: true }) }
   ], { active: ctx.query?.tab, base: hrefFor('leases', id) });
 
   return detailPage({
@@ -443,11 +444,14 @@ function paymentProgress(inv, payments, dueIn) {
 }
 
 export function invoiceDetail(id) {
-  const inv = store.byId('invoices', id);
-  if (!inv) return missing('invoices');
+  return awaiting(() => store.detail('invoices', id),
+                  (d) => (d.row ? invoicePage(d.row, d.items, d.payments) : missing('invoices')));
+}
+
+/** @param items its line items, and `payments` those against it, newest first */
+function invoicePage(inv, items, payments) {
+  const id = inv.id;
   const tenant = store.byId('tenants', inv.tenant_id);
-  const items = store.itemsOfInvoice(id);
-  const payments = store.paymentsOfInvoice(id).slice().sort(newestFirst('payment_date'));
   const open = OPEN.includes(inv.status);
   const late = open && inv.due_date && inv.due_date < today() ? daysBetween(inv.due_date, today()) : 0;
   const dueIn = open && inv.due_date && !late ? daysBetween(today(), inv.due_date) : null;
@@ -469,7 +473,7 @@ export function invoiceDetail(id) {
     inv.status === 'Void' ? notice(['This invoice is void and nothing is owed on it.',
                                     inv.notes ? el('small', { class: 'block', text: inv.notes }) : null], 'muted') : null,
     inv.status === 'Draft' ? notice('Draft — this invoice has not been issued to the tenant yet.', 'info',
-                                    store.can('manager') ? btn('Edit & issue', 'edit', () => openInvoiceForm(inv, { onSaved: again })) : null) : null,
+                                    store.can('manager') ? btn('Edit & issue', 'edit', () => openInvoiceForm(inv, { onSaved: again, items })) : null) : null,
     late ? notice(`Overdue by ${late} day${late === 1 ? '' : 's'} — ${money(inv.balance)} still to collect.`, 'danger',
                   canPay(inv) ? btn('Record payment', 'card', () => recordPaymentFor(inv, again)) : null) : null,
     paymentProgress(inv, payments, dueIn),
@@ -496,9 +500,9 @@ export function invoiceDetail(id) {
     ],
     actions: [
       canPay(inv) ? btn('Record payment', 'card', () => recordPaymentFor(inv, again), 'btn-primary') : null,
-      btn('Print / PDF', 'print', () => showInvoice(inv)),
+      btn('Print / PDF', 'print', () => showInvoice(inv, { items, payments })),
       wa ? linkBtn('WhatsApp', 'whatsapp', wa) : null,
-      store.can('manager') && inv.status !== 'Void' ? btn('Edit', 'edit', () => openInvoiceForm(inv, { onSaved: again })) : null,
+      store.can('manager') && inv.status !== 'Void' ? btn('Edit', 'edit', () => openInvoiceForm(inv, { onSaved: again, items })) : null,
       store.can('manager') && !['Void', 'Draft'].includes(inv.status) && !(Number(inv.amount_paid) > 0)
         ? el('button', { class: 'btn btn-ghost danger-text', onClick: () => voidInvoiceFor(inv, again) }, [icon('ban', 16), ' Void'])
         : null,
@@ -534,13 +538,18 @@ export function invoiceDetail(id) {
 // ── payment ─────────────────────────────────────────────────────────────────
 
 export function paymentDetail(id) {
-  const p = store.byId('payments', id);
-  if (!p) return missing('payments');
-  const inv = p.invoice_id ? store.byId('invoices', p.invoice_id) : null;
+  return awaiting(() => store.detail('payments', id), (d) => (d.row ? paymentPage(d) : missing('payments')));
+}
+
+/** @param d the payment, the invoice it settles, and the tenant's other payments (store.detail) */
+function paymentPage(d) {
+  const p = d.row;
+  const id = p.id;
+  const inv = d.invoice;
   const tenant = store.byId('tenants', p.tenant_id);
   const lease = p.lease_id ? store.byId('leases', p.lease_id) : (inv?.lease_id ? store.byId('leases', inv.lease_id) : null);
   const deposit = store.isDepositPayment(p);
-  const others = store.payments.filter(x => x.tenant_id === p.tenant_id && x.id !== id).sort(newestFirst('payment_date'));
+  const others = d.others;
   const again = () => refreshView();
 
   return detailPage({
@@ -583,7 +592,7 @@ export function paymentDetail(id) {
         lease ? panel('Lease', leaseCard(lease)) : panel('Property', el('p', {}, [ref('properties', p.property_id)]))
       ]),
       panel('Other payments from this tenant', recordList(others, paymentRow, { limit: 6, empty: 'No other payments.' }),
-            { flush: true, count: others.length })
+            { flush: true, count: d.othersCount })
     ],
     aside: panel('Payment details', props([
       ['Payment ID', copyable(id, { label: 'Payment ID', mono: true })],
@@ -606,9 +615,9 @@ export function paymentDetail(id) {
 
 const ENTITY_ICON = { maintenance: 'wrench', expenses: 'wallet', documents: 'folder' };
 
-function maintenanceMain(m) {
+/** @param expense the expense a finished ticket's cost was booked as, if any */
+function maintenanceMain(m, expense) {
   const openDays = m.reported_date ? daysBetween(m.reported_date, m.completed_date || today()) : null;
-  const expense = store.expenses.find(e => e.reference === m.id);
   const tenant = m.tenant_id ? store.byId('tenants', m.tenant_id) : null;
   const unit = m.unit_id ? store.byId('units', m.unit_id) : null;
   return [
@@ -634,8 +643,8 @@ function maintenanceMain(m) {
   ];
 }
 
-function expenseMain(e) {
-  const ticket = e.reference ? store.byId('maintenance', e.reference) : null;
+/** @param ticket the maintenance ticket this expense books the cost of, if any */
+function expenseMain(e, ticket) {
   const lease = e.reference ? store.byId('leases', e.reference) : null;
   const receipt = safeUrl(e.receipt_url);
   return [
@@ -679,15 +688,19 @@ function documentMain(d) {
 
 /** The page for records that are simpler than a lease or an invoice. */
 export function recordDetail(entity, id) {
+  return awaiting(() => store.detail(entity, id), (d) => (d.row ? recordPage(entity, d) : missing(entity)));
+}
+
+function recordPage(entity, d) {
   const def = entities[entity];
-  const row = store.byId(entity, id);
-  if (!row) return missing(entity);
+  const row = d.row;
+  const id = row.id;
   const again = () => refreshView();
   const title = row[def.labelKey] || id;
   const where = [row.property_id ? ref('properties', row.property_id) : null,
                  row.unit_id ? ref('units', row.unit_id, { short: true }) : null].filter(Boolean);
-  const main = entity === 'maintenance' ? maintenanceMain(row)
-    : entity === 'expenses' ? expenseMain(row)
+  const main = entity === 'maintenance' ? maintenanceMain(row, d.expense)
+    : entity === 'expenses' ? expenseMain(row, d.ticket)
     : documentMain(row);
 
   return detailPage({

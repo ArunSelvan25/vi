@@ -18,6 +18,10 @@ import {
   openRequest, assertTable, readTable, readTableTail, findRow, invalidate, reserveIds,
   insertRow, insertRows, patchRow, removeRow, getState, setState, tableVersions, guarded
 } from './db.js';
+import {
+  PAGED, OPEN as OPEN_STATUSES, listPage, scopeSummary, scopeHistory, recordDetail, dashboardData,
+  billingFigures, reportData
+} from './queries.js';
 
 // ─────────────────────────────────────────────────────────── configuration ──
 
@@ -59,10 +63,42 @@ const NEVER_RETURN = { Users: ['salt', 'password_hash'] };
 function minRoleFor(table) { return TABLE_MIN_ROLE[table] || 'manager'; }
 function readRoleFor(table) { return TABLE_READ_ROLE[table] || 'viewer'; }
 
+/**
+ * Columns a role below the one named may only see masked. A tenant's ID number
+ * (Aadhaar, PAN, passport) is personal data a viewer has no need for in full.
+ */
+const MASKED_BELOW = { Tenants: { id_number: 'manager' } };
+
+/** The columns `user` gets masked in `table`, or null for none. */
+function maskedColumns(user, table) {
+  const cols = MASKED_BELOW[table];
+  if (!cols) return null;
+  const hidden = Object.keys(cols).filter(c => (ROLE_RANK[user.role] || 0) < ROLE_RANK[cols[c]]);
+  return hidden.length ? hidden : null;
+}
+
+/** All but the last four characters hidden, as a masked Aadhaar shows; a short value is hidden whole. */
+export function maskIdNumber(v) {
+  const s = String(v == null ? '' : v).replace(/\s+/g, '');
+  if (!s) return '';
+  const keep = s.length > 6 ? 4 : 0;
+  return 'X'.repeat(s.length - keep) + s.slice(s.length - keep);
+}
+
+/** One row as `user` may see it: secrets removed, sensitive columns masked for their role. */
+function forClient(table, row, user) {
+  const safe = stripSecrets(table, row);
+  const masked = safe && user ? maskedColumns(user, table) : null;
+  if (!masked) return safe;
+  const out = { ...safe };
+  for (const c of masked) if (out[c] !== undefined) out[c] = maskIdNumber(out[c]);
+  return out;
+}
+
 /** Rows on their way to a client, with secrets removed. */
 async function readTableForClient(r, table, user) {
   requireRole(user, readRoleFor(table));
-  return (await readTable(r, table)).map(row => stripSecrets(table, row));
+  return (await readTable(r, table)).map(row => forClient(table, row, user));
 }
 
 /**
@@ -120,6 +156,11 @@ export function createBackend(deps) {
     if (!action) return fail('No action supplied');
     if (action === 'ping') return ok({ service: 'vi-property-manager', version: VERSION, time: nowIso(env.tz) });
     try {
+      // Checking a password takes a deliberately slow hash. These two hash
+      // outside the request lock, so a flood of sign-in attempts cannot stall
+      // everyone else's requests behind it.
+      if (action === 'login') return await login(run, env, payload || {});
+      if (action === 'changePassword') return await changePassword(run, env, payload || {}, token || '');
       return await run(r => route(r, action, payload || {}, token || ''));
     } catch (err) {
       return fail(describeError(err));
@@ -177,25 +218,30 @@ function humanise(column) {
 
 // ────────────────────────────────────────────────────────────────── router ──
 
-const READ_ONLY_ACTIONS = { ping: 1, login: 1, bootstrap: 1, list: 1, me: 1, stats: 1 };
+const READ_ONLY_ACTIONS = { ping: 1, login: 1, bootstrap: 1, list: 1, me: 1, stats: 1,
+                            page: 1, detail: 1, history: 1, report: 1 };
 export { READ_ONLY_ACTIONS };
 
 async function route(r, action, payload, token) {
   if (action === 'setup') return doSetup(r, payload, token);
-  if (action === 'login') return doLogin(r, payload);
+  if (action === 'logout') return logout(r, token);
 
   const user = await requireAuth(r, token);
 
   switch (action) {
     case 'me':               return ok({ user, settings: await readSettings(r) });
-    case 'bootstrap':        return ok(await bootstrap(r, user, payload.known));
+    case 'bootstrap':        return ok(await bootstrap(r, user, payload.known, !!payload.lean));
     case 'list':             return ok({ rows: await readTableForClient(r, assertTable(payload.table), user) });
+    case 'page':             return ok(await page(r, payload, user));
+    case 'detail':           return ok(await detail(r, payload, user));
+    case 'history':          return ok(await history(r, payload, user));
+    case 'report':           return ok(await reportData(r, payload));
     case 'create':
     case 'update': {
       const written = await writeRow(r, action, payload, user);
       const table = payload.table;
       const row = (await findRow(r, table, written[keyOf(table)])) || written;
-      return ok(await withSnapshot(r, payload, user, { row: stripSecrets(table, row) }));
+      return ok(await withSnapshot(r, payload, user, { row: forClient(table, row, user) }));
     }
     case 'remove':           return ok(await withSnapshot(r, payload, user, { id: await deleteRow(r, payload.table, payload.id, user) }));
     case 'saveInvoice':      return ok(await withSnapshot(r, payload, user, await saveInvoice(r, payload, user)));
@@ -206,15 +252,45 @@ async function route(r, action, payload, token) {
     case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
     case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
     case 'refreshStatuses':  requireRole(user, 'manager'); return ok(await withSnapshot(r, payload, user, await refreshStatuses(r, user)));
-    case 'changePassword':   return ok(await changePassword(r, payload, user));
     case 'createUser':       return ok({ row: await createUser(r, payload, user) });
     case 'resetPassword':    return ok(await resetPassword(r, payload, user));
     case 'setUserActive':    return ok({ row: await setUserActive(r, payload, user) });
     case 'setUserRole':      return ok({ row: await setUserRole(r, payload, user) });
+    case 'endSessions':      return ok(await endSessions(r, payload, user));
     case 'sendReminders':    return ok(await withSnapshot(r, payload, user, await sendReminders(r, user, { scheduled: false })));
     case 'stats':            return ok(await computeStats(r));
     default: return fail('Unknown action: ' + action);
   }
+}
+
+// ─────────────────────────────────────────────────────── paged reads ──
+
+/** A property, unit, tenant or lease page summarises what belongs to it. */
+const SCOPE_OF = { Properties: 'property', Units: 'unit', Tenants: 'tenant', Leases: 'lease' };
+
+/** One page of a growing table. The paging rules live in queries.js. */
+async function page(r, payload, user) {
+  const table = assertTable(payload.table);
+  if (!PAGED[table]) throw new Error(table + ' is not paged — it arrives with the rest of the data.');
+  requireRole(user, readRoleFor(table));
+  return listPage(r, table, payload);
+}
+
+/** What a record's own page needs beyond the row list the browser already has. */
+async function detail(r, payload, user) {
+  const table = assertTable(payload.table);
+  requireRole(user, readRoleFor(table));
+  if (SCOPE_OF[table]) return scopeSummary(r, SCOPE_OF[table], payload.id);
+  if (!PAGED[table] || table === 'ActivityLog' || table === 'InvoiceItems') throw new Error('No page for ' + table);
+  return recordDetail(r, table, payload.id);
+}
+
+/** A property, unit, tenant or lease's invoices, payments and tickets in full: its timeline and statement. */
+async function history(r, payload, user) {
+  const table = assertTable(payload.table);
+  if (!SCOPE_OF[table]) throw new Error('No history for ' + table);
+  requireRole(user, readRoleFor(table));
+  return scopeHistory(r, SCOPE_OF[table], payload.id);
 }
 
 /**
@@ -224,7 +300,7 @@ async function route(r, action, payload, token) {
  * so it obeys exactly the same role limits.
  */
 async function withSnapshot(r, payload, user, data) {
-  if (payload && payload.withSnapshot) data.snapshot = await bootstrap(r, user, payload.known);
+  if (payload && payload.withSnapshot) data.snapshot = await bootstrap(r, user, payload.known, !!payload.lean);
   return data;
 }
 
@@ -544,6 +620,7 @@ async function writeRowLocked(r, op, table, payload, user) {
   let paymentBefore = null;
   if (table === 'Payments') {
     if (op === 'update') paymentBefore = await findRow(r, 'Payments', payload.id);
+    if (paymentBefore) assertPaymentEditAllowed(user, paymentBefore, data);
     await preparePayment(r, data, paymentBefore);
   }
 
@@ -682,6 +759,21 @@ async function recordMaintenanceExpense(r, ticket) {
  * Validate a payment saved from the Payments page, and tie it to its invoice.
  * A payment with no invoice is money on account and is left as entered.
  */
+/**
+ * Taking money back is an administrator's call — voidPayment and deleting a
+ * payment both need admin — so lowering a recorded amount to nothing, or moving
+ * it off its invoice, must not be open to a manager through a plain edit.
+ */
+function assertPaymentEditAllowed(user, before, data) {
+  if (ROLE_RANK[user.role] >= ROLE_RANK.admin) return;
+  const amountChanged = data.amount !== undefined && round2(num(data.amount)) !== round2(num(before.amount));
+  const invoiceChanged = data.invoice_id !== undefined && String(data.invoice_id || '') !== String(before.invoice_id || '');
+  if (amountChanged || invoiceChanged) {
+    throw new Error('Only an administrator can change the amount or invoice of a recorded payment. ' +
+                    'Ask an administrator to void it, then record the correct payment.');
+  }
+}
+
 async function preparePayment(r, data, before) {
   const invoiceId = data.invoice_id !== undefined ? data.invoice_id : (before ? before.invoice_id : '');
   if (!invoiceId) return;
@@ -762,7 +854,8 @@ async function depositLedgers(r, leases) {
     const status = String(l.deposit_status || '');
     const received = paid[l.id] > 0 ? paid[l.id] : (status && status !== 'Pending' ? num(l.deposit_amount) : 0);
     const held = status === 'Transferred' ? 0 : round2(received - (applied[l.id] || 0) - (refunded[l.id] || 0));
-    out[l.id] = { received: round2(received), held: Math.max(0, held) };
+    out[l.id] = { received: round2(received), applied: round2(applied[l.id] || 0),
+                  refunded: round2(refunded[l.id] || 0), held: Math.max(0, held) };
   });
   return out;
 }
@@ -1091,13 +1184,17 @@ async function throttleWrite(r, identifier, n, until) {
                set failures = excluded.failures, locked_until = excluded.locked_until, updated_at = now()`;
 }
 
-async function throttleFail(r, identifier) {
-  const spray = (await throttleRow(r, '__global', THROTTLE.sprayWindowSec)).n + 1;
-  await throttleWrite(r, '__global', spray, 0);
-
+/**
+ * Count an attempt against `identifier` before its password is checked. The
+ * check runs outside the request lock, so charging only afterwards would let a
+ * burst of parallel guesses all pass throttleCheck first. A success clears the
+ * count again (throttleReset).
+ */
+async function throttleCharge(r, identifier) {
+  const spray = (await throttleRow(r, '__global', THROTTLE.sprayWindowSec)).n;
   const state = await throttleRow(r, identifier, THROTTLE.windowSec);
   state.n++;
-  const free = spray > THROTTLE.sprayThreshold ? 0 : THROTTLE.freeAttempts;
+  const free = spray >= THROTTLE.sprayThreshold ? 0 : THROTTLE.freeAttempts;
   if (state.n > free) {
     const delay = Math.min(THROTTLE.baseDelaySec * Math.pow(2, state.n - free - 1), THROTTLE.maxDelaySec);
     state.until = Date.now() + delay * 1000;
@@ -1105,6 +1202,12 @@ async function throttleFail(r, identifier) {
   await throttleWrite(r, identifier, state.n, state.until);
   // keep the table from growing without bound
   await r.tx`delete from login_throttle where updated_at < now() - make_interval(secs => ${THROTTLE.windowSec})`;
+}
+
+/** A failed attempt counts towards the spray total across all accounts. */
+async function throttleSpray(r) {
+  const spray = (await throttleRow(r, '__global', THROTTLE.sprayWindowSec)).n + 1;
+  await throttleWrite(r, '__global', spray, 0);
 }
 
 async function throttleReset(r, identifier) {
@@ -1251,11 +1354,61 @@ async function requireAuth(r, token) {
   if (changedAt && (!payload.iat || payload.iat < changedAt)) {
     throw new Error('AUTH_REQUIRED');
   }
+  // "sign out other devices", or an admin signing this account out
+  const revokedAt = parseFloat(current.sessions_revoked_at || 0) || 0;
+  if (revokedAt && (!payload.iat || payload.iat <= revokedAt)) {
+    throw new Error('AUTH_REQUIRED');
+  }
+  // this one token, signed out of on its device
+  const [revoked] = await r.tx`select 1 from revoked_sessions where token_hash = ${await tokenHash(token)}`;
+  if (revoked) throw new Error('AUTH_REQUIRED');
 
   return {
     id: current.id, phone: current.phone, email: current.email,
     name: current.name, role: current.role
   };
+}
+
+/** What revoked_sessions stores: a digest, so the table never holds a usable token. */
+async function tokenHash(token) {
+  return bytesToBase64(await sha256(String(token)));
+}
+
+/**
+ * Sign this device out: the token stops working now rather than when it
+ * expires. Always answers ok — a token that is already invalid has nothing
+ * left to end, and a stranger learns nothing from the reply.
+ */
+async function logout(r, token) {
+  const payload = await verifyToken(r.env.authSecret, token);
+  if (!payload) return ok({ signedOut: true });
+  await r.tx`insert into revoked_sessions (token_hash, expires_at)
+             values (${await tokenHash(token)}, ${new Date(payload.exp).toISOString()})
+             on conflict (token_hash) do nothing`;
+  // a revoked token past its expiry is refused anyway; no need to keep it
+  await r.tx`delete from revoked_sessions where expires_at < now()`;
+  await log(r, payload, 'sign-out', 'Users', payload.id, '');
+  return ok({ signedOut: true });
+}
+
+/**
+ * End every session of an account at once. Your own: every other device is
+ * signed out and this one is handed a fresh token, so it stays signed in.
+ * Someone else's (admin only): they are signed out everywhere.
+ */
+async function endSessions(r, payload, user) {
+  const own = !payload.id || String(payload.id) === String(user.id);
+  if (!own) requireRole(user, 'admin');
+  const target = await findRow(r, 'Users', own ? user.id : payload.id);
+  if (!target) throw new Error('User not found');
+
+  const at = Date.now();
+  await updateRow(r, 'Users', target.id, { sessions_revoked_at: at }, SYSTEM_ACTOR, true);
+  await log(r, user, 'sessions-ended', 'Users', target.id, own ? 'other devices' : 'by ' + (user.phone || user.name));
+  if (!own) return { ended: true, id: target.id };
+  // issued after the cut-off, so it survives it
+  const session = await issueSession(r, target, at + 1);
+  return { ended: true, id: target.id, token: session.token, user: session.user };
 }
 
 function requireRole(user, min) {
@@ -1264,42 +1417,64 @@ function requireRole(user, min) {
   }
 }
 
-async function doLogin(r, payload) {
+/**
+ * Sign in, in three steps so the slow hash never runs inside the request lock:
+ * a short locked read (throttle, charge the attempt, find the account), the
+ * hash with no lock or connection held, then a short locked write that
+ * re-reads the account in case it changed in between.
+ */
+async function login(run, env, payload) {
   // Phone is the login credential; email is optional contact detail only.
   const phone = normalisePhone(payload.phone || payload.identifier || '');
   const password = String(payload.password || '');
   if (!phone || !password) return fail('Phone number and password are required');
 
-  // One generic message for every failure mode, so a stranger cannot tell
-  // which numbers are registered.
-  const GENERIC = 'Invalid phone number or password';
+  const before = await run(async (r) => {
+    try { await throttleCheck(r, phone); } catch (e) { return { refused: e.message }; }
+    await throttleCharge(r, phone);
+    const u = (await readTable(r, 'Users')).find(x => normalisePhone(x.phone) === phone) || null;
+    return { found: u && { id: u.id, salt: u.salt, password_hash: u.password_hash } };
+  });
+  if (before.refused) return fail(before.refused);
 
-  try { await throttleCheck(r, phone); } catch (e) { return fail(e.message); }
-
-  const found = (await readTable(r, 'Users')).find(u => normalisePhone(u.phone) === phone) || null;
-
-  const disabled = found && String(found.active).toLowerCase() === 'false';
+  const found = before.found;
   // Hash even when the number is unknown, so a missing account is not
   // measurably faster to probe than a wrong password.
   const matches = found
     ? await passwordMatches(password, found.salt, found.password_hash)
-    : ((await hashPassword(password, 'no-such-user', r.env.hashIterations)) && false);
+    : ((await hashPassword(password, 'no-such-user', env.hashIterations)) && false);
 
-  if (!found || disabled || !matches) {
-    await throttleFail(r, phone);
+  // Move an account onto the current hashing scheme the first time we can,
+  // now that we have the plaintext in hand.
+  let upgrade = null;
+  if (matches && needsRehash(found.password_hash, env.hashIterations)) {
+    const salt = uuid();
+    upgrade = { salt, password_hash: await hashPassword(password, salt, env.hashIterations) };
+  }
+
+  return run(r => finishLogin(r, phone, found, matches, upgrade, payload));
+}
+
+async function finishLogin(r, phone, checked, matches, upgrade, payload) {
+  // One generic message for every failure mode, so a stranger cannot tell
+  // which numbers are registered.
+  const GENERIC = 'Invalid phone number or password';
+
+  const found = checked ? await findRow(r, 'Users', checked.id) : null;
+  const disabled = found && String(found.active).toLowerCase() === 'false';
+  // the password was checked against this hash; a change since then voids the check
+  const stale = found && String(found.password_hash) !== String(checked.password_hash);
+
+  if (!found || disabled || stale || !matches) {
+    await throttleSpray(r);
     await log(r, { phone }, 'login-failed', 'Users', found ? found.id : '', disabled ? 'disabled' : '');
     return fail(GENERIC);
   }
 
   await throttleReset(r, phone);
 
-  // Move an account onto the current hashing scheme the first time we can,
-  // now that we have the plaintext in hand.
-  if (needsRehash(found.password_hash, r.env.hashIterations)) {
-    const upgradeSalt = uuid();
-    await updateRow(r, 'Users', found.id, {
-      salt: upgradeSalt, password_hash: await hashPassword(password, upgradeSalt, r.env.hashIterations)
-    }, SYSTEM_ACTOR, true);
+  if (upgrade) {
+    await updateRow(r, 'Users', found.id, upgrade, SYSTEM_ACTOR, true);
     await log(r, SYSTEM_ACTOR, 'password-rehash', 'Users', found.id, 'upgraded to v3');
   }
 
@@ -1308,7 +1483,7 @@ async function doLogin(r, payload) {
   const data = { token: session.token, user: session.user, settings: await readSettings(r) };
   // Signing in is always followed by a request for all the data; answer
   // both at once. Built through bootstrap(), so it obeys the same role limits.
-  if (payload.withSnapshot) data.snapshot = await bootstrap(r, session.user);
+  if (payload.withSnapshot) data.snapshot = await bootstrap(r, session.user, null, !!payload.lean);
   return ok(data);
 }
 
@@ -1327,24 +1502,46 @@ async function issueSession(r, account, at) {
   return { token, user };
 }
 
-async function changePassword(r, payload, user) {
-  const me = await findRow(r, 'Users', user.id);
-  if (!me) throw new Error('User not found');
-  if (!(await passwordMatches(payload.current || '', me.salt, me.password_hash))) {
-    throw new Error('Current password is incorrect');
-  }
-  assertPasswordAcceptable(payload.next, me.phone);
+/**
+ * Split like login(): both hashes run outside the request lock, and wrong
+ * current passwords are throttled like failed sign-ins, so a stolen session
+ * cannot be used to guess the password behind it.
+ */
+async function changePassword(run, env, payload, token) {
+  const before = await run(async (r) => {
+    const user = await requireAuth(r, token);
+    const me = await findRow(r, 'Users', user.id);
+    if (!me) throw new Error('User not found');
+    assertPasswordAcceptable(payload.next, me.phone);
+    const key = normalisePhone(me.phone);
+    await throttleCheck(r, key);
+    await throttleCharge(r, key);
+    return { id: me.id, salt: me.salt, password_hash: me.password_hash };
+  });
+
+  const matches = await passwordMatches(payload.current || '', before.salt, before.password_hash);
   const salt = uuid();
-  const at = Date.now();
-  await updateRow(r, 'Users', me.id, {
-    salt, password_hash: await hashPassword(payload.next, salt, r.env.hashIterations),
-    password_changed_at: at
-  }, SYSTEM_ACTOR, true);
-  await log(r, user, 'password-change', 'Users', me.id, '');
-  // The change ends every session minted before it — including the one it was
-  // made from. Hand that one a replacement.
-  const session = await issueSession(r, me, at);
-  return { changed: true, token: session.token, user: session.user };
+  const hash = matches ? await hashPassword(payload.next, salt, env.hashIterations) : null;
+
+  return run(async (r) => {
+    const user = await requireAuth(r, token);
+    const me = await findRow(r, 'Users', user.id);
+    if (!me || String(me.password_hash) !== String(before.password_hash)) {
+      throw new Error('Your password was changed in the meantime. Sign in again.');
+    }
+    if (!matches) {
+      await log(r, user, 'password-change-failed', 'Users', me.id, 'wrong current password');
+      return fail('Current password is incorrect');
+    }
+    await throttleReset(r, normalisePhone(me.phone));
+    const at = Date.now();
+    await updateRow(r, 'Users', me.id, { salt, password_hash: hash, password_changed_at: at }, SYSTEM_ACTOR, true);
+    await log(r, user, 'password-change', 'Users', me.id, '');
+    // The change ends every session minted before it — including the one it was
+    // made from. Hand that one a replacement.
+    const session = await issueSession(r, me, at);
+    return ok({ changed: true, token: session.token, user: session.user });
+  });
 }
 
 async function createUser(r, payload, user) {
@@ -1500,14 +1697,71 @@ const COLLECTIONS = {
 };
 
 /**
- * One round-trip that hands the SPA everything it needs.
- *
- * @param known the table versions the browser already holds. A table whose
- *   version still matches is left out and named in `unchanged`, so a save that
- *   touched one table does not send back all of them — and an unchanged
- *   table is not even read.
+ * The small tables a lean browser keeps whole. Everything else in COLLECTIONS
+ * it pages through (queries.js).
  */
-async function bootstrap(r, user, known) {
+const KEPT = { properties: 'Properties', units: 'Units', tenants: 'Tenants', leases: 'Leases' };
+
+/**
+ * Tables a kept collection's figures are worked out from (DERIVED below). Its
+ * fingerprint covers them too, so a new payment refreshes the leases' deposit
+ * figures even though no lease row changed.
+ */
+const DERIVED_FROM = {
+  properties: ['properties', 'invoices'],
+  units:      ['units', 'invoices'],
+  tenants:    ['tenants', 'invoices'],
+  leases:     ['leases', 'invoices', 'invoice_items', 'payments', 'expenses']
+};
+
+/**
+ * Figures the cards show that depend on invoices and payments the browser no
+ * longer holds: what each tenant, unit and property owes, where each lease's
+ * deposit stands, and how far its rent has been billed.
+ */
+async function derivedFigures(r) {
+  const owed = { tenant_id: {}, unit_id: {}, property_id: {} };
+  const invoices = await readTable(r, 'Invoices');
+  for (const inv of invoices) {
+    if (OPEN_STATUSES.indexOf(String(inv.status)) < 0) continue;
+    for (const k of Object.keys(owed)) {
+      if (inv[k]) owed[k][inv[k]] = round2((owed[k][inv[k]] || 0) + num(inv.balance));
+    }
+  }
+  // the last day any rent invoice on a lease covers — where the next one starts
+  const rentLines = new Set((await readTable(r, 'InvoiceItems'))
+    .filter(i => String(i.category) === 'Rent').map(i => i.invoice_id));
+  const billed = {};
+  for (const inv of invoices) {
+    if (!inv.lease_id) continue;
+    if (!(String(inv.type) === 'Rent' || (inv.period_start && rentLines.has(inv.id)))) continue;
+    const end = String(inv.period_end || '').slice(0, 10);
+    if (end > (billed[inv.lease_id] || '')) billed[inv.lease_id] = end;
+  }
+  const ledgers = await depositLedgers(r, await readTable(r, 'Leases'));
+  return { owed, billed, ledgers };
+}
+
+const DERIVED = {
+  properties: (row, f) => ({ ...row, _owed: f.owed.property_id[row.id] || 0 }),
+  units:      (row, f) => ({ ...row, _owed: f.owed.unit_id[row.id] || 0 }),
+  tenants:    (row, f) => ({ ...row, _owed: f.owed.tenant_id[row.id] || 0 }),
+  leases:     (row, f) => ({ ...row, _billed_through: f.billed[row.id] || '',
+                             _deposit: f.ledgers[row.id] || { received: 0, applied: 0, refunded: 0, held: 0 } })
+};
+
+/**
+ * One round-trip that hands the SPA what it keeps.
+ *
+ * @param known the fingerprints of what the browser already holds. A
+ *   collection whose fingerprint still matches is left out and named in
+ *   `unchanged`, so a save that touched one table does not send back all of
+ *   them — and an unchanged table is not even read.
+ * @param lean  a current browser: only the small tables, with their derived
+ *   figures, plus the dashboard's lists and Billing's figures. Without it,
+ *   every table whole, for a browser still running the previous release.
+ */
+async function bootstrap(r, user, known, lean) {
   await refreshIfStale(r, user);
   known = known || {};
   const versions = await tableVersions(r);
@@ -1522,16 +1776,36 @@ async function bootstrap(r, user, known) {
     // the zone "today" is measured in — dates change over at its midnight
     timezone: r.tz,
     users: (user.role === 'admin' ? (await readTable(r, 'Users')).map(scrubUser) : []),
-    activity: (ROLE_RANK[user.role] >= ROLE_RANK[readRoleFor('ActivityLog')]
-      ? (await readTableTail(r, 'ActivityLog', 200)).reverse() : []),
     stats: await computeStats(r)
   };
-  for (const key of Object.keys(COLLECTIONS)) {
-    const table = COLLECTIONS[key];
-    const hash = instance + '.' + (versions[TABLES[table].sql] || 0);
+
+  if (!lean) {
+    out.activity = ROLE_RANK[user.role] >= ROLE_RANK[readRoleFor('ActivityLog')]
+      ? (await readTableTail(r, 'ActivityLog', 200)).reverse() : [];
+    for (const key of Object.keys(COLLECTIONS)) {
+      const table = COLLECTIONS[key];
+      // A masked copy is a different copy: a viewer promoted to manager must not
+      // be told the masked rows they already hold are still current.
+      const hash = instance + '.' + (versions[TABLES[table].sql] || 0) + (maskedColumns(user, table) ? '.m' : '');
+      out.hashes[key] = hash;
+      if (known[key] && known[key] === hash) out.unchanged.push(key);
+      else out[key] = (await readTable(r, table)).map(row => forClient(table, row, user));
+    }
+    return out;
+  }
+
+  out.lean = true;
+  out.dashboard = await dashboardData(r);
+  out.billing = await billingFigures(r);
+  let figures = null;
+  for (const key of Object.keys(KEPT)) {
+    const table = KEPT[key];
+    const hash = instance + '.' + DERIVED_FROM[key].map(t => versions[t] || 0).join('-') +
+                 (maskedColumns(user, table) ? '.m' : '');
     out.hashes[key] = hash;
-    if (known[key] && known[key] === hash) out.unchanged.push(key);
-    else out[key] = await readTable(r, table);
+    if (known[key] && known[key] === hash) { out.unchanged.push(key); continue; }
+    figures = figures || await derivedFigures(r);
+    out[key] = (await readTable(r, table)).map(row => DERIVED[key](forClient(table, row, user), figures));
   }
   return out;
 }
@@ -2260,12 +2534,27 @@ async function applyLateFees(r, actor) {
 /** Keep the audit trail to a workable size, trimming in batches. */
 export const ACTIVITY_LOG_KEEP = 5000;
 
+/**
+ * Failed sign-ins are trimmed on their own allowance. Anyone on the internet
+ * can add them, so counting them against the real history would let a stranger
+ * push every payment, deletion and role change out of the log.
+ */
+export const FAILED_LOGIN_KEEP = 1000;
+
 async function pruneActivityLog(r) {
-  const [{ n }] = await r.tx`select count(*)::int as n from activity_log`;
-  const excess = Number(n) - ACTIVITY_LOG_KEEP;
+  const trimmed = await trimActivityLog(r, true, FAILED_LOGIN_KEEP) +
+                  await trimActivityLog(r, false, ACTIVITY_LOG_KEEP);
+  if (trimmed) invalidate(r, 'ActivityLog');
+  return trimmed;
+}
+
+async function trimActivityLog(r, failedLogins, keep) {
+  const [{ n }] = await r.tx`
+    select count(*)::int as n from activity_log where (action = 'login-failed') = ${failedLogins}`;
+  const excess = Number(n) - keep;
   if (excess < 500) return 0;
-  await r.tx`delete from activity_log where seq in (select seq from activity_log order by seq limit ${excess})`;
-  invalidate(r, 'ActivityLog');
+  await r.tx`delete from activity_log where seq in (
+    select seq from activity_log where (action = 'login-failed') = ${failedLogins} order by seq limit ${excess})`;
   return excess;
 }
 

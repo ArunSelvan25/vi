@@ -6,32 +6,50 @@ import { setFormatterSettings, isoDate, isoMonth } from './ui.js';
 /** id → row, per collection array. See store.byId. */
 const ID_INDEX = new WeakMap();
 
-/** The collections a bootstrap carries, each fingerprinted by the server. */
-const COLLECTIONS = ['properties', 'units', 'tenants', 'leases', 'invoices', 'invoiceItems',
-                     'payments', 'maintenance', 'expenses', 'documents'];
+/**
+ * The small tables every screen reads, kept whole in the browser: a portfolio
+ * has only so many properties, units, tenants and leases. Each arrives with
+ * the figures the server works out for it (what a tenant owes, where a lease's
+ * deposit stands), so cards and lists can show them without the invoices.
+ */
+const COLLECTIONS = ['properties', 'units', 'tenants', 'leases'];
 
 /**
- * Client-side cache of all the data. Bootstrap pulls every table in one
- * round-trip, then mutations patch the
- * cache locally so the UI stays instant.
+ * The tables that grow without limit. A screen asks the server for the page it
+ * shows (store.page) or for a record and what surrounds it (store.detail).
+ * Rows that arrive either way are remembered, so a name or a hover card
+ * elsewhere can still find them.
  */
+export const REMOTE = new Set(['invoices', 'invoiceItems', 'payments', 'maintenance', 'expenses', 'documents']);
+
+/** The server's name for a collection. */
+const TABLE_OF = { invoiceItems: 'InvoiceItems', activity: 'ActivityLog' };
+export const tableOf = (entity) => (entities[entity] ? entities[entity].table : TABLE_OF[entity] || entity);
+
+/** An export asks for every matching row in one request, up to the server's limit. */
+const EXPORT_ROWS = 5000;
+
 export const store = {
   loaded: false,
   settings: {},
   stats: {},
-  activity: [],
+  /** Billing's figures: outstanding, overdue, due this week, collected this month. */
+  billing: {},
+  /** The dashboard's lists and trend. */
+  dashboard: {},
   users: [],
   /** Server fingerprint of each collection as it was last received. */
   hashes: {},
   properties: [], units: [], tenants: [], leases: [],
-  invoices: [], invoiceItems: [], payments: [], maintenance: [], expenses: [], documents: [],
+  /** Rows of REMOTE collections seen so far, by collection and id. */
+  cache: new Map(),
 
   listeners: new Set(),
   subscribe(fn) { this.listeners.add(fn); return () => this.listeners.delete(fn); },
   emit() { this.listeners.forEach(fn => fn(this)); },
 
   async load() {
-    return this.apply(await api('bootstrap', { known: this.known() }));
+    return this.apply(await api('bootstrap', { known: this.known(), lean: true }));
   },
 
   /**
@@ -45,7 +63,7 @@ export const store = {
 
   /** Payload fields that ask for a snapshot with a write. */
   snapshotRequest() {
-    return { withSnapshot: true, known: this.known() };
+    return { withSnapshot: true, lean: true, known: this.known() };
   },
 
   /**
@@ -57,7 +75,8 @@ export const store = {
     const next = {
       settings: data.settings || {},
       stats: data.stats || {},
-      activity: data.activity || [],
+      billing: data.billing || {},
+      dashboard: data.dashboard || {},
       users: data.users || [],
       hashes: data.hashes || {},
       loaded: true
@@ -92,6 +111,83 @@ export const store = {
    */
   forget(entity) { delete this.hashes[entity]; },
 
+  // ── the growing tables, from the server ─────────────────────────────────
+
+  /** Keep rows that arrived with a page or a record, so byId and label find them. */
+  remember(entity, rows) {
+    if (!rows) return;
+    let known = this.cache.get(entity);
+    if (!known) { known = new Map(); this.cache.set(entity, known); }
+    for (const row of [].concat(rows)) if (row && row.id) known.set(row.id, row);
+  },
+
+  /** Take in a response's rows and the rows it points at (`refs`). */
+  rememberAll(entity, res) {
+    if (!res) return res;
+    this.remember(entity, res.rows);
+    for (const [other, rows] of Object.entries(res.refs || {})) this.remember(other, rows);
+    return res;
+  },
+
+  /**
+   * One page of a growing table, searched, filtered and sorted by the server.
+   * @param params { scope: {kind, id}, preset, filters, q, sort, dir, page, pageSize }
+   * @returns { rows, total, page, pageSize }
+   */
+  async page(entity, params = {}) {
+    return this.rememberAll(entity, await api('page', { table: tableOf(entity), ...params }));
+  },
+
+  /** Every row matching `params`, up to EXPORT_ROWS — for CSV exports and statements. */
+  async everything(entity, params = {}) {
+    const res = await this.page(entity, { ...params, page: 1, pageSize: EXPORT_ROWS, export: true });
+    return res.rows;
+  },
+
+  /**
+   * What a record's page shows. For a property, unit, tenant or lease: counts,
+   * money figures and the most recent related records. For anything else: the
+   * row itself and what sits beside it on its page.
+   */
+  async detail(entity, id) {
+    const res = await api('detail', { table: tableOf(entity), id });
+    if (res.row) this.remember(entity, res.row);
+    this.remember('invoices', [].concat(res.recentInvoices || [], res.unpaid || [], res.invoice || []));
+    this.remember('payments', [].concat(res.recentPayments || [], res.payments || [], res.others || []));
+    this.remember('expenses', [].concat(res.recentExpenses || [], res.expense || []));
+    this.remember('maintenance', [].concat(res.openTickets || [], res.ticket || []));
+    this.remember('invoiceItems', res.items || []);
+    for (const [other, rows] of Object.entries(res.refs || {})) this.remember(other, rows);
+    return res;
+  },
+
+  /** A property, unit, tenant or lease's invoices, payments and tickets in full. */
+  async history(entity, id) {
+    const res = await api('history', { table: tableOf(entity), id });
+    this.remember('invoices', res.invoices || []);
+    this.remember('payments', res.payments || []);
+    this.remember('maintenance', res.maintenance || []);
+    return res;
+  },
+
+  /** The Reports screen's figures for a date range and, optionally, one property. */
+  async report(params) { return api('report', params); },
+
+  /** A remote row by id: from what has been seen, or else from the server. */
+  async fetchRow(entity, id) {
+    if (!id) return null;
+    const known = this.byId(entity, id);
+    if (known) return known;
+    const res = await this.page(entity, { ids: [id], pageSize: 1 });
+    return res.rows[0] || null;
+  },
+
+  /**
+   * A write can change any page, so what was remembered is dropped and the
+   * screens fetch afresh when they redraw.
+   */
+  touch() { this.cache.clear(); },
+
   // ── CRUD that keeps the cache in step ───────────────────────────────────
 
   /**
@@ -99,16 +195,19 @@ export const store = {
    * whether its unit reads as Occupied, a payment decides an invoice's balance
    * — so the local cache cannot be patched from the response alone. Re-pull
    * instead, otherwise the screen disagrees with the database until a manual
-   * refresh.
+   * refresh. A write to a growing table always takes a snapshot: it moves the
+   * dashboard, Billing's figures and what tenants owe.
    */
   CASCADING: new Set(['leases', 'units', 'payments', 'invoices', 'maintenance']),
 
+  cascades(entity) { return REMOTE.has(entity) || this.CASCADING.has(entity); },
+
   async create(entity, data) {
-    const cascades = this.CASCADING.has(entity);
-    const res = await api('create', { table: entities[entity].table, data,
+    const cascades = this.cascades(entity);
+    const res = await api('create', { table: tableOf(entity), data,
                                       ...(cascades ? this.snapshotRequest() : {}) });
-    this[entity] = [...this[entity], res.row];
-    this.forget(entity);
+    if (REMOTE.has(entity)) this.touch();
+    else { this[entity] = [...this[entity], res.row]; this.forget(entity); }
     if (cascades) await this.syncFrom(res); else this.emit();
     return res.row;
   },
@@ -118,33 +217,29 @@ export const store = {
    *   the server refuses the save if someone else has changed it since.
    */
   async update(entity, id, data, { expectedVersion } = {}) {
-    const cascades = this.CASCADING.has(entity);
-    const res = await api('update', { table: entities[entity].table, id, data,
+    const cascades = this.cascades(entity);
+    const res = await api('update', { table: tableOf(entity), id, data,
                                       expected_version: expectedVersion,
                                       ...(cascades ? this.snapshotRequest() : {}) });
-    this[entity] = this[entity].map(r => (r.id === id ? { ...r, ...res.row } : r));
-    this.forget(entity);
+    if (REMOTE.has(entity)) this.touch();
+    else { this[entity] = this[entity].map(r => (r.id === id ? { ...r, ...res.row } : r)); this.forget(entity); }
     if (cascades) await this.syncFrom(res); else this.emit();
     return res.row;
   },
 
   async remove(entity, id) {
-    const cascades = this.CASCADING.has(entity);
-    const res = await api('remove', { table: entities[entity].table, id,
+    const cascades = this.cascades(entity);
+    const res = await api('remove', { table: tableOf(entity), id,
                                       ...(cascades ? this.snapshotRequest() : {}) });
-    this[entity] = this[entity].filter(r => r.id !== id);
-    this.forget(entity);
-    // the server cascades an invoice's line items; mirror that locally
-    if (entity === 'invoices') {
-      this.invoiceItems = this.invoiceItems.filter(i => i.invoice_id !== id);
-      this.forget('invoiceItems');
-    }
+    if (REMOTE.has(entity)) this.touch();
+    else { this[entity] = this[entity].filter(r => r.id !== id); this.forget(entity); }
     if (cascades) await this.syncFrom(res); else this.emit();
   },
 
   /** Run a server action that writes, and take the snapshot it sends back. */
   async act(action, payload = {}) {
     const res = await api(action, { ...payload, ...this.snapshotRequest() });
+    this.touch();
     await this.syncFrom(res);
     return res;
   },
@@ -161,6 +256,7 @@ export const store = {
    * so keying the index on the array itself means it can never go stale.
    */
   byId(entity, id) {
+    if (REMOTE.has(entity)) return (this.cache.get(entity) && this.cache.get(entity).get(id)) || null;
     const rows = this[entity];
     if (!Array.isArray(rows)) return null;
     let index = ID_INDEX.get(rows);
@@ -220,12 +316,11 @@ export const store = {
     return this.leases.find(l => l.unit_id === unitId && l.status === 'Active') || null;
   },
 
-  invoicesOfTenant(tenantId) { return this.invoices.filter(i => i.tenant_id === tenantId); },
-
-  paymentsOfInvoice(invoiceId) { return this.payments.filter(p => p.invoice_id === invoiceId); },
-
-  /** The charges that make up an invoice — rent, electricity, water, … */
-  itemsOfInvoice(invoiceId) { return this.invoiceItems.filter(i => i.invoice_id === invoiceId); },
+  /** What a tenant, unit or property owes now, worked out by the server. */
+  owedBy(entity, id) {
+    const row = this.byId(entity, id);
+    return Number((row && row._owed) || 0);
+  },
 
   /**
    * Create or update an invoice together with its line items.
@@ -234,43 +329,27 @@ export const store = {
   async saveInvoice({ id, data, items, expectedVersion }) {
     const res = await api('saveInvoice', { id, data, items, expected_version: expectedVersion,
                                            ...this.snapshotRequest() });
+    this.touch();
     await this.syncFrom(res);
     return res;
   },
 
-  // ── money: what counts as income ────────────────────────────────────────
+  // ── money ─────────────────────────────────────────────────────────────────
 
   /**
    * A payment that is not income: money received against a security deposit.
-   * Deposits are held for the tenant; they reach income only when applied to an
-   * invoice at move-out, which is a separate payment on that invoice.
+   * The server marks each payment it sends (`_deposit`).
    */
-  isDepositPayment(p) {
-    const inv = this.byId('invoices', p.invoice_id);
-    return !!inv && inv.type === 'Deposit';
-  },
+  isDepositPayment(p) { return !!p && p._deposit === true; },
 
   /** Returning a deposit is money going back, not an operating expense. */
   isDepositRefund(e) { return e.category === 'Deposit Refund'; },
 
-  incomePayments(rows = this.payments) { return rows.filter(p => !this.isDepositPayment(p)); },
-
-  operatingExpenses(rows = this.expenses) { return rows.filter(e => !this.isDepositRefund(e)); },
-
-  /** Where a lease's security deposit stands — mirrors depositLedger in the backend. */
+  /** Where a lease's security deposit stands — worked out by the server (depositLedgers). */
   depositLedger(lease) {
-    const deposits = this.invoices.filter(i => i.lease_id === lease.id && i.type === 'Deposit' && i.status !== 'Void');
-    const paid = deposits.reduce((s, i) => s + Number(i.amount_paid || 0), 0);
-    const status = String(lease.deposit_status || '');
-    const received = paid > 0 ? paid : (status && status !== 'Pending' ? Number(lease.deposit_amount || 0) : 0);
-    const applied = this.payments
-      .filter(p => p.method === 'Deposit Adjustment' && p.reference === lease.id)
-      .reduce((s, p) => s + Number(p.amount || 0), 0);
-    const refunded = this.expenses
-      .filter(e => e.category === 'Deposit Refund' && e.reference === lease.id)
-      .reduce((s, e) => s + Number(e.amount || 0), 0);
-    const held = status === 'Transferred' ? 0 : Math.max(0, round2(received - applied - refunded));
-    return { received: round2(received), applied: round2(applied), refunded: round2(refunded), held };
+    const d = (lease && lease._deposit) || {};
+    return { received: Number(d.received || 0), applied: Number(d.applied || 0),
+             refunded: Number(d.refunded || 0), held: Number(d.held || 0) };
   },
 
   /** The monthly rent in force on a date, escalation compounded — mirrors currentMonthlyRent in the backend. */
@@ -305,10 +384,7 @@ export const store = {
     const span = (a, b) => Math.round((b - a) / 86400000) + 1;
 
     // where billing stands: the last day any rent invoice on this lease covers
-    const rentLines = new Set(this.invoiceItems.filter(i => i.category === 'Rent').map(i => i.invoice_id));
-    const through = this.invoices
-      .filter(i => i.lease_id === lease.id && (i.type === 'Rent' || (i.period_start && rentLines.has(i.id))))
-      .reduce((m, i) => (String(i.period_end || '') > m ? String(i.period_end).slice(0, 10) : m), '');
+    const through = String(lease._billed_through || '');
 
     let cursor = day(lease.start_date);
     if (through && plus(day(through), 1) > cursor) cursor = plus(day(through), 1);
@@ -344,49 +420,11 @@ export const store = {
     };
   },
 
-  /** Outstanding balance per tenant, biggest first. */
-  arrears(filter) {
-    const map = new Map();
-    for (const inv of this.invoices) {
-      if (filter && !filter(inv)) continue;
-      const bal = Number(inv.balance || 0);
-      if (bal <= 0 || ['Void', 'Draft'].includes(inv.status)) continue;
-      const cur = map.get(inv.tenant_id) || { tenant_id: inv.tenant_id, balance: 0, invoices: 0, oldest: null };
-      cur.balance += bal;
-      cur.invoices += 1;
-      if (!cur.oldest || inv.due_date < cur.oldest) cur.oldest = inv.due_date;
-      map.set(inv.tenant_id, cur);
-    }
-    return [...map.values()].sort((a, b) => b.balance - a.balance);
-  },
-
-  /**
-   * Collected vs. spent per month, oldest first — deposits in and out left out.
-   *
-   * @param months how many months, ending with the month of `end`
-   * @param opts.end   last month to include (default: this month)
-   * @param opts.match row filter, e.g. one property
-   */
-  monthlySeries(months = 6, { end = new Date(), match } = {}) {
-    const out = [];
-    const payments = this.incomePayments().filter(p => !match || match(p));
-    const expenses = this.operatingExpenses().filter(e => !match || match(e));
-    for (let i = months - 1; i >= 0; i--) {
-      const d = new Date(end.getFullYear(), end.getMonth() - i, 1);
-      const key = isoMonth(d);
-      const income = payments
-        .filter(p => String(p.payment_date || '').slice(0, 7) === key)
-        .reduce((s, p) => s + Number(p.amount || 0), 0);
-      const expense = expenses
-        .filter(e => String(e.date || '').slice(0, 7) === key)
-        .reduce((s, e) => s + Number(e.amount || 0), 0);
-      out.push({
-        key,
-        label: d.toLocaleDateString('en', { month: 'short' }),
-        income, expense, net: income - expense
-      });
-    }
-    return out;
+  /** Month keys (yyyy-MM) from the server, with the short month name a chart shows. */
+  labelSeries(series) {
+    return (series || []).map(m => ({
+      ...m, label: new Date(m.key + '-01T00:00:00').toLocaleDateString('en', { month: 'short' })
+    }));
   },
 
   /** Leases ending within `days`, soonest first. */
@@ -398,14 +436,6 @@ export const store = {
       .filter(l => l.status === 'Active' && l.end_date && l.end_date >= todayStr && l.end_date <= limitStr)
       .filter(l => !this.leases.some(n => n.renewed_from === l.id))
       .sort((a, b) => String(a.end_date).localeCompare(String(b.end_date)));
-  },
-
-  expiringDocuments(days = 60) {
-    const limit = new Date(); limit.setDate(limit.getDate() + days);
-    const limitStr = isoDate(limit);
-    return this.documents
-      .filter(d => d.expiry_date && d.expiry_date <= limitStr)
-      .sort((a, b) => String(a.expiry_date).localeCompare(String(b.expiry_date)));
   },
 
   can(minRole) {

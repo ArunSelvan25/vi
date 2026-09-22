@@ -505,6 +505,187 @@ await check('bootstrap never returns password hashes', async () => {
   assert(!/"salt"/.test(dump), 'salt leaked to the client');
 });
 
+// ── sign-in floods cannot stall the app ─────────────────────────────────────
+console.log('\n— sign-in floods cannot stall the app —');
+await check('password hashing does not hold the request lock', async () => {
+  // production-strength hashing, so each sign-in takes real time
+  const b = await makeSandbox({ hashIterations: PBKDF2_ITERATIONS, connections: 4 });
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = (await b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '')).data.token;
+  const order = [];
+  const flood = Array.from({ length: 6 }, (_, i) =>
+    b.handle('login', { phone: `95000${String(i).padStart(5, '0')}`, password: 'x' }, '').then(() => order.push('login')));
+  await new Promise(res => setTimeout(res, 20));
+  const work = b.handle('bootstrap', {}, admin).then(() => order.push('bootstrap'));
+  await Promise.all([...flood, work]);
+  assert(order.indexOf('bootstrap') < order.length - 1,
+         'a signed-in request waited for every anonymous sign-in to finish hashing: ' + order.join(','));
+});
+await check('a burst of parallel guesses gets no more tries than sequential ones', async () => {
+  const b = await makeSandbox({ connections: 4 });
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const results = await Promise.all(Array.from({ length: 12 }, (_, i) =>
+    b.handle('login', { phone: '9000000001', password: 'guess-' + i }, '')));
+  const checked = results.filter(r => /Invalid phone number or password/.test(r.error)).length;
+  assert(checked <= b.THROTTLE.freeAttempts + 1, checked + ' of 12 parallel guesses had their password checked');
+});
+await check('wrong current passwords on changePassword are throttled', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = (await b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '')).data.token;
+  let limited = false;
+  for (let i = 0; i < 8 && !limited; i++) {
+    const r = await b.handle('changePassword', { current: 'guess-' + i, next: 'a-brand-new-passphrase' }, admin);
+    assert(r.ok === false, 'a wrong current password was accepted');
+    limited = /Too many/.test(r.error);
+  }
+  assert(limited, 'eight wrong current passwords were never throttled');
+});
+
+// ── failed sign-ins cannot wipe the audit trail ─────────────────────────────
+console.log('\n— failed sign-ins cannot wipe the audit trail —');
+await check('a flood of failed sign-ins does not push real history out of the log', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = (await b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '')).data.token;
+  await b.handle('create', { table: 'Tenants', data: { full_name: 'Evidence' } }, admin);
+  await b.query(`insert into activity_log (id, timestamp, actor, action, entity)
+                 select 'LOG-F' || g, now(), '9' || g, 'login-failed', 'Users' from generate_series(1, 8000) g`);
+  await b.refreshStatuses();
+  const [{ real, noise }] = await b.query(`select count(*) filter (where action <> 'login-failed')::int as real,
+                                                 count(*) filter (where action = 'login-failed')::int as noise
+                                          from activity_log`);
+  const [{ n }] = await b.query(`select count(*)::int as n from activity_log
+                                 where action = 'create' and entity = 'Tenants'`);
+  assert(n === 1, 'the record of a real change was pruned away by failed sign-ins');
+  assert(real > 0 && noise <= 1000, `log after pruning: ${real} real, ${noise} failed sign-ins`);
+});
+
+// ── only an administrator takes money back ──────────────────────────────────
+console.log('\n— only an administrator takes money back —');
+await check('a manager cannot zero or move a recorded payment through a plain edit', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = (await b.handle('login', { phone: '9000000001', password: 'correct-horse-battery' }, '')).data.token;
+  await b.handle('createUser', { name: 'M', phone: '9000000004', role: 'manager', password: 'manager-pass-1234' }, admin);
+  const mgr = (await b.handle('login', { phone: '9000000004', password: 'manager-pass-1234' }, '')).data.token;
+  const t = (await b.handle('create', { table: 'Tenants', data: { full_name: 'T' } }, admin)).data.row;
+  const newInvoice = async () => (await b.handle('create', { table: 'Invoices', data: {
+    tenant_id: t.id, type: 'Utility', due_date: '2030-01-01', amount: 500 } }, admin)).data.row;
+  const inv = await newInvoice(), other = await newInvoice();
+  const pay = (await b.handle('recordPayment', { invoice_id: inv.id, amount: 500, method: 'Cash' }, admin)).data.payment;
+
+  const lowered = await b.handle('update', { table: 'Payments', id: pay.id, data: { amount: 1 } }, mgr);
+  assert(lowered.ok === false && /administrator/.test(lowered.error), 'manager lowered a payment: ' + JSON.stringify(lowered));
+  const moved = await b.handle('update', { table: 'Payments', id: pay.id, data: { invoice_id: other.id } }, mgr);
+  assert(moved.ok === false, 'manager moved a payment to another invoice');
+  const note = await b.handle('update', { table: 'Payments', id: pay.id, data: { amount: 500, notes: 'receipt 42' } }, mgr);
+  assert(note.ok, 'manager could not correct the notes on a payment: ' + note.error);
+  const fixed = await b.handle('update', { table: 'Payments', id: pay.id, data: { amount: 400 } }, admin);
+  assert(fixed.ok, 'admin could not correct a payment: ' + fixed.error);
+});
+
+// ── signing out ends the session on the server ──────────────────────────────
+console.log('\n— signing out ends the session on the server —');
+const signIn = async (b, phone, password) =>
+  (await b.handle('login', { phone, password }, '')).data.token;
+const works = async (b, token) => (await b.handle('bootstrap', {}, token)).ok;
+
+await check('a signed-out token stops working; the same account on another device does not', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const laptop = await signIn(b, '9000000001', 'correct-horse-battery');
+  const phone = await signIn(b, '9000000001', 'correct-horse-battery');
+  const out = await b.handle('logout', {}, laptop);
+  assert(out.ok, 'logout failed: ' + out.error);
+  assert(!(await works(b, laptop)), 'the token still works after signing out');
+  assert(await works(b, phone), 'signing out one device signed out the other');
+  const [row] = await b.query('select token_hash from revoked_sessions');
+  assert(row && row.token_hash !== laptop && !String(row.token_hash).includes('.'), 'the token itself was stored');
+});
+await check('logout with a bad or missing token answers ok and stores nothing', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  for (const t of ['', 'garbage', 'a.b']) assert((await b.handle('logout', {}, t)).ok, 'logout refused ' + JSON.stringify(t));
+  const [{ n }] = await b.query('select count(*)::int as n from revoked_sessions');
+  assert(n === 0, n + ' rows stored for invalid tokens');
+});
+await check('expired revocations are purged', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  await b.query(`insert into revoked_sessions values ('old', now() - interval '1 hour')`);
+  await b.handle('logout', {}, await signIn(b, '9000000001', 'correct-horse-battery'));
+  const rows = await b.query(`select token_hash from revoked_sessions where token_hash = 'old'`);
+  assert(rows.length === 0, 'an expired revocation was kept');
+});
+await check('"sign out other devices" ends every other session and keeps this one', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const here = await signIn(b, '9000000001', 'correct-horse-battery');
+  const elsewhere = await signIn(b, '9000000001', 'correct-horse-battery');
+  const r = await b.handle('endSessions', {}, here);
+  assert(r.ok && r.data.token, 'endSessions failed: ' + JSON.stringify(r));
+  assert(!(await works(b, elsewhere)), 'the other device is still signed in');
+  assert(!(await works(b, here)), 'the old token of this device survived');
+  assert(await works(b, r.data.token), 'the replacement token does not work');
+  assert(await works(b, await signIn(b, '9000000001', 'correct-horse-battery')), 'cannot sign in again afterwards');
+});
+await check('an admin can sign a user out everywhere; a manager cannot', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = await signIn(b, '9000000001', 'correct-horse-battery');
+  await b.handle('createUser', { name: 'M', phone: '9000000004', role: 'manager', password: 'manager-pass-1234' }, admin);
+  await b.handle('createUser', { name: 'V', phone: '9000000005', role: 'viewer', password: 'viewer-pass-1234' }, admin);
+  const mgr = await signIn(b, '9000000004', 'manager-pass-1234');
+  const viewer = await signIn(b, '9000000005', 'viewer-pass-1234');
+  const ids = Object.fromEntries((await b.readTable('Users')).map(u => [u.phone, u.id]));
+
+  const denied = await b.handle('endSessions', { id: ids['9000000005'] }, mgr);
+  assert(denied.ok === false, 'a manager signed another user out');
+  assert(await works(b, viewer), 'the refused request still ended the session');
+  assert((await b.handle('endSessions', { id: ids['9000000005'] }, admin)).ok, 'admin could not sign the user out');
+  assert(!(await works(b, viewer)), 'the user is still signed in');
+  assert(await works(b, admin), 'the admin lost their own session');
+});
+
+// ── tenant ID numbers are masked below manager ──────────────────────────────
+console.log('\n— tenant ID numbers are masked below manager —');
+await check('a viewer gets ID numbers masked, a manager in full', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = await signIn(b, '9000000001', 'correct-horse-battery');
+  await b.handle('create', { table: 'Tenants', data: { full_name: 'A', id_type: 'Aadhaar', id_number: '1234 5678 9012' } }, admin);
+  await b.handle('create', { table: 'Tenants', data: { full_name: 'B', id_type: 'Other', id_number: 'AB12' } }, admin);
+  await b.handle('createUser', { name: 'M', phone: '9000000004', role: 'manager', password: 'manager-pass-1234' }, admin);
+  await b.handle('createUser', { name: 'V', phone: '9000000005', role: 'viewer', password: 'viewer-pass-1234' }, admin);
+  const mgr = await signIn(b, '9000000004', 'manager-pass-1234');
+  const viewer = await signIn(b, '9000000005', 'viewer-pass-1234');
+
+  const ids = (rows) => rows.map(t => t.id_number).sort().join(',');
+  const vBoot = (await b.handle('bootstrap', {}, viewer)).data.tenants;
+  const vList = (await b.handle('list', { table: 'Tenants' }, viewer)).data.rows;
+  const vLogin = (await b.handle('login', { phone: '9000000005', password: 'viewer-pass-1234', withSnapshot: true }, '')).data.snapshot.tenants;
+  for (const [where, rows] of [['bootstrap', vBoot], ['list', vList], ['login snapshot', vLogin]]) {
+    assert(ids(rows) === 'XXXX,XXXXXXXX9012', `viewer ${where} returned ${ids(rows)}`);
+  }
+  assert(ids((await b.handle('bootstrap', {}, mgr)).data.tenants) === '1234 5678 9012,AB12', 'manager did not get full numbers');
+  assert(ids((await b.handle('list', { table: 'Tenants' }, mgr)).data.rows) === '1234 5678 9012,AB12', 'manager list was masked');
+});
+await check('a viewer promoted to manager is not left holding the masked copy', async () => {
+  const b = await makeSandbox();
+  await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
+  const admin = await signIn(b, '9000000001', 'correct-horse-battery');
+  await b.handle('create', { table: 'Tenants', data: { full_name: 'A', id_number: '123456789012' } }, admin);
+  await b.handle('createUser', { name: 'V', phone: '9000000005', role: 'viewer', password: 'viewer-pass-1234' }, admin);
+  const viewer = await signIn(b, '9000000005', 'viewer-pass-1234');
+  const first = (await b.handle('bootstrap', {}, viewer)).data;
+  const id = (await b.readTable('Users')).find(u => u.phone === '9000000005').id;
+  await b.handle('setUserRole', { id, role: 'manager' }, admin);
+  const again = (await b.handle('bootstrap', { known: first.hashes }, viewer)).data;
+  assert(!again.unchanged.includes('tenants'), 'the server said the masked tenants were still current');
+  assert(again.tenants[0].id_number === '123456789012', 'still masked after promotion: ' + again.tenants[0].id_number);
+});
+
 await closeAll();
 console.log('\n' + '─'.repeat(56));
 console.log(fail ? `${fail} FAILED, ${pass} passed` : `ALL ${pass} SECURITY CHECKS PASSED`);

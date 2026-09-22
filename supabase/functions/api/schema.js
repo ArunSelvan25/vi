@@ -81,7 +81,8 @@ export const TABLES = {
 
   Users: { sql: 'app_users', prefix: 'USR', cols: {
     id: req, name: req, phone: req, email: text, role: oneOf('viewer'), salt: req, password_hash: req,
-    password_changed_at: col('ms'), active: col('bool', true), last_login: ts, ...STAMPS } },
+    password_changed_at: col('ms'), active: col('bool', true), last_login: ts, ...STAMPS,
+    sessions_revoked_at: col('ms') } },
 
   Settings: { sql: 'settings', key: 'key', cols: { key: req, value: req } },
 

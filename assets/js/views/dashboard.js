@@ -1,4 +1,4 @@
-import { el, icon, money, date, badge, daysBetween, today, isoDate } from '../ui.js';
+import { el, icon, money, date, badge, daysBetween, today } from '../ui.js';
 import { store } from '../store.js';
 import { navigate } from '../router.js';
 import { barChart, donut, rankedBars } from '../components/charts.js';
@@ -39,17 +39,13 @@ function panel(title, body, { action, count } = {}) {
 
 export function dashboardView() {
   const s = store.stats;
+  // the lists and trend below, worked out by the server with each snapshot
+  const d = store.dashboard;
   const wrap = el('div', { class: 'view' });
 
   // ── KPI row ─────────────────────────────────────────────────────────────
-  const now = new Date();
-  const lastStart = isoDate(new Date(now.getFullYear(), now.getMonth() - 1, 1));
-  const lastSameDay = isoDate(new Date(now.getFullYear(), now.getMonth() - 1,
-    Math.min(now.getDate(), new Date(now.getFullYear(), now.getMonth(), 0).getDate())));
-  const prevCollected = store.incomePayments()
-    .filter(p => p.payment_date >= lastStart && p.payment_date <= lastSameDay)
-    .reduce((t, p) => t + Number(p.amount || 0), 0);
-  const trend = delta(s.collected_this_month, prevCollected);
+  // collected by this day last month, to compare this month with
+  const trend = delta(s.collected_this_month, d.prev_collected || 0);
 
   const priorityAlerts = [];
   if (s.overdue > 0) {
@@ -129,7 +125,7 @@ export function dashboardView() {
   ]));
 
   // ── charts ──────────────────────────────────────────────────────────────
-  const series = store.monthlySeries(6);
+  const series = store.labelSeries(d.series);
   wrap.append(el('div', { class: 'grid-2' }, [
     panel('Cash flow · last 6 months', barChart(series)),
     panel('Occupancy', donut([
@@ -139,7 +135,7 @@ export function dashboardView() {
   ]));
 
   // ── attention lists ─────────────────────────────────────────────────────
-  const arrears = store.arrears().slice(0, 6);
+  const arrears = d.arrears || [];
   const arrearsBody = arrears.length
     ? rankedBars(arrears.map(a => ({
         label: store.label('tenants', a.tenant_id),
@@ -169,10 +165,8 @@ export function dashboardView() {
       }))
     : el('p', { class: 'muted', text: 'No leases expiring soon.' });
 
-  const openTickets = store.maintenance
-    .filter(m => ['Open', 'In Progress', 'On Hold'].includes(m.status))
-    .sort((a, b) => ({ Urgent: 0, High: 1, Medium: 2, Low: 3 }[a.priority] ?? 4)
-                  - ({ Urgent: 0, High: 1, Medium: 2, Low: 3 }[b.priority] ?? 4));
+  // most urgent first; the server sends the first eight and how many are open
+  const openTickets = d.tickets || [];
   const ticketBody = openTickets.length
     ? el('ul', { class: 'list' }, openTickets.slice(0, 8).map(m =>
         el('li', { class: 'list-row clickable', onClick: () => navigate('maintenance/' + m.id) }, [
@@ -184,7 +178,7 @@ export function dashboardView() {
         ])))
     : el('p', { class: 'muted', text: 'No open maintenance tickets.' });
 
-  const docs = store.expiringDocuments(60);
+  const docs = d.documents || [];
   const docBody = docs.length
     ? el('ul', { class: 'list' }, docs.slice(0, 6).map(d => {
         const expired = d.expiry_date < today();
@@ -212,11 +206,11 @@ export function dashboardView() {
 
   wrap.append(el('div', { class: 'grid-2' }, [
     panel('Maintenance queue', ticketBody, {
-      count: openTickets.length || undefined,
+      count: d.open_tickets || undefined,
       action: el('button', { class: 'btn btn-ghost btn-sm', onClick: () => navigate('maintenance') },
                  ['All tickets'])
     }),
-    panel('Documents expiring', docBody, { count: docs.length || undefined })
+    panel('Documents expiring', docBody, { count: d.expiring_documents || undefined })
   ]));
 
   const vacant = store.units.filter(u => u.status === 'Vacant');

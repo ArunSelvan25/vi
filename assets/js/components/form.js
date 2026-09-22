@@ -1,9 +1,32 @@
 import { el, modal, toast } from '../ui.js';
-import { store } from '../store.js';
+import { store, REMOTE } from '../store.js';
 import { entities, formFields, GSTIN_PATTERN } from '../schema.js';
 
-/** Build one input from a schema field. */
-function inputFor(field, value, form) {
+/**
+ * A choice among a growing table's rows — a payment's invoice. The browser
+ * does not hold them all, so the current value is an option straight away
+ * (a save that leaves it alone keeps it) and the rest are the same tenant's
+ * rows, fetched from the server.
+ */
+function remoteOptions(select, field, value, record) {
+  const entity = field.optionsFrom;
+  if (value) select.append(el('option', { value, selected: true }, [store.label(entity, value)]));
+  const tenantId = record && record.tenant_id;
+  if (!tenantId) return;
+  store.page(entity, { filters: { tenant_id: tenantId }, pageSize: 100 }).then((res) => {
+    for (const option of select.options) if (option.value === String(value)) option.textContent = store.label(entity, value);
+    for (const row of res.rows) {
+      if (row.id === value) continue;
+      select.append(el('option', { value: row.id }, [store.label(entity, row.id)]));
+    }
+  }).catch(() => { /* the current value stays; nothing else to offer */ });
+}
+
+/**
+ * Build one input from a schema field.
+ * @param record the values the form opened with — a remote choice uses it to narrow its options
+ */
+function inputFor(field, value, record) {
   const id = 'f_' + field.key;
   const common = { id, name: field.key, class: 'input', 'data-key': field.key };
 
@@ -14,6 +37,12 @@ function inputFor(field, value, form) {
   if (field.type === 'select' || field.type === 'ref') {
     const select = el('select', common);
     select.append(el('option', { value: '', text: field.blank || (field.required ? 'Select…' : '— none —') }));
+
+    if (field.type === 'ref' && REMOTE.has(field.optionsFrom)) {
+      remoteOptions(select, field, value, record);
+      select.dataset.optionsFrom = field.optionsFrom;
+      return select;
+    }
 
     // options are plain strings, or { value, label } where the two differ
     const opts = field.type === 'ref'
@@ -62,7 +91,7 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
   const wrappers = {};
 
   for (const field of fields) {
-    const control = inputFor(field, values[field.key], null);
+    const control = inputFor(field, values[field.key], values);
     controls[field.key] = control;
     const locked = !isEdit && Object.prototype.hasOwnProperty.call(overrides, field.key);
     if (locked) control.setAttribute('disabled', '');
