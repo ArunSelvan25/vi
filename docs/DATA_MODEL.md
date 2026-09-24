@@ -34,14 +34,11 @@ and "today" is measured in the `APP_TIMEZONE` of the API.
 ## Leases
 
 - `frequency` — Monthly · Quarterly · Half-Yearly · Yearly. `rent_amount` is
-  always the monthly rent; longer periods bill 3×, 6× or 12× it.
+  always the monthly rent.
 - `rent_day` — for a monthly lease, the payment day each month: 1–28, or 31 for
-  the last day of the month. Its invoice can be raised any time in that month and
-  is due on the rent day; a part month is charged day by day at each month's own
-  length. Blank bills periods counted from the start date instead. `billing_day`
-  is an older, unused column and is not read.
-- `grace_days` — with a rent day, the days after it before the late fee is added;
-  without one, the days after each period starts before rent is due.
+  the last day of the month. `billing_day` is an older, unused column and is not read.
+- `grace_days` — with a rent day, the days after an invoice's due date before the
+  late fee is added.
 - `gst_rate` — GST % added to rent invoices and late fees on this lease.
 - `renewed_from` — the lease this one renews.
 - `deposit_status` — Pending · Held · Partially Refunded · Refunded · Forfeited ·
@@ -114,7 +111,6 @@ property, known values only for statuses, nothing referenced can be deleted).
 | Occupancy follows leases | Saving, terminating or deleting a lease updates its unit immediately. `Under Maintenance` is never overwritten |
 | One live lease per unit | An overlapping lease is refused, naming the clashing lease |
 | Lease dates | An end date before the start date is refused |
-| Rent is never billed twice | *Generate rent* skips every period or day already covered by a rent invoice on the lease, voided ones included |
 | Payments | Recorded against an invoice. Cannot exceed what is owed; any excess settles the tenant's other unpaid invoices. A settled, void or draft invoice takes no more. The invoice's balance and status follow at once |
 | Deleting an invoice | Only a draft. An issued invoice is voided instead, with a reason |
 | Two saves of one record | The second is refused if the record changed after its form was opened |

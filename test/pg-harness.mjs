@@ -14,7 +14,7 @@
 import fs from 'fs';
 import postgres from 'postgres';
 import {
-  createBackend, internals, todayIn, periodsFor, normalisePhone, constantTimeEquals,
+  createBackend, internals, todayIn, normalisePhone, constantTimeEquals,
   hashPasswordLegacy, hashPasswordV2, signToken, THROTTLE, BOOTSTRAP_WINDOW_MS
 } from '../supabase/functions/api/backend.js';
 import { PG_TYPES } from '../supabase/functions/api/schema.js';
@@ -132,7 +132,6 @@ export async function makeSandbox(opts = {}) {
     readSettings: () => inTx(r => internals.readSettings(r)),
     refreshStatuses: (user, quiet) => inTx(r => internals.refreshStatuses(r, user || SYSTEM, quiet)),
     applyInvoiceTotals: (id) => inTx(r => internals.applyInvoiceTotals(r, id)),
-    generateInvoices: (payload, user) => inTx(r => internals.generateInvoices(r, payload || {}, user || SYSTEM)),
     sendReminders: (user, o) => inTx(r => internals.sendReminders(r, user || SYSTEM, o || {})),
     dailyReminderJob: () => backend.dailyReminderJob(),
     dailyMaintenanceJob: () => backend.dailyMaintenanceJob(),
@@ -159,7 +158,6 @@ export async function makeSandbox(opts = {}) {
     /** Run raw SQL against this sandbox's database — the "someone edited the table by hand" case. */
     query: (text, params) => sql.unsafe(text, params || []),
     today: () => todayIn(tz),
-    periodsFor,
     normalisePhone,
     constantTimeEquals,
     hashPasswordLegacy,

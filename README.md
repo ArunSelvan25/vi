@@ -30,14 +30,14 @@ is ever left half-saved and two people can never overwrite each other's work.
 - **Record pages for everything** — a tenant, unit, lease, invoice or payment
   opens on its own page with everything related to it, linked onward. Hover a
   linked name for a summary card; IDs, phones and emails copy in one click.
+- **Search everything** — one box in the top bar (or `/`, or Ctrl/⌘ K) finds
+  tenants, properties, units, leases, invoices, payments, tickets, expenses and
+  documents by name, phone, unit, ID, reference or description.
 - **One Billing screen** — invoices and the payments against them, with
   outstanding / overdue / due-this-week / collected figures that double as filters.
-- **Rent days** — a monthly lease can be due on a fixed day (say the 10th). Its
-  invoice goes out from the 1st of that month, a part month is charged day by day
-  at each month's own length, and grace days count after the rent day before the
-  late fee.
-- **Rent generation that never double-bills** — one click raises every missing
-  rent invoice; anything already billed is skipped.
+- **Rent days** — a monthly lease can be due on a fixed day (say the 10th), and
+  grace days count after it before the late fee. Rent invoices are raised by hand
+  each month.
 - **Invoices with any mix of charges** — rent, electricity (EB), water and more as
   separate lines, each with its own GST rate.
 - **Accounting that holds up** — deposits are held money, not income; issued
@@ -77,7 +77,7 @@ assets/
     store.js             the small tables (properties, units, tenants, leases) kept in
                          the browser; pages and summaries of the rest from the API
     api.js               the API transport (text/plain POST, no CORS preflight)
-    components/          form builder · data table · charts · record pages · hover cards
+    components/          form builder · data table · charts · record pages · hover cards · search
     views/               one module per screen
 supabase/
   migrations/            the database, one migration at a time
@@ -109,7 +109,7 @@ does live. Sign in with phone `9000012345` / password `password123`.
 
 | Suite | What it proves |
 |---|---|
-| `test:backend` | Rent periods, rent-day cycles and part months, late-fee grace |
+| `test:backend` | Rent days and late-fee grace |
 | `test:paging` | Server-side paging, search and scopes, and every server-computed figure checked against the old in-browser arithmetic |
 | `test:security` | Setup takeover, brute force, enumeration, forged tokens, role escalation |
 | `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, rollback |

@@ -17,7 +17,7 @@ function pluralise(word) {
  */
 export function crudView(entity, {
   extraActions = [], onRowClick, columns, filterKeys = ['status'], headerActions = [],
-  openForm, canDelete
+  openForm, canDelete, searchText
 } = {}) {
   // entities with a richer editor (invoices and their line items) supply their own
   const open = openForm || ((row, opts) => openEntityForm(entity, row, opts));
@@ -107,6 +107,7 @@ export function crudView(entity, {
         filters,
         actions,
         onRowClick,
+        searchText,
         emptyMessage: `No ${def.title.toLowerCase()} yet. Create the first one to get started.`
       })
     );

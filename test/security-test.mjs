@@ -288,7 +288,7 @@ await check('no token reaches any data action', async () => {
   const b = await makeSandbox();
   await b.handle('setup', { adminPhone: '9000000001', adminPassword: 'correct-horse-battery' }, '');
   for (const action of ['bootstrap', 'list', 'create', 'update', 'remove', 'recordPayment',
-                        'generateInvoices', 'createUser', 'sendReminders', 'stats', 'me']) {
+                        'saveInvoice', 'createUser', 'sendReminders', 'stats', 'me', 'search']) {
     const r = await b.handle(action, { table: 'Tenants', data: {}, id: 'x' }, '');
     assert(r.ok === false, `"${action}" succeeded without a token`);
   }

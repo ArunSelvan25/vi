@@ -244,7 +244,6 @@ with Resend or SMTP).
 | *"Your session expired"* | Sessions last `session_hours` (default 12). Sign in again. |
 | *"… was changed by someone else after you opened it"* | Another person saved the same record first. Close the form, open it again to see their change, and redo yours. |
 | *"Invoice … has been issued, so it cannot be deleted"* | Issued invoices keep their number. Use **Void** (with a reason) instead. Only drafts can be deleted. |
-| Generate rent raised nothing | Nothing is due yet. A rent-day lease can be raised from the 1st of the month its rent day falls in; the lease page shows when its next invoice can be raised. |
 
 ---
 
@@ -311,7 +310,7 @@ npm test          # everything below
 
 | Suite | What it proves |
 |---|---|
-| `test:backend` | Rent periods, rent-day cycles and part months, late-fee grace |
+| `test:backend` | Rent days and late-fee grace |
 | `test:paging` | Server-side paging, search and scopes, and every server-computed figure checked against the old in-browser arithmetic |
 | `test:security` | The attacks above, and that accounts with older password hashes still sign in |
 | `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, a failed request leaving nothing behind |

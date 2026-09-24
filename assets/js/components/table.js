@@ -73,6 +73,7 @@ function isStatusField(field) {
  *            An export asks for every matching row.
  *
  * @param onTotal called with the number of matching rows after each load
+ * @param searchText search text to open with, as a global search's "See all" asks
  */
 export function dataTable({
   entity,
@@ -84,16 +85,18 @@ export function dataTable({
   emptyMessage = 'Nothing here yet.',
   filters = [],
   exportName,
-  onTotal
+  onTotal,
+  searchText = ''
 }) {
   const def = entities[entity];
   const cols = columns || tableFields(entity);
   const remote = !!source;
-  const state = { q: '', sort: null, dir: 1, page: 1, facets: {} };
+  const state = { q: String(searchText || '').trim().toLowerCase(), sort: null, dir: 1, page: 1, facets: {} };
 
   const host = el('div', { class: 'table-wrap' + (remote ? ' is-remote' : '') });
   const searchInput = el('input', {
     class: 'input search-input', type: 'search', placeholder: `Search ${def.title.toLowerCase()}…`,
+    value: String(searchText || '').trim(), 'aria-label': `Search ${def.title.toLowerCase()}`,
     onInput: debounce(e => { state.q = e.target.value.trim().toLowerCase(); state.page = 1; draw(); }, remote ? 300 : 200)
   });
 

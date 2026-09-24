@@ -1,4 +1,4 @@
-import { el, icon, money, toast, confirmDialog, today, whatsappLink } from '../ui.js';
+import { el, icon, money, toast, confirmDialog, whatsappLink } from '../ui.js';
 import { store } from '../store.js';
 import { tableFields, fieldByKey } from '../schema.js';
 import { navigate, refreshView } from '../router.js';
@@ -93,24 +93,6 @@ function bulkActions() {
     el('button', {
       class: 'btn btn-ghost',
       onClick: async (e) => {
-        const ok = await confirmDialog({
-          title: 'Generate rent invoices?',
-          message: 'Creates any missing rent invoices for every active lease up to today. Periods already invoiced are skipped, so it is safe to run repeatedly.',
-          confirmLabel: 'Generate', danger: false
-        });
-        if (!ok) return;
-        const btn = e.target.closest('button');
-        btn.disabled = true;
-        try {
-          const res = await store.act('generateInvoices', { upto: today() });
-          toast(res.created ? `${res.created} invoice(s) generated` : 'Everything already invoiced', 'ok');
-          refreshView();
-        } catch (err) { toast(err.message, 'danger'); btn.disabled = false; }
-      }
-    }, [icon('bolt', 16), ' Generate rent']),
-    el('button', {
-      class: 'btn btn-ghost',
-      onClick: async (e) => {
         const btn = e.target.closest('button');
         btn.disabled = true;
         try {
@@ -182,6 +164,7 @@ export function billingView(ctx = {}) {
         tab === 'invoices' ? filterChip : null,
         dataTable({
           entity: 'invoices', source: { preset: invoicePreset }, columns: invoiceColumns(),
+          searchText: tab === 'invoices' ? ctx.query?.q : '',
           filters: [
             { key: 'status', label: 'All statuses', options: fieldByKey('invoices', 'status').options },
             { key: 'type', label: 'All types', options: fieldByKey('invoices', 'type').options }
@@ -190,7 +173,7 @@ export function billingView(ctx = {}) {
           onRowClick: (row) => navigate('invoices/' + encodeURIComponent(row.id)),
           exportName: 'invoices',
           emptyMessage: show ? 'Nothing matches — clear the filter to see every invoice.'
-                             : 'No invoices yet. Create one, or generate this month’s rent.'
+                             : 'No invoices yet. Create one to bill a lease.'
         })
       ])
     },
@@ -199,7 +182,8 @@ export function billingView(ctx = {}) {
       render: () => el('div', { class: 'tab-stack' }, [
         tab === 'payments' ? filterChip : null,
         el('p', { class: 'muted small', text: 'Payments are recorded from the invoice they pay — use Record payment on an invoice.' }),
-        paymentTable({ preset: show === 'month' ? 'month' : undefined }, { exportName: 'payments' })
+        paymentTable({ preset: show === 'month' ? 'month' : undefined },
+                     { exportName: 'payments', searchText: tab === 'payments' ? ctx.query?.q : '' })
       ])
     }
   ], { active: tab, urlFor: (key) => address(key, key === tab ? show : '') });

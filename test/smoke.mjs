@@ -705,7 +705,7 @@ await step('the lease form offers a rent day for monthly leases only', async () 
   await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 5000 });
 });
 
-await step('a lease with a rent day shows the next invoice and how a part month is charged', async () => {
+await step('a lease with a rent day shows it, and rent is raised by hand — nothing generates it', async () => {
   const set = (value) => page.evaluate(async (v) => {
     const res = await fetch('/api', { method: 'POST', body: JSON.stringify({
       action: 'update', token: localStorage.getItem('vipm.token'),
@@ -718,18 +718,124 @@ await step('a lease with a rent day shows the next invoice and how a part month 
   await set(10);
   try {
     await page.evaluate(() => { location.hash = '#/leases/LSE-00001'; });
-    await page.waitForFunction(() => [...document.querySelectorAll('.panel')].some(p => /Next rent invoice/.test(p.textContent)),
+    await page.waitForFunction(() => /Rent day10th/.test(document.querySelector('.view')?.textContent || ''),
                                { timeout: 5000 });
-    const txt = await page.evaluate(() => [...document.querySelectorAll('.panel')]
-      .find(p => /Next rent invoice/.test(p.textContent)).textContent);
-    if (!/₹[\d,.]+ due \d/.test(txt) || !/Can be raised from/.test(txt) || !/Late fee from/.test(txt)) {
-      throw new Error('panel reads: ' + txt);
+    if (await page.evaluate(() => /Next rent invoice/.test(document.querySelector('.view').textContent))) {
+      throw new Error('the lease still previews a generated invoice');
     }
-    const facts = await page.$eval('.view', e => e.textContent);
-    if (!/Rent day10th/.test(facts)) throw new Error('rent day not shown on the lease');
   } finally {
     await set('');
   }
+  await go('billing', 'Billing');
+  const buttons = await page.$$eval('.view button', b => b.map(x => x.textContent.trim()));
+  if (buttons.some(t => /Generate/i.test(t))) throw new Error('Billing still offers: ' + buttons.join(', '));
+});
+
+console.log('\n— global search —');
+const searchHeads = () => page.$$eval('.global-search-head', h => h.map(x => x.childNodes[1].textContent));
+const waitSearched = () => page.waitForFunction(() => document.querySelector('.global-search-results') &&
+  !/Searching/.test(document.querySelector('.global-search-results').textContent), { timeout: 5000 });
+
+await step('"/" opens the search, a tenant matches as you type, and Enter opens them', async () => {
+  await go('tenants', 'Tenants');
+  await page.keyboard.press('/');
+  await page.waitForSelector('.global-search-input', { timeout: 3000 });
+  if (!await page.evaluate(() => document.activeElement.classList.contains('global-search-input'))) throw new Error('input not focused');
+  await page.keyboard.type('Karthik');
+  await waitSearched();
+  const heads = await searchHeads();
+  if (heads[0] !== 'Tenants') throw new Error('groups: ' + heads.join(', '));
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => /^#\/tenants\/TNT-/.test(location.hash) && !document.querySelector('.global-search'),
+                             { timeout: 5000 });
+});
+
+await step('Ctrl K searches invoices and payments on the server; Esc closes and gives focus back', async () => {
+  const launcher = await page.$('.search-launcher');
+  await launcher.focus();
+  await page.keyboard.down('Control'); await page.keyboard.press('k'); await page.keyboard.up('Control');
+  await page.waitForSelector('.global-search-input', { timeout: 3000 });
+  await page.keyboard.type('INV-0000');
+  await waitSearched();
+  const heads = await searchHeads();
+  if (!heads.includes('Invoices')) throw new Error('groups: ' + heads.join(', '));
+  const hrefs = await page.$$eval('.global-search-hit', a => a.map(x => x.getAttribute('href')));
+  if (!hrefs.some(h => /^#\/invoices\/INV-/.test(h))) throw new Error('no invoice link: ' + hrefs.join(', '));
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.querySelector('.global-search') &&
+    document.activeElement.classList.contains('search-launcher'), { timeout: 3000 });
+});
+
+await step('typing "/" in a field types it, and a search for nothing says so', async () => {
+  await go('tenants', 'Tenants');
+  await page.click('.search-input');
+  await page.keyboard.type('/');
+  if (await page.$('.global-search')) throw new Error('opened while typing in a field');
+  await page.$eval('.search-input', e => { e.value = ''; e.blur(); });
+  await page.click('.search-launcher');
+  await page.keyboard.type('zzqqxx');
+  await waitSearched();
+  const txt = await page.$eval('.global-search-results', e => e.textContent);
+  if (!/Nothing matches/.test(txt)) throw new Error('reads: ' + txt);
+  await page.keyboard.press('Escape');
+});
+
+await step('a module\'s name lists that module and narrows what follows; screens are found by name', async () => {
+  const ask = async (q) => {
+    await page.click('.search-launcher');
+    await page.waitForSelector('.global-search-input', { timeout: 3000 });
+    await page.keyboard.type(q);
+    await waitSearched();
+    await new Promise(r => setTimeout(r, 400));
+    const out = await page.$$eval('.global-search-group', gs => gs.map(g => ({
+      head: g.querySelector('.global-search-head').childNodes[1].textContent,
+      hits: [...g.querySelectorAll('.global-search-hit strong')].map(x => x.textContent) })));
+    await page.keyboard.press('Escape');
+    return out;
+  };
+  const lea = await ask('Lea');
+  if (!lea.some(g => g.head === 'Pages' && g.hits.includes('Go to Leases'))) throw new Error('no page link: ' + JSON.stringify(lea));
+  const leases = lea.find(g => g.head === 'Leases');
+  if (!leases || leases.hits.length < 2) throw new Error('"Lea" did not list the leases: ' + JSON.stringify(lea));
+  const inv = await ask('invoice');
+  if (!inv.some(g => g.head === 'Invoices' && g.hits.length)) throw new Error('"invoice" did not list invoices: ' + JSON.stringify(inv));
+  const narrowed = await ask('lease anita');
+  if (narrowed.length !== 1 || narrowed[0].head !== 'Leases' || !narrowed[0].hits.every(h => /Anita/.test(h))) {
+    throw new Error('"lease anita": ' + JSON.stringify(narrowed));
+  }
+  const status = await ask('active');
+  if (!status.some(g => g.head === 'Leases') || !status.some(g => g.head === 'Tenants')) throw new Error('status not searched: ' + JSON.stringify(status));
+});
+
+await step('an API from before the global search still answers it, one list at a time', async () => {
+  await page.setRequestInterception(true);
+  const old = (req) => {
+    if (req.method() === 'POST' && /\/api$/.test(req.url()) && JSON.parse(req.postData() || '{}').action === 'search') {
+      return req.respond({ status: 200, contentType: 'application/json', body: JSON.stringify({ ok: false, error: 'Unknown action: search' }) });
+    }
+    req.continue();
+  };
+  page.on('request', old);
+  try {
+    await page.click('.search-launcher');
+    await page.keyboard.type('INV-0000');
+    await waitSearched();
+    const txt = await page.$eval('.global-search-results', e => e.textContent);
+    if (/Could not search/.test(txt) || !/INV-0000/.test(txt)) throw new Error('reads: ' + txt.slice(0, 200));
+    await page.keyboard.press('Escape');
+  } finally {
+    page.off('request', old);
+    await page.setRequestInterception(false);
+  }
+});
+
+await step('"See all" opens the list already searched', async () => {
+  await page.evaluate(() => { location.hash = '#/tenants?q=Anita'; });
+  await page.waitForFunction(() => document.querySelector('.search-input')?.value === 'Anita', { timeout: 5000 });
+  const names = await page.$$eval('.data-table tbody tr', r => r.map(x => x.textContent));
+  if (!names.length || names.some(n => !/Anita/.test(n))) throw new Error('rows: ' + names.join(' | '));
+  await page.evaluate(() => { location.hash = '#/billing?tab=payments&q=UPI'; });
+  await page.waitForFunction(() => document.querySelector('.search-input')?.value === 'UPI', { timeout: 5000 });
 });
 
 console.log('\n— reports —');

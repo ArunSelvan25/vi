@@ -10,6 +10,7 @@ import { leasesView } from './views/leases.js';
 import { propertyDetail, unitDetail, tenantDetail } from './views/details.js';
 import { leaseDetail, invoiceDetail, paymentDetail, recordDetail } from './views/records.js';
 import { installHovercards } from './components/hovercard.js';
+import { searchLauncher, installSearchShortcut } from './components/search.js';
 import { reportsView } from './views/reports.js';
 import { settingsView } from './views/settings.js';
 import { setupView, loginView } from './views/onboarding.js';
@@ -114,6 +115,7 @@ function shell() {
     }, [icon('menu', 20)]),
     el('span', { class: 'topbar-title', id: 'page-title', 'aria-hidden': 'true' }),
     el('div', { class: 'topbar-spacer' }),
+    searchLauncher(),
     el('button', {
       class: 'icon-btn', title: 'Refresh data',
       onClick: async (e) => {
@@ -233,20 +235,22 @@ function routeHandler(path) {
   const open = (entity) => (row) => navigate(entity + '/' + encodeURIComponent(row.id));
   const handlers = {
     dashboard: dashboardView,
-    properties: listOrDetail(() => crudView('properties', { onRowClick: open('properties') }), propertyDetail),
-    units: listOrDetail(() => crudView('units', { filterKeys: ['status', 'furnishing'], onRowClick: open('units') }),
+    properties: listOrDetail((ctx) => crudView('properties', { searchText: ctx.query.q, onRowClick: open('properties') }), propertyDetail),
+    units: listOrDetail((ctx) => crudView('units', { searchText: ctx.query.q, filterKeys: ['status', 'furnishing'],
+                                                  onRowClick: open('units') }),
                         unitDetail),
-    tenants: listOrDetail(() => crudView('tenants', { onRowClick: open('tenants') }), tenantDetail),
+    tenants: listOrDetail((ctx) => crudView('tenants', { searchText: ctx.query.q, onRowClick: open('tenants') }), tenantDetail),
     leases: listOrDetail(leasesView, leaseDetail),
     billing: billingView,
     // the old list addresses still work: they open the matching Billing tab
     invoices: listOrDetail(() => moved('billing'), invoiceDetail),
     payments: listOrDetail(() => moved('billing?tab=payments'), paymentDetail),
-    maintenance: listOrDetail(() => crudView('maintenance', { filterKeys: ['status', 'priority', 'category'],
+    maintenance: listOrDetail((ctx) => crudView('maintenance', { searchText: ctx.query.q, filterKeys: ['status', 'priority', 'category'],
       onRowClick: open('maintenance') }), (id) => recordDetail('maintenance', id)),
-    expenses: listOrDetail(() => crudView('expenses', { filterKeys: ['category'], onRowClick: open('expenses') }),
+    expenses: listOrDetail((ctx) => crudView('expenses', { searchText: ctx.query.q, filterKeys: ['category'],
+                                                        onRowClick: open('expenses') }),
                            (id) => recordDetail('expenses', id)),
-    documents: listOrDetail(() => crudView('documents', { filterKeys: ['category', 'entity_type'],
+    documents: listOrDetail((ctx) => crudView('documents', { searchText: ctx.query.q, filterKeys: ['category', 'entity_type'],
       onRowClick: open('documents') }), (id) => recordDetail('documents', id)),
     reports: reportsView,
     settings: settingsView
@@ -314,4 +318,5 @@ async function boot(snapshot) {
 
 registerServiceWorker();
 installHovercards();
+installSearchShortcut();
 boot();

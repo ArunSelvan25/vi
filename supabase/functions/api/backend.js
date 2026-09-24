@@ -20,7 +20,7 @@ import {
 } from './db.js';
 import {
   PAGED, OPEN as OPEN_STATUSES, listPage, scopeSummary, scopeHistory, recordDetail, dashboardData,
-  billingFigures, reportData
+  billingFigures, reportData, SEARCHED, searchAll
 } from './queries.js';
 
 // ─────────────────────────────────────────────────────────── configuration ──
@@ -219,7 +219,7 @@ function humanise(column) {
 // ────────────────────────────────────────────────────────────────── router ──
 
 const READ_ONLY_ACTIONS = { ping: 1, login: 1, bootstrap: 1, list: 1, me: 1, stats: 1,
-                            page: 1, detail: 1, history: 1, report: 1 };
+                            page: 1, detail: 1, history: 1, report: 1, search: 1 };
 export { READ_ONLY_ACTIONS };
 
 async function route(r, action, payload, token) {
@@ -233,6 +233,7 @@ async function route(r, action, payload, token) {
     case 'bootstrap':        return ok(await bootstrap(r, user, payload.known, !!payload.lean));
     case 'list':             return ok({ rows: await readTableForClient(r, assertTable(payload.table), user) });
     case 'page':             return ok(await page(r, payload, user));
+    case 'search':           return ok(await globalSearch(r, payload, user));
     case 'detail':           return ok(await detail(r, payload, user));
     case 'history':          return ok(await history(r, payload, user));
     case 'report':           return ok(await reportData(r, payload));
@@ -248,7 +249,6 @@ async function route(r, action, payload, token) {
     case 'voidInvoice':      return ok(await withSnapshot(r, payload, user, await voidInvoice(r, payload, user)));
     case 'recordPayment':    return ok(await withSnapshot(r, payload, user, await recordPayment(r, payload, user)));
     case 'voidPayment':      return ok(await withSnapshot(r, payload, user, await voidPayment(r, payload.id, user)));
-    case 'generateInvoices': return ok(await withSnapshot(r, payload, user, await generateInvoices(r, payload, user)));
     case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
     case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
     case 'saveOccupants':    return ok(await withSnapshot(r, payload, user, await saveOccupants(r, payload, user)));
@@ -276,6 +276,21 @@ async function page(r, payload, user) {
   if (!PAGED[table]) throw new Error(table + ' is not paged — it arrives with the rest of the data.');
   requireRole(user, readRoleFor(table));
   return listPage(r, table, payload);
+}
+
+/** The shortest search worth sending, the longest kept, and the matches listed per table. */
+const SEARCH_MIN = 2, SEARCH_MAX = 100, SEARCH_LIMIT = 5;
+
+/**
+ * The search box in the top bar, for the tables the browser does not hold
+ * whole. Properties, units, tenants and leases are searched in the browser.
+ */
+async function globalSearch(r, payload, user) {
+  const q = String(payload.q || '').trim().slice(0, SEARCH_MAX);
+  if (q.length < SEARCH_MIN) return { q, results: {} };
+  const limit = Math.max(1, Math.min(parseInt(payload.limit, 10) || SEARCH_LIMIT, 10));
+  const tables = SEARCHED.filter(t => (ROLE_RANK[user.role] || 0) >= ROLE_RANK[readRoleFor(t)]);
+  return { q, results: await searchAll(r, q, limit, tables) };
 }
 
 /** What a record's own page needs beyond the row list the browser already has. */
@@ -1306,8 +1321,7 @@ async function assertVoidable(r, invoiceId) {
 
 /**
  * Void an issued invoice. It keeps its number and stays on record, and
- * nothing is owed on it. A voided rent invoice still counts as that period
- * billed, so generating rent does not raise it again.
+ * nothing is owed on it.
  */
 async function voidInvoice(r, payload, user) {
   requireRole(user, 'manager');
@@ -1930,7 +1944,7 @@ const DERIVED_FROM = {
 /**
  * Figures the cards show that depend on invoices and payments the browser no
  * longer holds: what each tenant, unit and property owes, where each lease's
- * deposit stands, how far its rent has been billed, and who else lives on it.
+ * deposit stands, and who else lives on it.
  */
 async function derivedFigures(r) {
   const owed = { tenant_id: {}, unit_id: {}, property_id: {} };
@@ -1941,16 +1955,6 @@ async function derivedFigures(r) {
       if (inv[k]) owed[k][inv[k]] = round2((owed[k][inv[k]] || 0) + num(inv.balance));
     }
   }
-  // the last day any rent invoice on a lease covers — where the next one starts
-  const rentLines = new Set((await readTable(r, 'InvoiceItems'))
-    .filter(i => String(i.category) === 'Rent').map(i => i.invoice_id));
-  const billed = {};
-  for (const inv of invoices) {
-    if (!inv.lease_id) continue;
-    if (!(String(inv.type) === 'Rent' || (inv.period_start && rentLines.has(inv.id)))) continue;
-    const end = String(inv.period_end || '').slice(0, 10);
-    if (end > (billed[inv.lease_id] || '')) billed[inv.lease_id] = end;
-  }
   const ledgers = await depositLedgers(r, await readTable(r, 'Leases'));
   // everyone besides the primary tenant living on each lease
   const occupants = {};
@@ -1960,15 +1964,14 @@ async function derivedFigures(r) {
       move_in_date: o.move_in_date, move_out_date: o.move_out_date, notes: o.notes, _v: o._v
     });
   }
-  return { owed, billed, ledgers, occupants };
+  return { owed, ledgers, occupants };
 }
 
 const DERIVED = {
   properties: (row, f) => ({ ...row, _owed: f.owed.property_id[row.id] || 0 }),
   units:      (row, f) => ({ ...row, _owed: f.owed.unit_id[row.id] || 0 }),
   tenants:    (row, f) => ({ ...row, _owed: f.owed.tenant_id[row.id] || 0 }),
-  leases:     (row, f) => ({ ...row, _billed_through: f.billed[row.id] || '',
-                             _deposit: f.ledgers[row.id] || { received: 0, applied: 0, refunded: 0, held: 0 },
+  leases:     (row, f) => ({ ...row, _deposit: f.ledgers[row.id] || { received: 0, applied: 0, refunded: 0, held: 0 },
                              _occupants: f.occupants[row.id] || [] })
 };
 
@@ -2074,146 +2077,6 @@ function scrubUser(u) {
 
 // ───────────────────────────────────────────────────── billing operations ──
 
-/**
- * Create rent invoices for every active lease whose billing periods up to
- * `upto` are not yet invoiced. Idempotent: re-running never double-bills.
- */
-async function generateInvoices(r, payload, user) {
-  requireRole(user, 'manager');
-  const upto = payload.upto || today(r);
-  const leases = await readTable(r, 'Leases');
-  const invoices = await readTable(r, 'Invoices');
-
-  // A period counts as billed once any invoice for that lease and start date
-  // carries rent — not only one still typed "Rent".
-  const rentLine = {};
-  (await readTable(r, 'InvoiceItems')).forEach(it => {
-    if (String(it.category) === 'Rent') rentLine[it.invoice_id] = true;
-  });
-  const billed = {};
-  // the last day each lease's rent is billed to, void or not — a voided
-  // period is not billed again
-  const billedThrough = {};
-  invoices.forEach(inv => {
-    if (inv.type === 'Rent' || (inv.lease_id && inv.period_start && rentLine[inv.id])) {
-      billed[inv.lease_id + '|' + inv.period_start] = true;
-      const through = String(inv.period_end || '').slice(0, 10);
-      if (inv.lease_id && through > (billedThrough[inv.lease_id] || '')) billedThrough[inv.lease_id] = through;
-    }
-  });
-
-  const t = today(r);
-  const headers = [], meta = [];
-  for (const lease of leases) {
-    // The stored status is only as fresh as the last refresh; go by the dates too.
-    if (String(lease.status) !== 'Active' &&
-        deriveLeaseStatus(r, lease.start_date, lease.end_date, lease.status) !== 'Active') continue;
-    const onRentDay = usesRentDay(lease);
-    const periods = onRentDay ? rentDayPeriods(lease, upto, billedThrough[lease.id]) : periodsFor(lease, upto);
-    for (const period of periods) {
-      const key = lease.id + '|' + period.start;
-      if (billed[key]) continue;
-      billed[key] = true;
-      // GST on rent follows the lease (18% on commercial property, nothing on a home)
-      const rate = num(lease.gst_rate);
-      const lines = (period.lines || [{ start: period.start, end: period.end, amount: round2(period.amount),
-                                        days: period.days, monthDays: null, whole: true }])
-        .map(l => ({ ...l, gst: round2(l.amount * rate / 100) }));
-      const amount = round2(lines.reduce((s, l) => s + l.amount, 0));
-      const gst = round2(lines.reduce((s, l) => s + l.gst, 0));
-      const split = rate > 0 ? await gstSplit(r, lease, gst) : { cgst: '', sgst: '', igst: '', place_of_supply: '' };
-      headers.push({
-        lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id,
-        property_id: lease.property_id, type: 'Rent',
-        period_start: period.start, period_end: period.end,
-        issue_date: period.issue || period.start, due_date: period.due,
-        amount, tax: gst, total: round2(amount + gst), amount_paid: 0, balance: round2(amount + gst),
-        cgst: split.cgst, sgst: split.sgst, igst: split.igst, place_of_supply: split.place_of_supply,
-        status: period.due < t ? 'Overdue' : 'Unpaid',
-        notes: onRentDay
-          ? (period.prorated ? 'Auto-generated rent for part of a month — ' + period.days + ' days'
-                             : 'Auto-generated rent · rent day ' + lease.rent_day)
-          : period.prorated
-            ? 'Auto-generated part period — ' + period.days + ' of ' + period.fullDays + ' days'
-            : 'Auto-generated ' + lease.frequency + ' rent'
-      });
-      meta.push({ period, lines, rate });
-    }
-  }
-
-  // two writes in total, however many periods are due
-  const created = await appendRows(r, 'Invoices', headers, user);
-  await appendRows(r, 'InvoiceItems', created.flatMap((row, n) => {
-    const { period, lines, rate } = meta[n];
-    return lines.map(l => ({
-      invoice_id: row.id,
-      description: period.lines ? rentLineText(l)
-        : 'Rent · ' + period.start + ' to ' + period.end +
-          (period.prorated ? ' (' + period.days + '/' + period.fullDays + ' days)' : ''),
-      category: 'Rent', quantity: 1, unit_amount: l.amount, amount: l.amount,
-      tax_rate: rate || 0, tax_amount: l.gst, notes: ''
-    }));
-  }), user);
-
-  // what was raised already overdue gets its late fee now, not on tomorrow's first load
-  if (created.length) await applyLateFees(r, SYSTEM_ACTOR);
-
-  await log(r, user, 'generate-invoices', 'Invoices', '', created.length + ' created up to ' + upto);
-  return { created: created.length, invoices: created };
-}
-
-/** Whole days from a to b inclusive of both ends. */
-function daysInclusive(a, b) {
-  return Math.round((b.getTime() - a.getTime()) / 86400000) + 1;
-}
-
-/** Every billing period of a lease that has started on or before `upto`. */
-export function periodsFor(lease, upto) {
-  const out = [];
-  const start = parseDate(lease.start_date);
-  const end = lease.end_date ? parseDate(lease.end_date) : null;
-  const limit = parseDate(upto);
-  if (!start || !limit) return out;
-
-  const step = { Monthly: 1, Quarterly: 3, 'Half-Yearly': 6, Yearly: 12 }[lease.frequency || 'Monthly'] || 1;
-  const grace = parseInt(lease.grace_days || 0, 10) || 0;
-  const baseRent = parseFloat(lease.rent_amount || 0) || 0;
-  const escalation = parseFloat(lease.escalation_pct || 0) || 0;
-
-  // Each period is measured from the lease start rather than from the previous
-  // period, so a lease beginning on the 31st is not permanently pulled back to
-  // the 28th once it passes February.
-  for (let i = 0; i < 400; i++) {
-    const periodStart = addMonths(start, i * step);
-    if (periodStart > limit) break;
-    if (end && periodStart > end) break;
-
-    const fullEnd = addMonths(start, (i + 1) * step);
-    fullEnd.setDate(fullEnd.getDate() - 1);
-    const periodEnd = (end && fullEnd > end) ? new Date(end.getTime()) : fullEnd;
-
-    // rent escalates on each anniversary of the lease start
-    const years = Math.floor(monthsBetween(start, periodStart) / 12);
-    let amount = baseRent * step * Math.pow(1 + escalation / 100, years);
-
-    // A lease that ends part-way through a period is only charged for the days
-    // it actually covers.
-    const fullDays = daysInclusive(periodStart, fullEnd);
-    const actualDays = daysInclusive(periodStart, periodEnd);
-    const prorated = actualDays < fullDays;
-    if (prorated && fullDays > 0) amount = amount * (actualDays / fullDays);
-
-    const due = new Date(periodStart.getTime());
-    due.setDate(due.getDate() + grace);
-
-    out.push({
-      start: fmtDate(periodStart), end: fmtDate(periodEnd), due: fmtDate(due),
-      amount: round2(amount), prorated, days: actualDays, fullDays
-    });
-  }
-  return out;
-}
-
 /** A lease bills on a fixed day of the month when it is monthly and has one. */
 export function usesRentDay(lease) {
   return (lease.frequency || 'Monthly') === 'Monthly' && validRentDay(lease.rent_day) !== null;
@@ -2226,105 +2089,11 @@ export function validRentDay(v) {
   return Number.isInteger(n) && ((n >= 1 && n <= 28) || n === 31) ? n : null;
 }
 
-/** The rent day in a month (months may overflow: -1 is last December). */
-function rentDayIn(year, month, rentDay) {
-  const first = new Date(year, month, 1);
-  const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
-  return new Date(first.getFullYear(), first.getMonth(), Math.min(rentDay, last));
-}
-
-/**
- * Billing cycles of a lease with a rent day. The rent day is the payment date:
- * each cycle ends on it and is due on it. A cycle can be raised any time in
- * the calendar month its rent day falls in — Generate rent on 1 Oct raises
- * everything due in October — so tenants have the invoice before they pay.
- * Grace days do not move the due date; they are the days after it before a
- * late fee is added (see applyLateFees).
- *
- * A cycle runs from the day after one rent day to the next, and a whole cycle
- * is one month's rent. A part cycle — from the lease start up to the first
- * rent day, from where earlier billing stopped, or up to an end date that is
- * not a rent day — is charged day by day, each calendar month at the rent
- * divided by that month's own days: 21–30 Sep is 10/30 of a month and 1–10 Oct
- * is 10/31. Each month is its own line on the invoice.
- *
- * @param upto the day invoices are being raised on: it is their invoice date,
- *   and cycles ending by the end of its month are included
- * @param billedThrough the last day already covered by a rent invoice on this
- *   lease, so no day is ever billed twice — including when a rent day is set
- *   on a lease that was billed the old way.
- */
-export function rentDayPeriods(lease, upto, billedThrough) {
-  const out = [];
-  const start = parseDate(lease.start_date);
-  const end = lease.end_date ? parseDate(lease.end_date) : null;
-  const limit = parseDate(upto);
-  const rentDay = validRentDay(lease.rent_day);
-  if (!start || !limit || rentDay === null) return out;
-
-  const baseRent = parseFloat(lease.rent_amount || 0) || 0;
-  const escalation = parseFloat(lease.escalation_pct || 0) || 0;
-  const monthEnd = new Date(limit.getFullYear(), limit.getMonth() + 1, 0);
-
-  let cursor = start;
-  const covered = billedThrough ? parseDate(billedThrough) : null;
-  if (covered && addDays(covered, 1) > cursor) cursor = addDays(covered, 1);
-
-  for (let i = 0; i < 400; i++) {
-    if (end && cursor > end) break;
-    let close = rentDayIn(cursor.getFullYear(), cursor.getMonth(), rentDay);
-    if (close < cursor) close = rentDayIn(cursor.getFullYear(), cursor.getMonth() + 1, rentDay);
-    const cycleEnd = (end && close > end) ? new Date(end.getTime()) : close;
-    // raised ahead, from the start of the month it is due in
-    if (cycleEnd > monthEnd) break;
-
-    // the rent in force on the day the cycle starts
-    const years = Math.floor(monthsBetween(start, cursor) / 12);
-    const monthly = baseRent * Math.pow(1 + escalation / 100, years);
-
-    const previousClose = rentDayIn(close.getFullYear(), close.getMonth() - 1, rentDay);
-    const whole = fmtDate(cursor) === fmtDate(addDays(previousClose, 1)) && fmtDate(cycleEnd) === fmtDate(close);
-
-    const lines = [];
-    if (whole) {
-      lines.push({ start: fmtDate(cursor), end: fmtDate(cycleEnd), amount: round2(monthly),
-                   days: daysInclusive(cursor, cycleEnd), monthDays: null });
-    } else {
-      let from = cursor;
-      while (from <= cycleEnd) {
-        const lastOfMonth = new Date(from.getFullYear(), from.getMonth() + 1, 0);
-        const to = lastOfMonth < cycleEnd ? lastOfMonth : cycleEnd;
-        const days = daysInclusive(from, to);
-        const monthDays = lastOfMonth.getDate();
-        lines.push({ start: fmtDate(from), end: fmtDate(to), amount: round2(monthly * days / monthDays),
-                     days, monthDays });
-        from = addDays(to, 1);
-      }
-    }
-
-    out.push({
-      start: fmtDate(cursor), end: fmtDate(cycleEnd),
-      // dated the day it is raised, never before the days it covers begin
-      issue: fmtDate(limit < cursor ? cursor : limit), due: fmtDate(cycleEnd),
-      amount: round2(lines.reduce((t, l) => t + l.amount, 0)), prorated: !whole,
-      days: daysInclusive(cursor, cycleEnd), lines
-    });
-    cursor = addDays(cycleEnd, 1);
-  }
-  return out;
-}
-
 /** The first day a late fee may be added to an invoice due on `due`. */
 export function lateFeeFrom(lease, due) {
   const d = parseDate(due);
   if (!d) return '';
   return fmtDate(addDays(d, (parseInt(lease.grace_days || 0, 10) || 0) + 1));
-}
-
-/** Description of one rent line: its dates, and for a part month its share. */
-function rentLineText(line) {
-  return 'Rent · ' + line.start + ' to ' + line.end +
-         (line.monthDays ? ' (' + line.days + '/' + line.monthDays + ' days)' : '');
 }
 
 /**
@@ -2970,14 +2739,6 @@ export function fmtDate(d) {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
 
-export function addMonths(d, n) {
-  const day = d.getDate();
-  const out = new Date(d.getFullYear(), d.getMonth() + n, 1);
-  const lastDay = new Date(out.getFullYear(), out.getMonth() + 1, 0).getDate();
-  out.setDate(Math.min(day, lastDay));
-  return out;
-}
-
 export function monthsBetween(a, b) {
   return (b.getFullYear() - a.getFullYear()) * 12 + (b.getMonth() - a.getMonth());
 }
@@ -2989,6 +2750,6 @@ export function round2(n) { return Math.round((parseFloat(n) || 0) * 100) / 100;
  * the request context `r` that `backend.run(fn)` hands to `fn`.
  */
 export const internals = {
-  readTable, findRow, readSettings, refreshStatuses, applyInvoiceTotals, generateInvoices, computeStats,
-  sendReminders, dailyReminderJob, periodsFor, today, deriveLeaseStatus, getState, setState
+  readTable, findRow, readSettings, refreshStatuses, applyInvoiceTotals, computeStats,
+  sendReminders, dailyReminderJob, today, deriveLeaseStatus, getState, setState
 };

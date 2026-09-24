@@ -221,20 +221,6 @@ await check('an occupant can be made primary; the previous primary becomes a co-
   assert(rows[0].relationship === 'Friend', 'relationship lost in the swap');
 });
 
-await check('rent after the swap is billed to the new primary; earlier invoices stay put', async () => {
-  const { box, c, must, lease, anita, priya } = await household({
-    lease: { start_date: '2026-01-01' }, occupants: ({ priya }) => [{ tenant_id: priya.id }] });
-  await must('generateInvoices', { upto: '2026-02-28' });
-  const before = (await box.readTable('Invoices')).filter(i => i.lease_id === lease.id);
-  assert(before.length && before.every(i => i.tenant_id === anita.id), 'first invoices not billed to Anita');
-  await must('setPrimaryTenant', { lease_id: lease.id, tenant_id: priya.id });
-  await must('generateInvoices', { upto: '2026-04-30' });
-  const all = (await box.readTable('Invoices')).filter(i => i.lease_id === lease.id);
-  const later = all.filter(i => !before.some(b => b.id === i.id));
-  assert(later.length && later.every(i => i.tenant_id === priya.id), 'new invoices: ' + later.map(i => i.tenant_id).join(','));
-  assert(before.every(b => all.find(i => i.id === b.id).tenant_id === anita.id), 'an old invoice moved');
-});
-
 await check('only someone on the lease, still living there, can be made primary', async () => {
   const { box, c, must, lease, priya, ravi } = await household({
     occupants: ({ priya }) => [{ tenant_id: priya.id, move_in_date: '2026-01-01', move_out_date: '2026-01-10' }] });
@@ -256,7 +242,9 @@ await check('a stale page cannot swap the primary tenant', async () => {
 await check('after a swap, settling the deposit still clears arrears billed to the previous primary', async () => {
   const { box, must, lease, anita, priya } = await household({
     lease: { deposit_amount: 50000, deposit_status: 'Held' }, occupants: ({ priya }) => [{ tenant_id: priya.id }] });
-  await must('generateInvoices', { upto: '2026-01-31' });
+  await must('saveInvoice', { data: { tenant_id: anita.id, lease_id: lease.id, unit_id: lease.unit_id,
+    period_start: '2026-01-01', period_end: '2026-01-31', due_date: '2026-01-01' },
+    items: [{ description: 'Rent · January', category: 'Rent', quantity: 1, unit_amount: 20000 }] });
   const owed = (await box.readTable('Invoices')).find(i => i.lease_id === lease.id && i.type === 'Rent');
   assert(owed && owed.tenant_id === anita.id, 'no rent invoice for Anita');
   await must('setPrimaryTenant', { lease_id: lease.id, tenant_id: priya.id });

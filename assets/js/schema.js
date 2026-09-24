@@ -178,21 +178,16 @@ export const entities = {
       { key: 'frequency', label: 'Billing frequency', type: 'select',
         options: ['Monthly', 'Quarterly', 'Half-Yearly', 'Yearly'] },
       { key: 'rent_day', label: 'Rent day', type: 'select', options: RENT_DAY_OPTIONS, numeric: true,
-        blank: 'None — bill from the start date', showWhen: { frequency: ['Monthly', ''] },
-        help: 'The payment date each month. Generate rent raises the invoice any time in that month — on the '
-            + '1st for the 10th — for the month up to the rent day. The first one covers the start date up to '
-            + 'it, each month charged by its own number of days: a lease from 21 Sep with the 10th is billed '
-            + '21–30 Sep (10/30) and 1–10 Oct (10/31), due 10 Oct.' },
+        blank: 'None', showWhen: { frequency: ['Monthly', ''] },
+        help: 'The payment date each month. Grace days count from an invoice\'s due date before the late fee is added.' },
       // billing_day is kept as a column so existing values survive, but stays
-      // off the form: rent periods follow the lease start date and nothing
-      // reads it. An input that does nothing is worse than no input.
+      // off the form: nothing reads it. An input that does nothing is worse than no input.
       { key: 'billing_day', label: 'Billing day of month', type: 'number', form: false },
       { key: 'late_fee', label: 'Late fee', type: 'money',
         help: 'Added once as a line item when an invoice on this lease goes overdue. Leave blank for none.' },
       { key: 'grace_days', label: 'Grace days', type: 'number',
-        help: 'With a rent day: days after the rent day before the late fee is added — the invoice still '
-            + 'shows the rent day as its payment date. Without one: days after each period starts before the '
-            + 'rent is due; rent is billed from the lease start date, so a lease starting on the 5th bills on the 5th.' },
+        help: 'With a rent day: days after an invoice\'s due date before the late fee is added. Without one, '
+            + 'the late fee is added as soon as an invoice goes overdue.' },
       { key: 'escalation_pct', label: 'Annual escalation %', type: 'number',
         help: 'Rent increases by this % on each lease anniversary' },
       { key: 'gst_rate', label: 'GST on rent %', type: 'number',

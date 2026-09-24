@@ -22,6 +22,9 @@ const COLLECTIONS = ['properties', 'units', 'tenants', 'leases'];
  */
 export const REMOTE = new Set(['invoices', 'invoiceItems', 'payments', 'maintenance', 'expenses', 'documents']);
 
+/** The growing collections the global search looks in. */
+const SEARCHED = ['invoices', 'payments', 'maintenance', 'expenses', 'documents'];
+
 /** The server's name for a collection. */
 const TABLE_OF = { invoiceItems: 'InvoiceItems', activity: 'ActivityLog' };
 export const tableOf = (entity) => (entities[entity] ? entities[entity].table : TABLE_OF[entity] || entity);
@@ -136,6 +139,31 @@ export const store = {
    */
   async page(entity, params = {}) {
     return this.rememberAll(entity, await api('page', { table: tableOf(entity), ...params }));
+  },
+
+  /**
+   * The server's half of the global search: the first few matching rows of
+   * each growing table, keyed by collection, with how many match in all.
+   * @returns { invoices: { rows, total }, payments: …, … }
+   */
+  async search(q) {
+    let results;
+    try {
+      results = (await api('search', { q })).results || {};
+    } catch (err) {
+      // an API deployed before the global search: ask each list instead
+      if (!/Unknown action/.test(err.message)) throw err;
+      results = {};
+      await Promise.all(SEARCHED.map(async (entity) => {
+        results[tableOf(entity)] = await api('page', { table: tableOf(entity), q, pageSize: 5 });
+      }));
+    }
+    const out = {};
+    for (const entity of SEARCHED) {
+      const found = results[tableOf(entity)];
+      if (found) out[entity] = this.rememberAll(entity, found);
+    }
+    return out;
   },
 
   /** Every row matching `params`, up to EXPORT_ROWS — for CSV exports and statements. */
@@ -427,63 +455,6 @@ export const store = {
     let months = (d.getFullYear() - s.getFullYear()) * 12 + (d.getMonth() - s.getMonth());
     if (d.getDate() < s.getDate()) months--;
     return round2(base * Math.pow(1 + pct / 100, Math.floor(Math.max(0, months) / 12)));
-  },
-
-  /**
-   * The next rent invoice a lease with a rent day will raise — mirrors
-   * rentDayPeriods in the backend, which does the billing; this only
-   * previews it. Null for a lease without a rent day, or once its term is
-   * fully billed.
-   */
-  nextRentInvoice(lease) {
-    const rentDay = Number(lease.rent_day);
-    const monthly = (lease.frequency || 'Monthly') === 'Monthly';
-    if (!monthly || !lease.start_date || !(Number.isInteger(rentDay) && ((rentDay >= 1 && rentDay <= 28) || rentDay === 31))) return null;
-
-    const day = (iso) => new Date(String(iso).slice(0, 10) + 'T00:00:00');
-    const plus = (d, n) => { const out = new Date(d.getTime()); out.setDate(out.getDate() + n); return out; };
-    const rentDayIn = (y, m) => {
-      const first = new Date(y, m, 1);
-      const last = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
-      return new Date(first.getFullYear(), first.getMonth(), Math.min(rentDay, last));
-    };
-    const span = (a, b) => Math.round((b - a) / 86400000) + 1;
-
-    // where billing stands: the last day any rent invoice on this lease covers
-    const through = String(lease._billed_through || '');
-
-    let cursor = day(lease.start_date);
-    if (through && plus(day(through), 1) > cursor) cursor = plus(day(through), 1);
-    const end = lease.end_date ? day(lease.end_date) : null;
-    if (end && cursor > end) return null;
-
-    let close = rentDayIn(cursor.getFullYear(), cursor.getMonth());
-    if (close < cursor) close = rentDayIn(cursor.getFullYear(), cursor.getMonth() + 1);
-    const cycleEnd = end && close > end ? end : close;
-    const rent = this.currentRent(lease, isoDate(cursor));
-    const whole = isoDate(cursor) === isoDate(plus(rentDayIn(close.getFullYear(), close.getMonth() - 1), 1)) &&
-                  isoDate(cycleEnd) === isoDate(close);
-
-    const lines = [];
-    if (whole) lines.push({ start: isoDate(cursor), end: isoDate(cycleEnd), amount: round2(rent) });
-    else {
-      for (let from = cursor; from <= cycleEnd;) {
-        const monthEnd = new Date(from.getFullYear(), from.getMonth() + 1, 0);
-        const to = monthEnd < cycleEnd ? monthEnd : cycleEnd;
-        const days = span(from, to);
-        lines.push({ start: isoDate(from), end: isoDate(to), days, monthDays: monthEnd.getDate(),
-                     amount: round2(rent * days / monthEnd.getDate()) });
-        from = plus(to, 1);
-      }
-    }
-    // due on the rent day; raisable from the 1st of that month; the grace
-    // days run after the due date, before a late fee
-    return {
-      start: isoDate(cursor), end: isoDate(cycleEnd), due: isoDate(cycleEnd),
-      raiseFrom: isoDate(new Date(cycleEnd.getFullYear(), cycleEnd.getMonth(), 1)),
-      lateFeeFrom: isoDate(plus(cycleEnd, (parseInt(lease.grace_days || 0, 10) || 0) + 1)),
-      amount: round2(lines.reduce((t, l) => t + l.amount, 0)), partial: !whole, lines
-    };
   },
 
   /** Month keys (yyyy-MM) from the server, with the short month name a chart shows. */

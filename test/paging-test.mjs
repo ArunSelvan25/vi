@@ -65,7 +65,16 @@ for (const [u, t, start, months, rent, deposit, rentDay] of leaseSpec) {
   });
   leases.push(lease);
 }
-await call('generateInvoices', { upto: today });
+// a month's rent raised by hand for each lease, from its start up to this month
+for (const lease of leases) {
+  for (let m = -14; m <= 0; m++) {
+    const start = shift(m, 1), end = shift(m + 1, 0);
+    if (start < lease.start_date.slice(0, 8) + '01' || (lease.end_date && start > lease.end_date)) continue;
+    await call('saveInvoice', { data: { tenant_id: lease.tenant_id, lease_id: lease.id, unit_id: lease.unit_id,
+      period_start: start, period_end: end, issue_date: start, due_date: shift(m, 5) },
+      items: [{ description: 'Rent · ' + start.slice(0, 7), category: 'Rent', quantity: 1, unit_amount: lease.rent_amount }] });
+  }
+}
 await create('Invoices', { tenant_id: tenants[1].id, type: 'Utility', due_date: shift(-1, 10), amount: 1234.5 });
 await create('Invoices', { tenant_id: tenants[2].id, type: 'Utility', due_date: shift(1, 10), amount: 400, property_id: P2.id });
 
@@ -73,6 +82,7 @@ await create('Invoices', { tenant_id: tenants[2].id, type: 'Utility', due_date: 
 let k = 0;
 for (const inv of await box.readTable('Invoices')) {
   if (['Void', 'Draft', 'Paid'].includes(inv.status) || !(Number(inv.balance) > 0)) continue;
+  if (inv.type === 'Utility' && inv.due_date > today) continue;   // voided below, with nothing paid on it
   k++;
   if (k % 4 === 0) continue;
   const amount = k % 3 === 0 ? round2(Number(inv.balance) / 2) : Number(inv.balance);
@@ -276,6 +286,31 @@ await check('% and _ in a search are matched literally', async () => {
          'a lone % matched everything');
 });
 
+console.log('\n— the global search —');
+await check('each growing table answers with its first matches and how many match in all, as its own list does', async () => {
+  for (const q of ['Anita', 'rent', 'REF-', 'Repairs', 'nothing-like-this']) {
+    const { results } = await call('search', { q });
+    for (const table of ['Invoices', 'Payments', 'Maintenance', 'Expenses', 'Documents']) {
+      const list = await call('page', { table, q, pageSize: 5 });
+      const found = results[table];
+      assert(found, `${q}: no answer for ${table}`);
+      assert(found.total === list.total, `${q}: ${table} total ${found.total}, the list says ${list.total}`);
+      same(ids(found.rows), ids(list.rows), `${q}: ${table} rows`);
+    }
+  }
+  const many = await call('search', { q: 'rent' });
+  assert(many.results.Invoices.total > 5 && many.results.Invoices.rows.length === 5, 'not capped at five');
+});
+await check('the search needs two characters, keeps to 100, and a viewer may use it', async () => {
+  assert(Object.keys((await call('search', { q: ' a ' })).results).length === 0, 'one character was searched');
+  assert((await call('search', { q: 'x'.repeat(500) })).q.length === 100, 'a long search was not trimmed');
+  await call('createUser', { name: 'S', phone: '9000000006', role: 'viewer', password: 'viewer-pass-1234' });
+  const viewer = (await call('login', { phone: '9000000006', password: 'viewer-pass-1234' }, '')).token;
+  assert((await call('search', { q: 'Anita' }, viewer)).results.Invoices, 'a viewer could not search');
+  const out = await box.handle('search', { q: 'Anita' }, '');
+  assert(out.ok === false && out.error === 'AUTH_REQUIRED', 'searched without a session');
+});
+
 console.log('\n— worked-out columns —');
 await check('"Paid on" is the date of the latest payment against each invoice', async () => {
   const res = await everything('Invoices');
@@ -400,10 +435,6 @@ await check('a lean start sends only the small tables, with their derived figure
   for (const p of s.properties) assert(p._owed === owed(T.Invoices.filter(i => i.property_id === p.id)), p.id + ' _owed');
   for (const l of s.leases) {
     same(l._deposit, depositLedger(l), l.id + ' deposit');
-    const rentLines = new Set(T.InvoiceItems.filter(i => i.category === 'Rent').map(i => i.invoice_id));
-    const through = T.Invoices.filter(i => i.lease_id === l.id && (i.type === 'Rent' || (i.period_start && rentLines.has(i.id))))
-      .reduce((m, i) => (String(i.period_end || '') > m ? String(i.period_end).slice(0, 10) : m), '');
-    assert(l._billed_through === through, `${l.id} billed through ${l._billed_through} vs ${through}`);
   }
 });
 await check('a payment refreshes the figures on leases and tenants even though no lease changed', async () => {

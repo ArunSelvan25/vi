@@ -224,8 +224,9 @@ export function openRenewLease(lease, { onDone } = {}) {
   });
 }
 
-export function leasesView() {
+export function leasesView(ctx = {}) {
   return crudView('leases', {
+    searchText: ctx.query?.q,
     filterKeys: ['status', 'frequency'],
     onRowClick: (row) => navigate('leases/' + encodeURIComponent(row.id)),
     extraActions: [

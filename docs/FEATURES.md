@@ -27,14 +27,13 @@
 - Unit ↔ tenant agreement with start and end dates, rent, deposit and deposit
   status (Held / Partially Refunded / Refunded).
 - Billing frequency: **Monthly, Quarterly, Half-Yearly or Yearly**.
-- **Grace days** — how long after a period starts before the invoice is due.
-- **Part periods are pro-rated by day.** A lease ending on the 10th of a month
-  is charged 10/31 of the rent, not a full month — and the invoice line says so.
+- **Grace days** — on a lease with a rent day, the days after an invoice's due
+  date before the late fee is added.
 - **Late fees** — set one on the lease and it is added, once, as a line item
   when an invoice on that lease goes overdue.
-- **Annual escalation %** — rent compounds automatically on each lease
-  anniversary, so a 3-year lease at 5% bills correctly without you touching it.
-  The rent roll, property and tenant pages show the rent in force today.
+- **Annual escalation %** — rent compounds on each lease anniversary. The rent
+  roll, property, tenant and lease pages show the rent in force today and the
+  next increase, so you know what to bill.
 - **Renew a lease** from the lease list, a tenant's page, or by clicking it in
   the dashboard's *Leases expiring* list: it starts the day after, suggests this
   year's escalated rent, and carries the deposit over so it is counted once.
@@ -64,23 +63,13 @@
 
 ## Rent & billing
 
-- **One-click invoice generation.** Raises every missing rent invoice for every
-  active lease up to today. **Idempotent** — a period that already has an
-  invoice is never billed twice, so it is safe to run as often as you like.
-- Correct period maths: month-end leases don't drift (a lease starting on the
-  31st bills on the 31st, not the 28th, after February), lease end dates clip
-  the final period, quarterly periods charge 3× the monthly rent.
+- **Rent is invoiced by hand.** Each month, raise a rent invoice for each lease
+  from the Billing page, with its period, due date and a Rent line. Nothing is
+  generated automatically.
 - **Rent day** — a monthly lease can have a fixed payment day each month
-  (1st–28th, or the last day). Its invoice can be raised any time in that
-  month — run Generate rent on the 1st and every invoice due that month goes
-  out — dated the day it is raised and due on the rent day: with the 10th, the
-  invoice for 11 Oct–10 Nov is due 10 Nov. Grace days then count after the
-  rent day, before the late fee: due the 10th with 5 days' grace, the fee is
-  added from the 16th while the invoice still shows the 10th. A part month is charged day by day at each month's own length — a lease
-  from 21 Sep is billed 21–30 Sep (10/30) and 1–10 Oct (10/31) on 10 Oct, one
-  line per month. Setting a rent day on a lease already billed carries on from
-  the last billed day, so no day is billed twice or skipped. The lease page
-  previews the next invoice.
+  (1st–28th, or the last day). Grace days count after an invoice's due date,
+  before the late fee: due the 10th with 5 days' grace, the fee is added from
+  the 16th while the invoice still shows the 10th.
 - **Line items** — one invoice carries any mix of charges: rent, electricity
   (EB), water, gas, internet, parking, maintenance, late fees. Add rows as you
   go, each with a description, category, quantity and unit amount, and the total
@@ -183,6 +172,27 @@
 - Leases expiring, maintenance queue, documents expiring, vacant units.
 - Every card is clickable through to the underlying records.
 
+## Search
+
+- **One search box for every module**, in the top bar — or press `/` or
+  Ctrl/⌘ K from anywhere. It finds tenants, properties, units, leases,
+  invoices, payments, maintenance tickets, expenses and documents.
+- Properties, units, tenants and leases match as you type: by name, phone
+  (with or without spaces and country code), email, unit, city, ID, and anyone
+  living on a lease. Every word must match, so *anita 101* finds Anita's lease
+  on A-101.
+- Invoices, payments, tickets, expenses and documents are searched on the
+  server from two characters, the same way each list's own search box works —
+  including by tenant, property or unit name.
+- **Start with a module's name** to list that module: *lea* shows the leases,
+  *invoice* the invoices, *tickets* the maintenance queue. Words after it search
+  only that module — *lease anita*, *invoice overdue*, *ticket leak*.
+- **Screens are found by name** too: *repo* offers Reports, *upi* Settings.
+- Status, rent, dates, property and frequency are searchable as well, so
+  *active*, *vacant* or *overdue* work.
+- Up to five matches per module, with the total. *See all* opens that module's
+  list already searched. Arrow keys move, Enter opens, Esc closes.
+
 ## Reports
 
 - Date range and per-property filters.
@@ -236,14 +246,13 @@
 
 Honest about what the current features do *not* do:
 
-- **Without a rent day, rent bills from the lease start date**, so a lease
-  starting on the 5th bills on the 5th. Set a rent day on a monthly lease to bill
-  on a fixed day instead. (The old `billing_day` column is not read.)
+- **Rent invoices are not generated.** Each one is raised by hand, so the app
+  does not warn about a month nobody billed. (The old `billing_day` column is not read.)
 - **A sold property's history stays in the reports** while dropping out of the
   dashboard headline figures. That is deliberate: past income and costs remain
   true.
-- **A late fee on an invoice raised already overdue** (other than by *Generate
-  rent*) is added at the next day's housekeeping, not the moment it is saved.
+- **A late fee on an invoice raised already overdue** is added at the next
+  day's housekeeping, not the moment it is saved.
 - **No QR code** for UPI on printed invoices — the UPI ID and a *Pay via UPI*
   link are shown instead.
 

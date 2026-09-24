@@ -235,6 +235,22 @@ export async function listPage(r, table, p = {}) {
   return { rows, total, page, pageSize, refs: await refsFor(r, table, rows) };
 }
 
+/** The growing tables the global search looks in, in the order it lists them. */
+export const SEARCHED = ['Invoices', 'Payments', 'Maintenance', 'Expenses', 'Documents'];
+
+/**
+ * The global search: the first `limit` matches in each table `tables` names,
+ * with how many match in all, searched as each list's own search box does.
+ */
+export async function searchAll(r, q, limit, tables = SEARCHED) {
+  const out = {};
+  for (const table of tables) {
+    const { rows, total, refs } = await listPage(r, table, { q, pageSize: limit });
+    out[table] = { rows, total, refs };
+  }
+  return out;
+}
+
 /**
  * Rows a page points at that the browser does not keep: the invoice a payment
  * settles, so the page can name it.

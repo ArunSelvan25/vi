@@ -90,9 +90,9 @@ export function invoiceTable(source, { hide = [], exportName } = {}) {
   });
 }
 
-export function paymentTable(source, { hide = [], exportName } = {}) {
+export function paymentTable(source, { hide = [], exportName, searchText } = {}) {
   return dataTable({
-    entity: 'payments', source,
+    entity: 'payments', source, searchText,
     columns: columnsWithout('payments', hide), filters: facet('payments', 'method', 'All methods'),
     onRowClick: (r) => navigate('payments/' + r.id), exportName, emptyMessage: 'No payments yet.',
     actions: [{ label: 'Receipt', icon: 'receipt', onClick: (r) => showReceipt(r) }]
@@ -204,38 +204,6 @@ function nextEscalation(lease) {
   return { on, rent: store.currentRent(lease, on) };
 }
 
-/**
- * For a lease with a rent day: the next invoice Generate rent will raise —
- * when, for which days, and how a part month is worked out.
- */
-function nextRentPanel(lease) {
-  if (!['Active', 'Upcoming'].includes(lease.status)) return null;
-  const next = store.nextRentInvoice(lease);
-  if (!next) return null;
-  const range = (a, b) => `${date(a)} – ${date(b)}`;
-  return panel('Next rent invoice', el('div', { class: 'stack' }, [
-    el('p', { class: 'pay-progress-text' }, [
-      el('strong', { text: money(next.amount) }), ` due ${date(next.due)} for ${range(next.start, next.end)}`
-    ]),
-    facts([
-      ['Can be raised from', date(next.raiseFrom)],
-      ['Payment date', date(next.due)],
-      Number(lease.late_fee) > 0 ? ['Late fee from', `${date(next.lateFeeFrom)} · ${money(lease.late_fee)}`] : null
-    ]),
-    next.partial
-      ? el('div', { class: 'rent-lines' }, next.lines.map(l => el('div', { class: 'kv' }, [
-          el('span', { text: `${range(l.start, l.end)} · ${l.days} of ${l.monthDays} days` }),
-          el('strong', { text: money(l.amount) })
-        ])))
-      : null,
-    el('p', { class: 'muted small', text: next.partial
-      ? 'Part of a month is charged day by day, each month at the rent divided by its own number of days.'
-      : `A full month from the day after one rent day (${rentDayLabel(lease.rent_day)}) to the next.` })
-  ]), { action: next.raiseFrom <= today()
-    ? el('span', { class: 'badge badge-warn', text: 'Ready — use Generate rent' })
-    : el('span', { class: 'muted small', text: 'Generate rent raises it from ' + date(next.raiseFrom) }) });
-}
-
 export function leaseDetail(id, ctx = {}) {
   const lease = store.byId('leases', id);
   if (!lease) return missing('leases');
@@ -287,7 +255,6 @@ function leasePage(lease, s, ctx) {
         ['GST on rent', Number(lease.gst_rate) ? lease.gst_rate + '%' : null]
       ])
     ])),
-    nextRentPanel(lease),
     el('div', { class: 'grid-2' }, [
       panel('Primary tenant', tenantCard(tenant)),
       panel('Unit', unitCard(unit))

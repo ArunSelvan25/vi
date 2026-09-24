@@ -88,6 +88,32 @@ async function portfolio(leaseOverrides) {
   return { box, admin, c, prop, unit, tenant, lease };
 }
 
+/**
+ * Raise the first lease's rent by hand, one invoice a month from its start up
+ * to `upto` — what the landlord does from the Billing page each month.
+ */
+async function raiseRent(box, c, upto = box.today()) {
+  const lease = (await box.readTable('Leases'))[0];
+  const day = (iso, months, days = 0) => {
+    const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1 + months, d + days)).toISOString().slice(0, 10);
+  };
+  const raised = [];
+  for (let i = 0; ; i++) {
+    const start = day(lease.start_date, i);
+    if (start > upto || (lease.end_date && start > lease.end_date)) break;
+    const r = await c('saveInvoice', { data: {
+      tenant_id: lease.tenant_id, lease_id: lease.id, unit_id: lease.unit_id,
+      period_start: start, period_end: day(lease.start_date, i + 1, -1), issue_date: start,
+      due_date: day(start, 0, Number(lease.grace_days) || 0) },
+      items: [{ description: 'Rent', category: 'Rent', quantity: 1, unit_amount: Number(lease.rent_amount),
+                tax_rate: Number(lease.gst_rate) || 0 }] });
+    if (!r.ok) throw new Error('saveInvoice failed: ' + r.error);
+    raised.push(r.data.invoice);
+  }
+  return raised;
+}
+
 await probe('a new record starts in a real status, not blank', async () => {
   const { box } = await portfolio();
   const problems = [];
@@ -111,26 +137,10 @@ await probe('a lease saved with the status left blank still becomes Active', asy
   return lease.data.row.status === 'Active' ? null : 'status is ' + JSON.stringify(lease.data.row.status);
 });
 
-await probe('Generate rent works on a lease the moment it is saved', async () => {
-  const { box, c } = await portfolio();
-  const gen = await c('generateInvoices', { upto: box.today() });
-  if (!gen.ok) return 'failed: ' + gen.error;
-  return gen.data.created > 0 ? null : 'created 0 invoices for an active lease';
-});
-
-await probe('Generate rent is idempotent — running it twice bills nothing extra', async () => {
-  const { box, c } = await portfolio();
-  const first = (await c('generateInvoices', { upto: box.today() })).data.created;
-  const second = (await c('generateInvoices', { upto: box.today() })).data.created;
-  return second === 0 ? null : `first run ${first}, second run ${second} (double billing)`;
-});
-
-await probe('a future lease is Upcoming and bills nothing yet', async () => {
-  const { box, c, lease } = await portfolio({ start_date: '2027-01-01', end_date: '2027-12-31' });
+await probe('a future lease is Upcoming and does not occupy the unit yet', async () => {
+  const { box, lease } = await portfolio({ start_date: '2027-01-01', end_date: '2027-12-31' });
   if (lease.data.row.status !== 'Upcoming') return 'status is ' + lease.data.row.status;
-  if ((await box.readTable('Units'))[0].status === 'Occupied') return 'a future lease already marks the unit Occupied';
-  return (await c('generateInvoices', { upto: box.today() })).data.created === 0
-    ? null : 'a lease that has not started was billed';
+  return (await box.readTable('Units'))[0].status === 'Occupied' ? 'a future lease already marks the unit Occupied' : null;
 });
 
 await probe('terminating a lease frees the unit at once', async () => {
@@ -179,7 +189,7 @@ await probe('a lease ending before it starts is refused', async () => {
 console.log('\n— money cannot go missing —');
 await probe('deleting a payment restores the invoice balance', async () => {
   const { box, c } = await portfolio();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   await c('recordPayment', { invoice_id: inv.id, amount: Number(inv.balance), method: 'UPI' });
   const paid = (await box.readTable('Invoices')).find(i => i.id === inv.id);
@@ -195,7 +205,7 @@ await probe('deleting a payment restores the invoice balance', async () => {
 
 await probe('an invoice with a payment against it cannot be deleted', async () => {
   const { box, c } = await portfolio();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   await c('recordPayment', { invoice_id: inv.id, amount: 100, method: 'Cash' });
   const del = await c('remove', { table: 'Invoices', id: inv.id });
@@ -205,7 +215,7 @@ await probe('an invoice with a payment against it cannot be deleted', async () =
 
 await probe('an issued invoice is voided, never deleted — a draft can be deleted', async () => {
   const { box, c, tenant } = await portfolio();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const issued = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
   const del = await c('remove', { table: 'Invoices', id: issued.id });
   if (del.ok) return 'an issued invoice was deleted, leaving a gap in the numbering';
@@ -219,7 +229,7 @@ await probe('an issued invoice is voided, never deleted — a draft can be delet
 
 await probe('a payment never pushes any balance negative', async () => {
   const { box, c } = await portfolio();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const invoices = await box.readTable('Invoices');
   const owedInTotal = invoices.reduce((s, i) => s + Number(i.balance || 0), 0);
 
@@ -243,7 +253,7 @@ await probe('a payment never pushes any balance negative', async () => {
 
 await probe('paying an already-settled invoice is refused', async () => {
   const { box, c } = await portfolio();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   await c('recordPayment', { invoice_id: inv.id, amount: Number(inv.balance) });
   return (await c('recordPayment', { invoice_id: inv.id, amount: 500 })).ok
@@ -414,47 +424,6 @@ await probe('signing a new lease makes a past tenant Active again', async () => 
     ? null : 'a re-signed tenant is still ' + (await box.readTable('Tenants'))[0].status;
 });
 
-console.log('\n— part periods are billed pro rata —');
-await probe('a lease ending mid-period is charged only for the days it covers', async () => {
-  const box = await makeSandbox();
-  const periods = box.periodsFor({ start_date: '2026-01-01', end_date: '2026-03-10',
-    rent_amount: 30000, frequency: 'Monthly', grace_days: 0 }, '2026-06-01');
-  if (periods.length !== 3) return periods.length + ' periods, expected 3';
-  if (periods[0].amount !== 30000 || periods[1].amount !== 30000) return 'full months were altered';
-  const last = periods[2];
-  const want = Math.round(30000 * (10 / 31) * 100) / 100;
-  if (Math.abs(last.amount - want) > 0.01) return `part month billed ${last.amount}, expected ${want}`;
-  return last.prorated ? null : 'the part period is not flagged as pro rata';
-});
-
-await probe('a mid-month start bills whole periods, then a part period at the end', async () => {
-  const box = await makeSandbox();
-  const periods = box.periodsFor({ start_date: '2026-01-15', end_date: '2026-04-30',
-    rent_amount: 30000, frequency: 'Monthly', grace_days: 0 }, '2026-06-01');
-  const full = periods.filter(p => !p.prorated);
-  const part = periods.filter(p => p.prorated);
-  if (full.length !== 3) return full.length + ' full periods, expected 3';
-  if (part.length !== 1) return part.length + ' part periods, expected 1';
-  return full.every(p => p.amount === 30000) ? null : 'a full period was pro-rated';
-});
-
-await probe('an open-ended lease is never pro-rated', async () => {
-  const box = await makeSandbox();
-  const periods = box.periodsFor({ start_date: '2026-01-01', end_date: '',
-    rent_amount: 30000, frequency: 'Monthly', grace_days: 0 }, '2026-04-15');
-  return periods.some(p => p.prorated) ? 'a period was pro-rated with no end date' : null;
-});
-
-await probe('a quarterly lease pro-rates against the whole quarter', async () => {
-  const box = await makeSandbox();
-  const periods = box.periodsFor({ start_date: '2026-01-01', end_date: '2026-02-15',
-    rent_amount: 10000, frequency: 'Quarterly', grace_days: 0 }, '2026-06-01');
-  const p = periods[0];
-  if (!p.prorated) return 'not flagged';
-  const want = Math.round(30000 * (p.days / p.fullDays) * 100) / 100;
-  return Math.abs(p.amount - want) > 0.01 ? `billed ${p.amount}, expected ${want}` : null;
-});
-
 console.log('\n— settings that are configured are actually used —');
 await probe('invoice_prefix drives new invoice numbers', async () => {
   const { box, admin } = await bootedSandbox();
@@ -476,8 +445,8 @@ await probe('a late fee on the lease is charged once when an invoice goes overdu
   await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 10000, grace_days: 0, late_fee: 500 } });
-  await c('generateInvoices', { upto: box.today() });
-  await c('bootstrap', {});                                   // housekeeping applies the fees
+  await raiseRent(box, c);
+  await box.refreshStatuses();                                // the next housekeeping run applies the fees
 
   const overdue = (await box.readTable('Invoices')).filter(i => i.status === 'Overdue');
   if (!overdue.length) return 'no overdue invoices to test with';
@@ -489,7 +458,7 @@ await probe('a late fee on the lease is charged once when an invoice goes overdu
   if (Number(inv.total) !== 10500) return 'the fee did not reach the invoice total: ' + inv.total;
 
   // running housekeeping again must not stack a second fee
-  await c('bootstrap', {});
+  await box.refreshStatuses();
   const again = (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee').length;
   return again === fees.length ? null : `fees grew from ${fees.length} to ${again} on a second run`;
 });
@@ -503,8 +472,8 @@ await probe('no late fee is charged when the lease has none', async () => {
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
   await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31', rent_amount: 10000, grace_days: 0 } });
-  await c('generateInvoices', { upto: box.today() });
-  await c('bootstrap', {});
+  await raiseRent(box, c);
+  await box.refreshStatuses();
   return (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee').length
     ? 'a fee was charged with no late_fee set' : null;
 });
@@ -817,26 +786,6 @@ await probe('a line with no description is refused', async () => {
   return r.ok ? 'a nameless line was accepted' : null;
 });
 
-await probe('generated rent invoices also get a line item', async () => {
-  const { box, admin } = await bootedSandbox();
-  const t = (await box.handle('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } }, admin)).data.row;
-  const p = (await box.handle('create', { table: 'Properties', data: { name: 'P' } }, admin)).data.row;
-  const u = (await box.handle('create', { table: 'Units', data: { property_id: p.id, unit_number: 'A' } }, admin)).data.row;
-  // dates must straddle today, or the lease is correctly Expired and bills nothing
-  const year = Number(box.today().slice(0, 4));
-  await box.handle('create', { table: 'Leases', data: {
-    property_id: p.id, unit_id: u.id, tenant_id: t.id,
-    start_date: (year - 1) + '-01-01', end_date: (year + 1) + '-12-31',
-    rent_amount: 5000, frequency: 'Monthly' } }, admin);
-  const r = await box.handle('generateInvoices', { upto: box.today() }, admin);
-  if (!r.data.created) return 'no invoices generated';
-  const items = await box.readTable('InvoiceItems');
-  if (items.length !== r.data.created) {
-    return `${r.data.created} invoices but ${items.length} line items`;
-  }
-  return items.every(i => i.category === 'Rent') ? null : 'a generated line is not categorised as Rent';
-});
-
 console.log('\n— privilege boundaries —');
 await probe('a manager cannot change organisation settings', async () => {
   const { b, admin } = await boot();
@@ -851,26 +800,6 @@ await probe('the last administrator cannot be deleted', async () => {
   const me = (await b.readTable('Users'))[0];
   const r = await b.handle('remove', { table: 'Users', id: me.id }, admin);
   return r.ok ? 'the only admin deleted themselves — nobody can sign in now' : null;
-});
-
-console.log('\n— write amplification (edge functions have a CPU budget) —');
-await probe('generating many invoices does not re-read a table per row', async () => {
-  const { b, admin } = await boot();
-  const fullReads = () => b.queries.filter(q => /^select \* from "[a-z_]+" order by/.test(q)).length;
-  const t = (await b.handle('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } }, admin)).data.row;
-  const p = (await b.handle('create', { table: 'Properties', data: { name: 'P' } }, admin)).data.row;
-  const u = (await b.handle('create', { table: 'Units', data: { property_id: p.id, unit_number: 'A' } }, admin)).data.row;
-  await b.handle('create', { table: 'Leases', data: {
-    property_id: p.id, unit_id: u.id, tenant_id: t.id, start_date: '2024-01-01',
-    end_date: '2026-12-31', rent_amount: 1000, frequency: 'Monthly', status: 'Active' } }, admin);
-  const before = fullReads();
-  const r = await b.handle('generateInvoices', { upto: '2026-09-08' }, admin);
-  const created = r.data.created;
-  const reads = fullReads() - before;
-  if (created < 24) return 'test set-up: only ' + created + ' invoices';
-  return reads > 12
-    ? `${created} invoices caused ${reads} full table reads (~${(reads / created).toFixed(1)} per invoice)`
-    : null;
 });
 
 console.log('\n— CSV export —');
@@ -1061,9 +990,9 @@ await probe('a manager cannot reset anyone\'s password', async () => {
     : null;
 });
 
-console.log('\n— rent is billed once, however the invoice is edited —');
+console.log('\n— editing an invoice —');
 
-/** A running monthly lease that has three periods due, generated. */
+/** A monthly lease that has been running since the start of last year. */
 async function billedLease(leaseExtra = {}) {
   const { box, admin } = await bootedSandbox();
   const c = async (a, p, tok = admin) => (await box.handle(a, p, tok));
@@ -1088,28 +1017,6 @@ const editLines = async (box, inv, extra = []) => ({
                          quantity: i.quantity, unit_amount: i.unit_amount })), ...extra]
 });
 
-await probe('adding an electricity line to a rent invoice does not get that month billed again', async () => {
-  const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
-  const rent = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
-  const saved = await c('saveInvoice', (await editLines(box, rent,
-    [{ description: 'EB 142 units', category: 'Electricity', quantity: 142, unit_amount: 8.5 }])));
-  if (!saved.ok) return 'edit failed: ' + saved.error;
-  if (saved.data.invoice.type !== 'Rent') return 'the rent invoice was relabelled ' + saved.data.invoice.type;
-  const again = await c('generateInvoices', { upto: box.today() });
-  return again.data.created ? again.data.created + ' invoice(s) raised again for periods already billed' : null;
-});
-
-await probe('a rent invoice already relabelled "Mixed" still counts as billed', async () => {
-  const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
-  const rent = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
-  // what an earlier build left behind
-  await c('update', { table: 'Invoices', id: rent.id, data: { type: 'Mixed' } });
-  const again = await c('generateInvoices', { upto: box.today() });
-  return again.data.created ? 'billed ' + rent.period_start + ' a second time' : null;
-});
-
 await probe('an ad-hoc invoice is still relabelled when its lines change', async () => {
   const { box, c, tenant } = await billedLease();
   const made = (await c('saveInvoice', { data: { tenant_id: tenant.id, due_date: '2030-01-10' },
@@ -1130,52 +1037,6 @@ await probe('a void invoice cannot be edited back into arrears', async () => {
   return after.status === 'Void' && Number(after.balance) === 0 ? null : `status ${after.status}, balance ${after.balance}`;
 });
 
-await probe('a nightly run bills a lease whose stored status has not caught up', async () => {
-  const { box } = await billedLease();
-  await box.query(`update leases set status = 'Upcoming'`);
-  const r = await box.generateInvoices({ upto: box.today() }, { role: 'admin', name: 'trigger' });
-  return r.created ? null : 'no invoices for a lease that has been running since last year';
-});
-
-await probe('generating a year of rent writes each table once', async () => {
-  const { box, c } = await billedLease();
-  const mark = box.queries.length;
-  const r = await c('generateInvoices', { upto: box.today() });
-  const sent = box.queries.slice(mark);
-  if (r.data.created < 12) return 'expected a year of periods, got ' + r.data.created;
-  const items = await box.readTable('InvoiceItems');
-  if (items.length !== r.data.created) return r.data.created + ' invoices but ' + items.length + ' lines';
-  const ids = new Set((await box.readTable('Invoices')).map(i => i.id));
-  if (ids.size !== r.data.created) return 'invoice ids are not unique';
-  if (items.some(i => !ids.has(i.invoice_id))) return 'a line points at an invoice that does not exist';
-  const inserts = (t) => sent.filter(q => q.startsWith(`insert into "${t}"`)).length;
-  return inserts('invoices') === 1 && inserts('invoice_items') === 1
-    ? null : `${inserts('invoices')} invoice inserts and ${inserts('invoice_items')} line inserts`;
-});
-
-await probe('a rent run bigger than one insert batch is written whole', async () => {
-  const { box, admin } = await bootedSandbox();
-  const c = (a, p) => box.handle(a, p, admin);
-  const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
-  const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  // two leases 25 years long: 600 monthly periods, more than one 500-row batch
-  for (const n of ['A', 'B']) {
-    const u = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: n } })).data.row;
-    const l = await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: u.id, tenant_id: t.id,
-      start_date: '2000-01-01', end_date: '2024-12-31', rent_amount: 1000, status: 'Active' } });
-    if (!l.ok) return l.error;
-  }
-  // they ended long ago; mark them running so the whole history is due
-  await box.query(`update leases set status = 'Active'`);
-  const r = await c('generateInvoices', { upto: '2024-12-31' });
-  if (!r.ok) return r.error;
-  const invoices = (await box.readTable('Invoices')).filter(i => i.type === 'Rent');
-  const items = await box.readTable('InvoiceItems');
-  if (invoices.length !== 600) return invoices.length + ' rent invoices, expected 600';
-  if (new Set(invoices.map(i => i.id)).size !== 600) return 'invoice ids repeat';
-  return items.filter(i => i.category === 'Rent').length === 600 ? null : 'some invoices have no line';
-});
-
 await probe('the late fee is not charged on a security deposit', async () => {
   const { box, c } = await billedLease({ deposit_amount: 50000, late_fee: 500 });
   await c('bootstrap', {});
@@ -1187,8 +1048,8 @@ await probe('the late fee is not charged on a security deposit', async () => {
 
 await probe('the late fee is still charged on overdue rent', async () => {
   const { box, c } = await billedLease({ late_fee: 500 });
-  await c('generateInvoices', { upto: box.today() });
-  await c('bootstrap', {});
+  await raiseRent(box, c);
+  await box.refreshStatuses();
   return (await box.readTable('InvoiceItems')).some(i => i.category === 'Late Fee')
     ? null : 'no late fee on any overdue rent invoice';
 });
@@ -1196,7 +1057,7 @@ await probe('the late fee is still charged on overdue rent', async () => {
 console.log('\n— a payment entered on the Payments page —');
 await probe('settles the invoice it is against', async () => {
   const { box, c, tenant } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   const r = await c('create', { table: 'Payments', data: {
     payment_date: box.today(), tenant_id: tenant.id, invoice_id: inv.id, amount: Number(inv.balance), method: 'UPI' } });
@@ -1208,7 +1069,7 @@ await probe('settles the invoice it is against', async () => {
 
 await probe('cannot be more than the invoice still owes', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   const r = await c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 999999 } });
   return r.ok ? 'an overpayment was accepted' : null;
@@ -1225,7 +1086,7 @@ await probe('cannot be taken on a void invoice', async () => {
 
 await probe('editing its amount re-prices the invoice', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   const pay = (await c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 4000 } })).data.row;
   const up = await c('update', { table: 'Payments', id: pay.id, data: { amount: 10000 } });
@@ -1238,7 +1099,7 @@ await probe('editing its amount re-prices the invoice', async () => {
 
 await probe('moving it to another invoice puts the first one back', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const [a, b] = await box.readTable('Invoices');
   const pay = (await c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: a.id, amount: 10000 } })).data.row;
   await c('update', { table: 'Payments', id: pay.id, data: { invoice_id: b.id } });
@@ -1249,7 +1110,7 @@ await probe('moving it to another invoice puts the first one back', async () => 
 
 await probe('takes its tenant and property from the invoice', async () => {
   const { box, c, prop, tenant } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   const row = (await c('create', { table: 'Payments', data: { payment_date: box.today(), invoice_id: inv.id, amount: 10 } })).data.row;
   return row.tenant_id === tenant.id && row.property_id === prop.id
@@ -1264,7 +1125,7 @@ await probe('money on account, with no invoice, is still accepted', async () => 
 
 await probe('voiding a payment recomputes its invoice once', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   const p = (await c('recordPayment', { invoice_id: inv.id, amount: 1000 })).data.payment;
   const mark = box.queries.length;
@@ -1371,7 +1232,7 @@ await probe('the audit log keeps numbering from its last row', async () => {
 
 await probe('the scheduled jobs run with nobody signed in', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   await box.query(`update invoices set status = 'Unpaid'`);        // stale since yesterday
   const maintenance = await box.dailyMaintenanceJob();
   if (!maintenance || maintenance.changes < 1) return 'housekeeping did nothing: ' + JSON.stringify(maintenance);
@@ -1414,7 +1275,7 @@ await probe('the version handed back with a save is the one the next save needs'
 
 await probe('an invoice edited on a stale copy is refused', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   await c('recordPayment', { invoice_id: inv.id, amount: 100 });
   const r = await c('saveInvoice', { ...(await editLines(box, inv)), expected_version: inv._v });
@@ -1491,21 +1352,12 @@ await probe('voiding needs a reason, keeps the number and leaves nothing owed', 
 
 await probe('an invoice holding money cannot be voided', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices'))[0];
   await c('recordPayment', { invoice_id: inv.id, amount: 100 });
   const r = await c('voidInvoice', { id: inv.id, reason: 'x' });
   if (r.ok) return 'voided with a payment against it';
   return /received/.test(r.error) ? null : 'refused for the wrong reason: ' + r.error;
-});
-
-await probe('a voided rent period is not billed again', async () => {
-  const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
-  const inv = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
-  const v = await c('voidInvoice', { id: inv.id, reason: 'rent-free month' });
-  if (!v.ok) return 'could not void: ' + v.error;
-  return (await c('generateInvoices', { upto: box.today() })).data.created ? 'the voided month was billed again' : null;
 });
 
 await probe('a draft is not payable and does not count as owed', async () => {
@@ -1530,7 +1382,7 @@ async function gstPortfolio(state, leaseGst = 18) {
 
 await probe('rent on a lease with GST is taxed, split CGST + SGST within the state', async () => {
   const { box, c } = await gstPortfolio('Karnataka');
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
   const want = { amount: 10000, tax: 1800, total: 11800, cgst: 900, sgst: 900, igst: 0 };
   const bad = Object.entries(want).filter(([k, v]) => Number(inv[k]) !== v);
@@ -1540,7 +1392,7 @@ await probe('rent on a lease with GST is taxed, split CGST + SGST within the sta
 
 await probe('a property in another state is charged IGST', async () => {
   const { box, c } = await gstPortfolio('TN');
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const inv = (await box.readTable('Invoices')).find(i => i.type === 'Rent');
   return Number(inv.igst) === 1800 && Number(inv.cgst) === 0 && /^33-/.test(inv.place_of_supply)
     ? null : `igst ${inv.igst}, cgst ${inv.cgst}, place ${inv.place_of_supply}`;
@@ -1554,7 +1406,8 @@ await probe('each line carries its own rate, and a late fee is taxed like the re
   ] })).data.invoice;
   if (Number(inv.tax) !== 1800 || Number(inv.total) !== 12600) return `tax ${inv.tax}, total ${inv.total}`;
   await c('update', { table: 'Leases', id: (await box.readTable('Leases'))[0].id, data: { late_fee: 500 } });
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
+  await box.refreshStatuses();                                 // housekeeping adds the fee
   const fee = (await box.readTable('InvoiceItems')).find(i => i.category === 'Late Fee');
   return fee && Number(fee.tax_amount) === 90 ? null : 'late fee tax ' + (fee && fee.tax_amount);
 });
@@ -1599,7 +1452,7 @@ await probe('a terminated lease whose deposit has not been returned still owes i
 
 await probe('move-out: the deposit pays arrears and deductions, and the rest is refunded', async () => {
   const { box, c, lease, tenant } = await billedLease({ deposit_amount: 100000, deposit_status: 'Held' });
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   const owed = (await box.readTable('Invoices')).filter(i => i.type === 'Rent' && Number(i.balance) > 0)
     .slice(1).map(i => i.id);
   // leave one unpaid month; pay the rest so arrears are small
@@ -1725,7 +1578,7 @@ await probe('one tenant gets one email for all their invoices, and never twice i
 console.log('\n— speed —');
 await probe('only the first load of the day runs housekeeping', async () => {
   const { box, c } = await billedLease();
-  await c('generateInvoices', { upto: box.today() });
+  await raiseRent(box, c);
   // as if a day had passed: nothing has refreshed today, and one invoice is stale
   await box.query(`delete from app_state where key = 'LAST_REFRESH'`);
   const first_ = (await box.readTable('Invoices'))[0].id;
@@ -1771,63 +1624,24 @@ await probe('a setting added by a new release reaches an existing deployment', a
 });
 
 console.log('\n— rent day —');
-await probe('a rent-day lease is due on the 10th, part months by each month’s own days, GST per line', async () => {
-  const Y = Number((await bootedSandbox()).box.today().slice(0, 4)) - 1;
-  const { box, c, lease } = await billedLease({ start_date: Y + '-09-21', rent_amount: 30000, rent_day: 10, gst_rate: 18 });
-  const r = await c('generateInvoices', { upto: Y + '-11-10' });
-  if (!r.ok) return r.error;
-  const problems = [];
-  const invs = r.data.invoices.filter(i => i.lease_id === lease.id).sort((a, b) => a.period_start < b.period_start ? -1 : 1);
-  if (invs.length !== 2) return invs.length + ' invoices';
-  const [first, second] = await Promise.all(invs.map(i => rowOf(box, 'Invoices', i.id)));
-  if (first.period_start !== Y + '-09-21' || first.period_end !== Y + '-10-10' || first.due_date !== Y + '-10-10' ||
-      first.issue_date !== Y + '-11-10') {
-    problems.push(`first covers ${first.period_start}–${first.period_end}, issued ${first.issue_date}, due ${first.due_date}`);
-  }
-  if (Number(first.amount) !== 19677.42 || Number(first.tax) !== 3541.94 || Number(first.total) !== 23219.36) {
-    problems.push(`first ${first.amount} + ${first.tax} = ${first.total}`);
-  }
-  const lines = (await box.readTable('InvoiceItems')).filter(i => i.invoice_id === first.id);
-  if (lines.length !== 2 || !/\(10\/30 days\)/.test(lines[0].description + lines[1].description) ||
-      !/\(10\/31 days\)/.test(lines[0].description + lines[1].description)) {
-    problems.push('lines ' + lines.map(l => l.description).join(' | '));
-  }
-  if (Number(second.amount) !== 30000 || second.period_start !== Y + '-10-11') problems.push(`second ${second.period_start} ${second.amount}`);
-  const again = await c('generateInvoices', { upto: Y + '-11-10' });
-  if (again.data.created) problems.push('running it again raised ' + again.data.created + ' more');
-  return problems.length ? problems.join('; ') : null;
-});
-
 await probe('on a rent-day lease the grace days run after the rent day, before the late fee', async () => {
   const Y = Number((await bootedSandbox()).box.today().slice(0, 4)) - 1;
   const late = async (grace) => {
-    const { box, c, lease } = await billedLease({ start_date: Y + '-01-11', rent_amount: 30000, rent_day: 10,
-                                            late_fee: 500, grace_days: grace });
-    const r = await c('generateInvoices', { upto: Y + '-02-01' });
-    const inv = r.data.invoices.find(i => i.lease_id === lease.id);
+    const { box, c, lease, tenant } = await billedLease({ start_date: Y + '-01-11', rent_amount: 30000, rent_day: 10,
+                                                    late_fee: 500, grace_days: grace });
+    const inv = (await c('saveInvoice', { data: { tenant_id: tenant.id, lease_id: lease.id, due_date: Y + '-02-10',
+      period_start: Y + '-01-11', period_end: Y + '-02-10' },
+      items: [{ description: 'Rent', category: 'Rent', quantity: 1, unit_amount: 30000 }] })).data.invoice;
+    await box.refreshStatuses();
     const row = await rowOf(box, 'Invoices', inv.id);
     const fees = (await box.readTable('InvoiceItems')).filter(i => i.invoice_id === inv.id && i.category === 'Late Fee');
-    return { due: row.due_date, status: row.status, fees: fees.length };
+    return { status: row.status, fees: fees.length };
   };
   const within = await late(100000), past = await late(5);   // a grace too long to have run out yet, and 5 days
   const problems = [];
-  if (within.due !== Y + '-02-10') problems.push('due ' + within.due);
   if (within.status !== 'Overdue' || within.fees) problems.push(`still in grace: ${within.status}, ${within.fees} late fee`);
   if (past.fees !== 1) problems.push(past.fees + ' late fees once the grace ran out');
   return problems.length ? problems.join('; ') : null;
-});
-
-await probe('setting a rent day on a lease already billed carries on from where billing stopped', async () => {
-  const Y = Number((await bootedSandbox()).box.today().slice(0, 4)) - 1;
-  const { c, lease } = await billedLease({ start_date: Y + '-01-01', rent_amount: 30000 });
-  await c('generateInvoices', { upto: Y + '-03-15' });                 // Jan, Feb, Mar billed in advance
-  const u = await c('update', { table: 'Leases', id: lease.id, data: { rent_day: 10 } });
-  if (!u.ok) return u.error;
-  const r = await c('generateInvoices', { upto: Y + '-05-10' });
-  const got = r.data.invoices.filter(i => i.lease_id === lease.id).map(i => i.period_start + '..' + i.period_end + '=' + Number(i.amount))
-    .sort();
-  const want = [`${Y}-04-01..${Y}-04-10=10000`, `${Y}-04-11..${Y}-05-10=30000`];
-  return JSON.stringify(got) === JSON.stringify(want) ? null : 'got ' + got.join(', ');
 });
 
 await probe('a rent day outside the 1st–28th (or last day) is refused, and a renewal keeps it', async () => {
