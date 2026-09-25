@@ -75,7 +75,7 @@ function inputFor(field, value, record) {
  * Opens a create/edit modal for an entity and returns the saved row.
  * `overrides` pre-fills (and locks) fields — used for "add unit to this property".
  */
-export function openEntityForm(entity, row = null, { overrides = {}, onSaved } = {}) {
+export function openEntityForm(entity, row = null, { overrides = {}, defaults = {}, onSaved } = {}) {
   const def = entities[entity];
   const isEdit = !!row;
   const fields = formFields(entity);
@@ -85,7 +85,8 @@ export function openEntityForm(entity, row = null, { overrides = {}, onSaved } =
     grace_days: store.settings.default_grace_days,
     late_fee: store.settings.default_late_fee
   } : {};
-  const values = { ...orgDefaults, ...(row || {}), ...overrides };
+  // `defaults` only suggest (a ticket reported by the unit's tenant); `overrides` lock
+  const values = { ...orgDefaults, ...(isEdit ? {} : defaults), ...(row || {}), ...overrides };
 
   const grid = el('div', { class: 'form-grid' });
   const controls = {};

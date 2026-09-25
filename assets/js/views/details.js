@@ -13,6 +13,8 @@ import { recordPaymentFor } from './invoices.js';
 import { OPEN, sum, newestFirst, canPay, country, telHref, btn, managerBtn, linkBtn, viewAll, missing,
          deleteBtn, invoiceTable, paymentTable, leaseTable, ticketTable, expenseTable, documentTable,
          expenseRow, tenantCard, leaseCard } from './records.js';
+import { addButton, tableAdd, panelActions, invoiceDefaults, addInvoice, addPayment, addTicket, addExpense,
+         addDocument, addLease } from './adders.js';
 
 const byUnitNumber = (a, b) => String(a.unit_number).localeCompare(String(b.unit_number), undefined, { numeric: true });
 const ACTIVE_TICKET = ['Open', 'In Progress', 'On Hold'];
@@ -83,6 +85,11 @@ function propertyPage(property, s, ctx) {
     ? Math.round((property.current_value - property.purchase_price) / property.purchase_price * 1000) / 10 : null;
 
   const addUnit = () => openEntityForm('units', null, { overrides: { property_id: id }, onSaved: () => refreshView() });
+  const here = { property_id: id };
+  const newTicket = () => addTicket(here);
+  const newExpense = () => addExpense(here);
+  const newPayment = () => addPayment(scope);
+  const newInvoice = () => addInvoice(invoiceDefaults('property', property));
 
   let t = null;
   const overview = () => el('div', { class: 'tab-stack' }, [
@@ -98,17 +105,18 @@ function propertyPage(property, s, ctx) {
       panel('Collected vs spent', barChart(store.labelSeries(s.series), { height: 200 })),
       panel('Open maintenance', recordList(s.openTickets, ticketRow, { limit: 6, empty: 'Nothing open.' }), {
         flush: true, count: counts.openTickets,
-        action: counts.maintenance ? viewAll(() => t.select('maintenance')) : null
+        action: panelActions(addButton('New ticket', newTicket), counts.maintenance ? viewAll(() => t.select('maintenance')) : null)
       })
     ]),
     el('div', { class: 'grid-2' }, [
       panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }), {
         flush: true, count: counts.payments,
-        action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null
+        action: panelActions(addButton('Record payment', newPayment, 'card'),
+                             counts.payments > 5 ? viewAll(() => t.select('payments')) : null)
       }),
       panel('Recent expenses', recordList(s.recentExpenses, expenseRow, { limit: 5, empty: 'No expenses recorded.' }), {
         flush: true, count: counts.expenses,
-        action: counts.expenses > 5 ? viewAll(() => t.select('expenses')) : null
+        action: panelActions(addButton('Add expense', newExpense), counts.expenses > 5 ? viewAll(() => t.select('expenses')) : null)
       })
     ])
   ]);
@@ -117,15 +125,21 @@ function propertyPage(property, s, ctx) {
     { key: 'overview', label: 'Overview', render: overview },
     { key: 'units', label: 'Units', count: units.length, render: () => dataTable({
         entity: 'units', rows: units, columns: tableFields('units').filter(c => c.key !== 'property_id'),
-        onRowClick: (r) => navigate('units/' + r.id), emptyMessage: 'No units yet.' }) },
-    { key: 'leases', label: 'Leases', count: leases.length, render: () => leaseTable(leases, { hide: ['property_id'] }) },
+        onRowClick: (r) => navigate('units/' + r.id), emptyMessage: 'No units yet.', add: tableAdd('Add unit', addUnit) }) },
+    { key: 'leases', label: 'Leases', count: leases.length,
+      render: () => leaseTable(leases, { hide: ['property_id'], add: tableAdd('New lease', () => addLease(here)) }) },
     { key: 'invoices', label: 'Invoices', count: counts.invoices,
-      render: () => invoiceTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-invoices' }) },
+      render: () => invoiceTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-invoices',
+                                             add: tableAdd('New invoice', newInvoice) }) },
     { key: 'payments', label: 'Payments', count: counts.payments,
-      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-payments' }) },
-    { key: 'expenses', label: 'Expenses', count: counts.expenses, render: () => expenseTable({ scope }, { hide: ['property_id'] }) },
-    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance, render: () => ticketTable({ scope }, { hide: ['property_id'] }) },
-    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) }
+      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'property-' + id + '-payments',
+                                             add: tableAdd('Record payment', newPayment) }) },
+    { key: 'expenses', label: 'Expenses', count: counts.expenses,
+      render: () => expenseTable({ scope }, { hide: ['property_id'], add: tableAdd('Add expense', newExpense) }) },
+    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance,
+      render: () => ticketTable({ scope }, { hide: ['property_id'], add: tableAdd('New ticket', newTicket) }) },
+    { key: 'documents', label: 'Documents', count: counts.documents,
+      render: () => documentTable({ scope }, { add: tableAdd('Add document', () => addDocument('Property', id)) }) }
   ], { active: ctx.query?.tab, base: hrefFor('properties', id) });
 
   return detailPage({
@@ -208,6 +222,12 @@ function unitPage(unit, s, ctx) {
       })
     : null;
 
+  const here = { property_id: unit.property_id, unit_id: id };
+  // a ticket on an occupied unit is usually reported by whoever lives there
+  const newTicket = () => addTicket(here, tenant ? { tenant_id: tenant.id } : {});
+  const newInvoice = () => addInvoice(invoiceDefaults('unit', unit));
+  const newPayment = () => addPayment(scope);
+
   let t = null;
   const overview = () => el('div', { class: 'tab-stack' }, [
     !lease ? notice([
@@ -232,25 +252,31 @@ function unitPage(unit, s, ctx) {
     el('div', { class: 'grid-2' }, [
       panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices for this unit yet.' }),
-        { flush: true, count: counts.invoices, action: counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+        { flush: true, count: counts.invoices, action: panelActions(
+            addButton('New invoice', newInvoice), counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null) }),
       panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: counts.payments, action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: counts.payments, action: panelActions(
+            addButton('Record payment', newPayment, 'card'), counts.payments > 5 ? viewAll(() => t.select('payments')) : null) })
     ]),
     panel('Open maintenance', recordList(s.openTickets, ticketRow, { limit: 5, empty: 'Nothing open.' }),
-      { flush: true, count: counts.openTickets, action: counts.maintenance ? viewAll(() => t.select('maintenance')) : null })
+      { flush: true, count: counts.openTickets, action: panelActions(
+          addButton('New ticket', newTicket), counts.maintenance ? viewAll(() => t.select('maintenance')) : null) })
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
     { key: 'invoices', label: 'Invoices', count: counts.invoices,
-      render: () => invoiceTable({ scope }, { hide: ['property_id', 'unit_id'], exportName: 'unit-' + id + '-invoices' }) },
+      render: () => invoiceTable({ scope }, { hide: ['property_id', 'unit_id'], exportName: 'unit-' + id + '-invoices',
+                                             add: tableAdd('New invoice', newInvoice) }) },
     { key: 'payments', label: 'Payments', count: counts.payments,
-      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'unit-' + id + '-payments' }) },
+      render: () => paymentTable({ scope }, { hide: ['property_id'], exportName: 'unit-' + id + '-payments',
+                                             add: tableAdd('Record payment', newPayment) }) },
     { key: 'leases', label: 'Lease history', count: leases.length,
-      render: () => leaseTable(leases, { hide: ['property_id', 'unit_id'] }) },
+      render: () => leaseTable(leases, { hide: ['property_id', 'unit_id'], add: tableAdd('New lease', () => addLease(here)) }) },
     { key: 'maintenance', label: 'Maintenance', count: counts.maintenance,
-      render: () => ticketTable({ scope }, { hide: ['property_id', 'unit_id'] }) },
-    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
+      render: () => ticketTable({ scope }, { hide: ['property_id', 'unit_id'], add: tableAdd('New ticket', newTicket) }) },
+    { key: 'documents', label: 'Documents', count: counts.documents,
+      render: () => documentTable({ scope }, { add: tableAdd('Add document', () => addDocument('Unit', id)) }) },
     { key: 'activity', label: 'Activity',
       render: () => awaiting(() => store.history('units', id), (h) =>
         panel('Activity', timeline(eventsFor({ leases: allLeases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),
@@ -349,6 +375,12 @@ function tenantPage(tenant, s, ctx) {
   ].filter(l => l !== null).join('\n');
   const wa = tenant.phone ? whatsappLink(tenant.phone, balanceText, country()) : '';
 
+  // where they live, for a ticket they report
+  const home = activeLease || sharedHome?.lease || null;
+  const newTicket = () => addTicket({ tenant_id: id }, home ? { property_id: home.property_id, unit_id: home.unit_id } : {});
+  const newInvoice = () => addInvoice(invoiceDefaults('tenant', tenant));
+  const newPayment = () => addPayment(scope);
+
   let t = null;
   const overview = () => el('div', { class: 'tab-stack' }, [
     overdue.length
@@ -396,23 +428,30 @@ function tenantPage(tenant, s, ctx) {
     el('div', { class: 'grid-2' }, [
       panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices yet.' }),
-        { flush: true, count: counts.invoices, action: counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+        { flush: true, count: counts.invoices, action: panelActions(
+            addButton('New invoice', newInvoice), counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null) }),
       panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: counts.payments, action: counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: counts.payments, action: panelActions(
+            addButton('Record payment', newPayment, 'card'), counts.payments > 5 ? viewAll(() => t.select('payments')) : null) })
     ])
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
     { key: 'invoices', label: 'Invoices', count: counts.invoices,
-      render: () => invoiceTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-invoices' }) },
+      render: () => invoiceTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-invoices',
+                                             add: tableAdd('New invoice', newInvoice) }) },
     { key: 'payments', label: 'Payments', count: counts.payments,
-      render: () => paymentTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-payments' }) },
+      render: () => paymentTable({ scope }, { hide: ['tenant_id'], exportName: 'tenant-' + id + '-payments',
+                                             add: tableAdd('Record payment', newPayment) }) },
     // a shared lease names its primary tenant, so the column stays when there is one
     { key: 'leases', label: 'Leases', count: allLeases.length,
-      render: () => leaseTable(allLeases, { hide: shared.length ? [] : ['tenant_id'] }) },
-    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance, render: () => ticketTable({ scope }) },
-    { key: 'documents', label: 'Documents', count: counts.documents, render: () => documentTable({ scope }) },
+      render: () => leaseTable(allLeases, { hide: shared.length ? [] : ['tenant_id'],
+                                            add: tableAdd('New lease', () => addLease({ tenant_id: id })) }) },
+    { key: 'maintenance', label: 'Maintenance', count: counts.maintenance,
+      render: () => ticketTable({ scope }, { add: tableAdd('New ticket', newTicket) }) },
+    { key: 'documents', label: 'Documents', count: counts.documents,
+      render: () => documentTable({ scope }, { add: tableAdd('Add document', () => addDocument('Tenant', id)) }) },
     { key: 'activity', label: 'Activity',
       render: () => awaiting(() => store.history('tenants', id), (h) =>
         panel('Activity', timeline(eventsFor({ leases, invoices: h.invoices, payments: h.payments, tickets: h.maintenance }))),

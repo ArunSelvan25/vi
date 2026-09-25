@@ -770,6 +770,24 @@ await step('Generate rent: this month ticked, EB units typed, saved as drafts, t
   if (res.periods.some(p => p.kind === 'current')) throw new Error('this month is still offered after issuing');
 });
 
+await step('each record page adds from where you are: a lease\'s Documents tab adds a document linked to it', async () => {
+  await page.evaluate(() => { location.hash = '#/leases/LSE-00001?tab=documents'; });
+  await page.waitForFunction(() => [...document.querySelectorAll('.table-toolbar button')].some(b => /Add document/.test(b.textContent)),
+                             { timeout: 8000 });
+  await page.evaluate(() => [...document.querySelectorAll('.table-toolbar button')].find(b => /Add document/.test(b.textContent)).click());
+  await page.waitForSelector('#f_entity_id', { timeout: 5000 });
+  const linked = await page.evaluate(() => ({ type: document.querySelector('#f_entity_type').value,
+    id: document.querySelector('#f_entity_id').value, locked: document.querySelector('#f_entity_id').disabled }));
+  if (linked.type !== 'Lease' || linked.id !== 'LSE-00001' || !linked.locked) throw new Error(JSON.stringify(linked));
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 5000 });
+  // and the overview's panels carry their own add buttons
+  await page.evaluate(() => { location.hash = '#/leases/LSE-00001'; });
+  await page.waitForFunction(() => [...document.querySelectorAll('.panel-head button')].some(b => /New invoice/.test(b.textContent)) &&
+                                   [...document.querySelectorAll('.panel-head button')].some(b => /Record payment/.test(b.textContent)),
+                             { timeout: 8000 });
+});
+
 console.log('\n— global search —');
 const searchHeads = () => page.$$eval('.global-search-head', h => h.map(x => x.childNodes[1].textContent));
 const waitSearched = () => page.waitForFunction(() => document.querySelector('.global-search-results') &&

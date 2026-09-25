@@ -15,7 +15,7 @@ const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
  * own GST rate, because rent on a shop and the electricity passed through with
  * it are taxed differently.
  */
-export async function openInvoiceForm(invoice = null, { onSaved, items } = {}) {
+export async function openInvoiceForm(invoice = null, { onSaved, items, defaults } = {}) {
   // an invoice being edited opens with its line items: the ones its page
   // already has, or else fetched now
   let existing = [];
@@ -23,11 +23,16 @@ export async function openInvoiceForm(invoice = null, { onSaved, items } = {}) {
     try { existing = items || (await store.detail('invoices', invoice.id)).items || []; }
     catch (err) { toast(err.message, 'danger'); return null; }
   }
-  return invoiceForm(invoice, existing, { onSaved });
+  return invoiceForm(invoice, existing, { onSaved, defaults });
 }
 
-function invoiceForm(invoice, existing, { onSaved } = {}) {
+/**
+ * @param defaults for a new invoice, who and what it is for — tenant, property,
+ *   unit, lease — when it is raised from that record's own page
+ */
+function invoiceForm(invoice, existing, { onSaved, defaults } = {}) {
   const isEdit = !!invoice;
+  const start = invoice || defaults || {};
   const isDraft = isEdit && invoice.status === 'Draft';
   const defaultRate = Number(store.settings.default_gst_rate || 0);
   // an invoice from before line rates keeps its flat, typed tax
@@ -50,14 +55,14 @@ function invoiceForm(invoice, existing, { onSaved } = {}) {
   const blank = { value: '', label: '— none —' };
 
   const tenantSel = select([{ value: '', label: 'Select…' }, ...store.options('tenants')],
-                           invoice?.tenant_id, { id: 'f_tenant_id' });
-  const propertySel = select([blank, ...store.options('properties')], invoice?.property_id);
-  const unitSel = select([blank], invoice?.unit_id);
-  const leaseSel = select([blank, ...store.options('leases')], invoice?.lease_id);
+                           start.tenant_id, { id: 'f_tenant_id' });
+  const propertySel = select([blank, ...store.options('properties')], start.property_id);
+  const unitSel = select([blank], start.unit_id);
+  const leaseSel = select([blank, ...store.options('leases')], start.lease_id);
 
   const syncUnits = () => {
     const pid = propertySel.value;
-    const current = unitSel.value || invoice?.unit_id || '';
+    const current = unitSel.value || start.unit_id || '';
     unitSel.textContent = '';
     unitSel.append(el('option', { value: '', text: '— none —' }));
     for (const o of store.options('units', u => !pid || u.property_id === pid)) {

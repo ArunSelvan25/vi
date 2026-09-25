@@ -13,6 +13,7 @@ import { recordPaymentFor, showInvoice, showReceipt, openInvoiceForm, voidInvoic
 import { openRenewLease, openSettleDeposit } from './leases.js';
 import { householdList, openOccupants } from '../components/occupants.js';
 import { openGenerateRent } from './rentrun.js';
+import { addButton, tableAdd, panelActions, invoiceDefaults, addInvoice, addPayment, addDocument } from './adders.js';
 import { api } from '../api.js';
 
 /** An API deployed before Generate rent: leave its panel out rather than show an error. */
@@ -83,9 +84,9 @@ const facet = (entity, key, label) => {
 // Each takes `source` — { scope, preset, filters } — and the server pages it,
 // newest first unless the reader sorts by a column.
 
-export function invoiceTable(source, { hide = [], exportName } = {}) {
+export function invoiceTable(source, { hide = [], exportName, add } = {}) {
   return dataTable({
-    entity: 'invoices', source,
+    entity: 'invoices', source, add,
     columns: columnsWithout('invoices', hide), filters: facet('invoices', 'status', 'All statuses'),
     onRowClick: (r) => navigate('invoices/' + r.id), exportName, emptyMessage: 'No invoices yet.',
     actions: [
@@ -95,42 +96,42 @@ export function invoiceTable(source, { hide = [], exportName } = {}) {
   });
 }
 
-export function paymentTable(source, { hide = [], exportName, searchText } = {}) {
+export function paymentTable(source, { hide = [], exportName, searchText, add } = {}) {
   return dataTable({
-    entity: 'payments', source, searchText,
+    entity: 'payments', source, searchText, add,
     columns: columnsWithout('payments', hide), filters: facet('payments', 'method', 'All methods'),
     onRowClick: (r) => navigate('payments/' + r.id), exportName, emptyMessage: 'No payments yet.',
     actions: [{ label: 'Receipt', icon: 'receipt', onClick: (r) => showReceipt(r) }]
   });
 }
 
-export function leaseTable(rows, { hide = [] } = {}) {
+export function leaseTable(rows, { hide = [], add } = {}) {
   return dataTable({
-    entity: 'leases', rows: rows.slice().sort(newestFirst('start_date')),
+    entity: 'leases', rows: rows.slice().sort(newestFirst('start_date')), add,
     columns: columnsWithout('leases', hide), filters: facet('leases', 'status', 'All statuses'),
     onRowClick: (r) => navigate('leases/' + r.id), emptyMessage: 'No leases yet.'
   });
 }
 
-export function ticketTable(source, { hide = [] } = {}) {
+export function ticketTable(source, { hide = [], add } = {}) {
   return dataTable({
-    entity: 'maintenance', source,
+    entity: 'maintenance', source, add,
     columns: columnsWithout('maintenance', hide), filters: facet('maintenance', 'status', 'All statuses'),
     onRowClick: (r) => navigate('maintenance/' + r.id), emptyMessage: 'No maintenance tickets.'
   });
 }
 
-export function expenseTable(source, { hide = [] } = {}) {
+export function expenseTable(source, { hide = [], add } = {}) {
   return dataTable({
-    entity: 'expenses', source,
+    entity: 'expenses', source, add,
     columns: columnsWithout('expenses', hide), filters: facet('expenses', 'category', 'All categories'),
     onRowClick: (r) => navigate('expenses/' + r.id), emptyMessage: 'No expenses recorded.'
   });
 }
 
-export function documentTable(source) {
+export function documentTable(source, { add } = {}) {
   return dataTable({
-    entity: 'documents', source,
+    entity: 'documents', source, add,
     filters: facet('documents', 'category', 'All categories'),
     onRowClick: (r) => navigate('documents/' + r.id), emptyMessage: 'No documents linked.'
   });
@@ -290,6 +291,9 @@ function leasePage(lease, s, ctx) {
     createPerson: (done) => openEntityForm('tenants', null, { onSaved: done })
   });
 
+  const newInvoice = () => addInvoice(invoiceDefaults('lease', lease));
+  const newPayment = () => addPayment(scope);
+
   let t = null;
   const overview = () => el('div', { class: 'tab-stack' }, [
     renewedTo
@@ -340,19 +344,24 @@ function leasePage(lease, s, ctx) {
     el('div', { class: 'grid-2' }, [
       panel('Recent invoices', recordList(s.recentInvoices, invoiceRow,
         { limit: 5, empty: 'No invoices on this lease yet.' }),
-        { flush: true, count: s.counts.invoices, action: s.counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null }),
+        { flush: true, count: s.counts.invoices, action: panelActions(
+            addButton('New invoice', newInvoice), s.counts.invoices > 5 ? viewAll(() => t.select('invoices')) : null) }),
       panel('Recent payments', recordList(s.recentPayments, paymentRow, { limit: 5, empty: 'No payments yet.' }),
-        { flush: true, count: s.counts.payments, action: s.counts.payments > 5 ? viewAll(() => t.select('payments')) : null })
+        { flush: true, count: s.counts.payments, action: panelActions(
+            addButton('Record payment', newPayment, 'card'), s.counts.payments > 5 ? viewAll(() => t.select('payments')) : null) })
     ])
   ]);
 
   t = tabs([
     { key: 'overview', label: 'Overview', render: overview },
     { key: 'invoices', label: 'Invoices', count: s.counts.invoices,
-      render: () => invoiceTable({ scope }, { hide: ['tenant_id', 'property_id', 'unit_id'], exportName: 'lease-' + id + '-invoices' }) },
+      render: () => invoiceTable({ scope }, { hide: ['tenant_id', 'property_id', 'unit_id'], exportName: 'lease-' + id + '-invoices',
+                                             add: tableAdd('New invoice', newInvoice) }) },
     { key: 'payments', label: 'Payments', count: s.counts.payments,
-      render: () => paymentTable({ scope }, { hide: ['tenant_id', 'property_id'], exportName: 'lease-' + id + '-payments' }) },
-    { key: 'documents', label: 'Documents', count: s.counts.documents, render: () => documentTable({ scope }) },
+      render: () => paymentTable({ scope }, { hide: ['tenant_id', 'property_id'], exportName: 'lease-' + id + '-payments',
+                                             add: tableAdd('Record payment', newPayment) }) },
+    { key: 'documents', label: 'Documents', count: s.counts.documents,
+      render: () => documentTable({ scope }, { add: tableAdd('Add document', () => addDocument('Lease', id)) }) },
     { key: 'activity', label: 'Activity',
       render: () => awaiting(() => store.history('leases', id), (h) =>
         panel('Activity', timeline(eventsFor({ leases: [lease], invoices: h.invoices, payments: h.payments }))), { inline: true }) }

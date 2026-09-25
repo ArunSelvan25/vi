@@ -1696,3 +1696,25 @@ a.rec-row:hover { background: var(--surface-2); text-decoration: none; }
   .rr-result-row { grid-template-columns: minmax(0, 1fr) auto; }
   .rr-result-actions { grid-column: 1 / -1; justify-content: flex-start; }
 }
+
+/* ── add from where you are ───────────────────────────────────────────────
+   A panel header can carry an add button beside its "View all". */
+.panel-actions { display: inline-flex; align-items: center; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+.table-toolbar > .btn-primary { flex: none; }
+
+/* choosing which unpaid invoice a payment is for */
+.pick-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-md); }
+.pick-row {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: var(--s3); align-items: center;
+  padding: var(--s3); cursor: pointer; font-weight: 400;
+}
+.pick-row + .pick-row { border-top: 1px solid var(--border); }
+.pick-row:has(input:checked) { background: var(--brand-weak); }
+.pick-row input { width: 18px; height: 18px; margin: 0; accent-color: var(--brand); }
+.pick-main { display: flex; flex-direction: column; min-width: 0; }
+.pick-main strong { font-weight: 550; color: var(--text); }
+.pick-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 600px) {
+  .table-toolbar > .btn-primary { flex: 1 1 100%; }
+}

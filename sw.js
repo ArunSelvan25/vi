@@ -51,6 +51,7 @@ const SHELL = [
   './assets/js/components/occupants.js',
   './assets/js/components/search.js',
   './assets/js/components/table.js',
+  './assets/js/views/adders.js',
   './assets/js/views/billing.js',
   './assets/js/views/crud.js',
   './assets/js/views/dashboard.js',

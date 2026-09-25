@@ -72,6 +72,9 @@ function isStatusField(field) {
  *            and pages (store.page), and the table only ever holds one page.
  *            An export asks for every matching row.
  *
+ * @param add      { label, onClick } — the way to add a row here, e.g. "Add
+ *                 document" on a lease's Documents tab: a button in the toolbar,
+ *                 and again in the empty state
  * @param onTotal called with the number of matching rows after each load
  * @param searchText search text to open with, as a global search's "See all" asks
  */
@@ -86,7 +89,8 @@ export function dataTable({
   filters = [],
   exportName,
   onTotal,
-  searchText = ''
+  searchText = '',
+  add = null
 }) {
   const def = entities[entity];
   const cols = columns || tableFields(entity);
@@ -123,10 +127,13 @@ export function dataTable({
     }
   }, [icon('download', 15), ' CSV']);
 
+  const addBtn = () => el('button', { class: 'btn btn-primary btn-sm', type: 'button', onClick: add.onClick },
+                         [icon('plus', 15), ' ' + add.label]);
   const toolbar = el('div', { class: 'table-toolbar' }, [
     el('div', { class: 'search-box' }, [icon('search', 16), searchInput]),
     facetBar,
-    exportBtn
+    exportBtn,
+    add ? addBtn() : null
   ]);
 
   const tableEl = el('table', { class: 'data-table' });
@@ -245,7 +252,8 @@ export function dataTable({
       scrollEl.hidden = true;
       emptyHost.hidden = false;
       const anyRows = remote ? narrowed() : rows.length;
-      emptyHost.append(emptyState(anyRows ? 'No rows match your filters.' : emptyMessage));
+      emptyHost.append(emptyState(anyRows ? 'No rows match your filters.' : emptyMessage,
+                                  !anyRows && add ? addBtn() : null));
     } else {
       scrollEl.hidden = false;
       emptyHost.hidden = true;
