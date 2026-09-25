@@ -135,6 +135,40 @@ for (const [route, label] of [['properties', 'property'], ['tenants', 'tenant'],
   await new Promise((s) => setTimeout(s, 200));
 }
 
+console.log('\n— generate rent, every step —');
+for (const w of [320, 390]) {
+  await page.setViewport({ width: w, height: 780, isMobile: true });
+  await showRoute('billing');
+  await page.evaluate(() => [...document.querySelectorAll('.head-actions .btn')].find(b => /Generate rent/.test(b.textContent)).click());
+  await page.waitForSelector('.rr-lease', { timeout: 8000 }).catch(() => {});
+  const fitsNow = async (step) => {
+    await new Promise((s) => setTimeout(s, 250));
+    const o = await overflow();
+    const m = await page.evaluate(() => {
+      const r = document.querySelector('.rr-modal').getBoundingClientRect();
+      return { left: Math.round(r.left), right: Math.round(r.right), vw: document.documentElement.clientWidth };
+    });
+    ok(`${step} fits at ${w}px`, o.doc <= o.vw + 1 && m.left >= -1 && m.right <= m.vw + 1,
+       `${o.doc}px vs ${o.vw}px — ${o.offenders.join(', ')} · ${JSON.stringify(m)}`);
+  };
+  await fitsNow('step 1, select leases');
+  const next = () => page.evaluate(() => [...document.querySelectorAll('.rr-foot button')].find(b => /^Next/.test(b.textContent)).click());
+  await next();
+  await page.waitForSelector('.rr-grid', { timeout: 5000 }).catch(() => {});
+  await page.evaluate(() => document.querySelector('.rr-toggle')?.click());
+  await fitsNow('step 2, edit invoices (details open)');
+  await next();
+  await page.waitForSelector('.rr-review-table', { timeout: 5000 }).catch(() => {});
+  await fitsNow('step 3, review');
+  // leave without billing
+  await page.evaluate(() => document.querySelector('.rr-modal .modal-head .icon-btn').click());
+  await page.waitForFunction(() => [...document.querySelectorAll('.modal-foot button')].some(b => /^Leave$/.test(b.textContent)), { timeout: 3000 }).catch(() => {});
+  await page.evaluate(() => [...document.querySelectorAll('.modal-foot button')].find(b => /^Leave$/.test(b.textContent))?.click());
+  await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 3000 }).catch(() => {});
+  await page.evaluate(() => { try { localStorage.removeItem('vipm.generateRent.v1'); } catch (e) {} });
+}
+await page.setViewport({ width: 360, height: 780, isMobile: true });
+
 console.log('\n— detail screens —');
 for (const [route, name] of [['properties', 'property'], ['tenants', 'tenant']]) {
   await showRoute(route);

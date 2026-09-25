@@ -62,8 +62,8 @@ const seed = {
   ],
   // deposits collected before the app existed, so marked Held by hand
   Leases: [
-    { id:'LSE-00001', property_id:'PRP-00001', unit_id:'UNT-00001', tenant_id:'TNT-00001', start_date:monthDay(-11, 1), end_date:monthEnd(6), rent_amount:28000, deposit_amount:150000, deposit_status:'Held', frequency:'Monthly', late_fee:500, grace_days:5, escalation_pct:5, status:'Active' },
-    { id:'LSE-00002', property_id:'PRP-00002', unit_id:'UNT-00003', tenant_id:'TNT-00002', start_date:monthDay(-3, 1), end_date:inDays(30), rent_amount:75000, deposit_amount:450000, deposit_status:'Held', frequency:'Monthly', late_fee:1000, grace_days:5, escalation_pct:0, status:'Active' }
+    { id:'LSE-00001', property_id:'PRP-00001', unit_id:'UNT-00001', tenant_id:'TNT-00001', start_date:monthDay(-11, 1), end_date:monthEnd(6), rent_amount:28000, deposit_amount:150000, deposit_status:'Held', frequency:'Monthly', rent_day:31, late_fee:500, grace_days:5, escalation_pct:5, status:'Active' },
+    { id:'LSE-00002', property_id:'PRP-00002', unit_id:'UNT-00003', tenant_id:'TNT-00002', start_date:monthDay(-3, 1), end_date:inDays(30), rent_amount:75000, deposit_amount:450000, deposit_status:'Held', frequency:'Monthly', rent_day:31, late_fee:1000, grace_days:5, escalation_pct:0, status:'Active' }
   ],
   LeaseTenants: [
     { id:'LTN-00001', lease_id:'LSE-00001', tenant_id:'TNT-00003', role:'Co-tenant', relationship:'Friend', move_in_date:monthDay(-11, 1) }

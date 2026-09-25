@@ -2,6 +2,7 @@ import { el, icon, money, date, toast, modal, today, addDays, isoDate } from '..
 import { store } from '../store.js';
 import { crudView } from './crud.js';
 import { refreshView, navigate } from '../router.js';
+import { RENT_DAY_OPTIONS } from '../schema.js';
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -171,6 +172,10 @@ export function openRenewLease(lease, { onDone } = {}) {
   const rentInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01',
                                   value: round2(pct ? finalRent * (1 + pct / 100) : finalRent) });
   const escInput = el('input', { class: 'input', type: 'text', inputmode: 'decimal', step: '0.01', value: lease.escalation_pct ?? '' });
+  const rentDayInput = el('select', { class: 'input' }, [
+    el('option', { value: '', text: 'Select…' }),
+    ...RENT_DAY_OPTIONS.map(o => el('option', { value: o.value, selected: String(lease.rent_day) === o.value || null }, [o.label]))
+  ]);
   const carry = el('input', { type: 'checkbox', checked: held > 0 || null, disabled: held > 0 ? null : true });
   // whoever is still living there when the lease ends renews with it
   const staying = store.occupantsOf(lease).filter(o => !o.move_out_date || !lease.end_date || o.move_out_date > lease.end_date);
@@ -183,7 +188,8 @@ export function openRenewLease(lease, { onDone } = {}) {
       field('New start date', startInput),
       field('New end date *', endInput),
       field('Monthly rent', rentInput, `Last rent ${money(finalRent)}` + (pct ? `, with this year's ${pct}% escalation applied` : '')),
-      field('Annual escalation %', escInput)
+      field('Annual escalation %', escInput),
+      field('Rent day *', rentDayInput, 'The day of the month the rent is due.')
     ]),
     el('label', { class: 'check' }, [carry,
       held > 0 ? ` Carry the deposit of ${money(held)} over to the new lease` : ' No deposit is held to carry over']),
@@ -203,12 +209,14 @@ export function openRenewLease(lease, { onDone } = {}) {
         onClick: async (e, close) => {
           error.hidden = true;
           if (!endInput.value) { error.hidden = false; error.textContent = 'Choose when the renewed lease ends.'; return; }
+          if (!rentDayInput.value) { error.hidden = false; error.textContent = 'Choose the rent day.'; return; }
           const btn = e.currentTarget;
           btn.disabled = true; btn.textContent = 'Renewing…';
           try {
             const res = await store.act('renewLease', {
               id: lease.id, start_date: startInput.value, end_date: endInput.value,
-              rent_amount: rentInput.value, escalation_pct: escInput.value, carry_deposit: carry.checked,
+              rent_amount: rentInput.value, escalation_pct: escInput.value, rent_day: rentDayInput.value,
+              carry_deposit: carry.checked,
               carry_occupants: carryPeople.checked
             });
             toast(`Renewed as ${res.lease.id}`, 'ok');

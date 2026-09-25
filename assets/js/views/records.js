@@ -1,5 +1,5 @@
 import { el, icon, money, date, badge, today, daysBetween, whatsappLink, emptyState, confirmDialog, toast,
-         isoDate, safeUrl } from '../ui.js';
+         isoDate, safeUrl, modal } from '../ui.js';
 import { store } from '../store.js';
 import { entities, tableFields, fieldByKey, rentDayLabel } from '../schema.js';
 import { navigate, refreshView } from '../router.js';
@@ -12,6 +12,11 @@ import { recordPaymentFor, showInvoice, showReceipt, openInvoiceForm, voidInvoic
          invoiceMessage } from './invoices.js';
 import { openRenewLease, openSettleDeposit } from './leases.js';
 import { householdList, openOccupants } from '../components/occupants.js';
+import { openGenerateRent } from './rentrun.js';
+import { api } from '../api.js';
+
+/** An API deployed before Generate rent: leave its panel out rather than show an error. */
+const outdatedApi = (err) => (/Unknown action/.test(err.message) ? null : Promise.reject(err));
 
 // ── shared by every record page ─────────────────────────────────────────────
 
@@ -204,6 +209,59 @@ function nextEscalation(lease) {
   return { on, rent: store.currentRent(lease, on) };
 }
 
+/**
+ * Where a lease's rent billing stands: what can be raised now, or when the
+ * next invoice can be, and how its rent is made up. Managers only — it is
+ * worked out by the server with Generate rent's own rules.
+ */
+function rentPanel(lease, again) {
+  if (!store.can('manager') || !['Active', 'Upcoming', 'Expired', 'Terminated'].includes(lease.status)) return null;
+  const range = (a, b) => (a === b ? date(a) : `${date(a)} – ${date(b)}`);
+  return awaiting(() => api('rentCandidates', {}).catch(outdatedApi), (res) => {
+    if (!res) return el('span');
+    const c = res.leases.find(x => x.lease_id === lease.id);
+    if (!c) return el('span');
+    const raise = btn('Raise now', 'bolt', () => openGenerateRent({ leaseId: lease.id }), 'btn-primary');
+    const lines = (p) => el('div', { class: 'rent-lines' }, p.lines.map(l => el('div', { class: 'kv' }, [
+      el('span', { text: l.month_days ? `${range(l.start, l.end)} · ${l.days} of ${l.month_days} days` : range(l.start, l.end) }),
+      el('strong', { text: money(l.amount) })
+    ])));
+    let content, action = null;
+    if (c.state === 'missing_rent_day') {
+      content = notice('This lease has no rent day, so its rent cannot be generated. Edit the lease to set one.', 'warn',
+                       btn('Edit lease', 'edit', () => openEntityForm('leases', lease, { onSaved: again })));
+    } else if (c.state === 'open_termination') {
+      content = notice('Terminated, but the end date is not the day the tenant left. Set it to bill the final days.', 'warn',
+                       btn('Edit lease', 'edit', () => openEntityForm('leases', lease, { onSaved: again })));
+    } else if (c.state === 'ready' || c.state === 'backlog') {
+      const current = c.periods.filter(p => p.kind === 'current');
+      const backlog = c.periods.filter(p => p.kind === 'backlog');
+      const first = current[0] || backlog[0];
+      content = el('div', { class: 'stack' }, [
+        el('p', { class: 'pay-progress-text' }, [
+          el('strong', { text: money(first.amount) }), ` for ${range(first.start, first.end)}, due ${date(first.due)}`,
+          backlog.length && current.length ? ` · and ${backlog.length} older unbilled period${backlog.length === 1 ? '' : 's'}` : ''
+        ]),
+        lines(first),
+        c.late_fees.length ? el('p', { class: 'muted small', text: `${c.late_fees.length} late fee${c.late_fees.length === 1 ? '' : 's'} to decide on overdue invoices.` }) : null
+      ]);
+      action = raise;
+    } else if (c.next) {
+      content = el('div', { class: 'stack' }, [
+        el('p', { class: 'pay-progress-text' }, [
+          c.last_billed ? ['Billed to ', el('strong', { text: date(c.last_billed.end) }), ' · '] : null,
+          'next ', el('strong', { text: money(c.next.amount) }), ` for ${range(c.next.start, c.next.end)}, due ${date(c.next.due)}`
+        ].flat().filter(Boolean)),
+        lines(c.next),
+        el('p', { class: 'muted small', text: `It can be raised from ${date(c.next.raise_from)}.` })
+      ]);
+    } else {
+      return el('span');
+    }
+    return panel('Rent billing', content, { action });
+  }, { inline: true });
+}
+
 export function leaseDetail(id, ctx = {}) {
   const lease = store.byId('leases', id);
   if (!lease) return missing('leases');
@@ -255,6 +313,7 @@ function leasePage(lease, s, ctx) {
         ['GST on rent', Number(lease.gst_rate) ? lease.gst_rate + '%' : null]
       ])
     ])),
+    rentPanel(lease, again),
     el('div', { class: 'grid-2' }, [
       panel('Primary tenant', tenantCard(tenant)),
       panel('Unit', unitCard(unit))
@@ -428,11 +487,49 @@ function paymentProgress(inv, payments, dueIn) {
 
 export function invoiceDetail(id) {
   return awaiting(() => store.detail('invoices', id),
-                  (d) => (d.row ? invoicePage(d.row, d.items, d.payments) : missing('invoices')));
+                  (d) => (d.row ? invoicePage(d.row, d.items, d.payments, d.late_fee) : missing('invoices')));
+}
+
+/**
+ * The late fee on an overdue invoice: never added by itself, so the page says
+ * when one can be charged, and lets it be charged here or waived for good.
+ */
+function lateFeeNotice(inv, fee, again) {
+  if (!fee) return null;
+  if (fee.waived) return notice(['Late fee waived: ', fee.waived], 'muted');
+  if (fee.charged_on && fee.charged_on !== inv.id) {
+    return notice(['Late fee for this invoice charged on ', ref('invoices', fee.charged_on, { text: fee.charged_on }), '.'], 'info');
+  }
+  if (!fee.eligible || !store.can('manager')) return null;
+  const charge = btn(`Add late fee ${money(fee.fee)}`, 'plus', async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    try { await store.act('chargeLateFee', { invoice_id: inv.id }); toast('Late fee added', 'ok'); again(); }
+    catch (err) { b.disabled = false; toast(err.message, 'danger'); }
+  });
+  const waive = btn('Waive…', 'ban', () => {
+    const reason = el('textarea', { class: 'input', rows: 2, placeholder: 'e.g. medical emergency; paid late with notice' });
+    const error = el('p', { class: 'form-error', hidden: true });
+    modal({
+      title: 'Waive late fee · ' + inv.id, width: 480,
+      body: el('div', { class: 'stack' }, [error,
+        el('p', { class: 'muted', text: `The ${money(fee.fee)} late fee will not be charged for this invoice, now or later. This is logged.` }),
+        el('label', {}, ['Reason *', reason])]),
+      actions: [{ label: 'Cancel' }, { label: 'Waive late fee', variant: 'btn-primary', onClick: async (e, close) => {
+        if (!reason.value.trim()) { error.hidden = false; error.textContent = 'Give a reason.'; return; }
+        e.currentTarget.disabled = true;
+        try { await store.act('waiveLateFee', { invoice_id: inv.id, reason: reason.value.trim() }); close(); toast('Late fee waived', 'ok'); again(); }
+        catch (err) { e.currentTarget.disabled = false; error.hidden = false; error.textContent = err.message; }
+      } }]
+    });
+  });
+  return notice(`Past its grace days since ${date(fee.from)}: a late fee of ${money(fee.fee)} can be charged. ` +
+                'It is also offered on the tenant\'s next rent invoice.', 'warn',
+                el('span', { class: 'action-bar' }, [charge, waive]));
 }
 
 /** @param items its line items, and `payments` those against it, newest first */
-function invoicePage(inv, items, payments) {
+function invoicePage(inv, items, payments, lateFee) {
   const id = inv.id;
   const tenant = store.byId('tenants', inv.tenant_id);
   const open = OPEN.includes(inv.status);
@@ -459,6 +556,7 @@ function invoicePage(inv, items, payments) {
                                     store.can('manager') ? btn('Edit & issue', 'edit', () => openInvoiceForm(inv, { onSaved: again, items })) : null) : null,
     late ? notice(`Overdue by ${late} day${late === 1 ? '' : 's'} — ${money(inv.balance)} still to collect.`, 'danger',
                   canPay(inv) ? btn('Record payment', 'card', () => recordPaymentFor(inv, again)) : null) : null,
+    lateFeeNotice(inv, lateFee, again),
     paymentProgress(inv, payments, dueIn),
     panel('Line items', lineItemsTable(inv, items), { flush: true, count: items.length || 1 }),
     panel('Payments', recordList(payments, paymentRow, { empty: 'No payments recorded against this invoice.' }), {

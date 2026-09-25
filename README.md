@@ -35,9 +35,11 @@ is ever left half-saved and two people can never overwrite each other's work.
   documents by name, phone, unit, ID, reference or description.
 - **One Billing screen** — invoices and the payments against them, with
   outstanding / overdue / due-this-week / collected figures that double as filters.
-- **Rent days** — a monthly lease can be due on a fixed day (say the 10th), and
-  grace days count after it before the late fee. Rent invoices are raised by hand
-  each month.
+- **Generate rent** — pick the leases, type in electricity units and other
+  charges, review, then issue or save as drafts. Rent is billed on each lease's
+  rent day for the time already lived, part months by the day, never twice; late
+  fees are offered, never added on their own. See
+  [docs/RENT_GENERATION.md](docs/RENT_GENERATION.md).
 - **Invoices with any mix of charges** — rent, electricity (EB), water and more as
   separate lines, each with its own GST rate.
 - **Accounting that holds up** — deposits are held money, not income; issued
@@ -109,7 +111,8 @@ does live. Sign in with phone `9000012345` / password `password123`.
 
 | Suite | What it proves |
 |---|---|
-| `test:backend` | Rent days and late-fee grace |
+| `test:backend` | Rent periods — the agreed worked examples — rent days and late-fee grace |
+| `test:rent` | Generate rent end to end: what each lease is offered, drafts, charges, adjustments, late fees, billed outside the app, never billing twice |
 | `test:paging` | Server-side paging, search and scopes, and every server-computed figure checked against the old in-browser arithmetic |
 | `test:security` | Setup takeover, brute force, enumeration, forged tokens, role escalation |
 | `test:production` | ~140 behaviour probes: billing, deposits, roles, concurrency, rollback |

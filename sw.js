@@ -59,6 +59,7 @@ const SHELL = [
   './assets/js/views/leases.js',
   './assets/js/views/onboarding.js',
   './assets/js/views/records.js',
+  './assets/js/views/rentrun.js',
   './assets/js/views/reports.js',
   './assets/js/views/settings.js',
   './assets/icons/icon-192.png',

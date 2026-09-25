@@ -26,11 +26,13 @@
 
 - Unit ↔ tenant agreement with start and end dates, rent, deposit and deposit
   status (Held / Partially Refunded / Refunded).
-- Billing frequency: **Monthly, Quarterly, Half-Yearly or Yearly**.
-- **Grace days** — on a lease with a rent day, the days after an invoice's due
-  date before the late fee is added.
-- **Late fees** — set one on the lease and it is added, once, as a line item
-  when an invoice on that lease goes overdue.
+- Billing frequency: **Monthly, Quarterly, Half-Yearly or Yearly**, and a
+  **rent day** (required) — the day of the month rent is due.
+- **Grace days** — the days after an invoice's due date (or the day it was
+  issued, if later) before a late fee can be charged.
+- **Late fees** — set one on the lease. It is never added automatically: it is
+  offered, unticked, when you next generate rent, and on the overdue invoice's
+  own page, where it can also be waived for good with a reason.
 - **Annual escalation %** — rent compounds on each lease anniversary. The rent
   roll, property, tenant and lease pages show the rent in force today and the
   next increase, so you know what to bill.
@@ -63,13 +65,19 @@
 
 ## Rent & billing
 
-- **Rent is invoiced by hand.** Each month, raise a rent invoice for each lease
-  from the Billing page, with its period, due date and a Rent line. Nothing is
-  generated automatically.
-- **Rent day** — a monthly lease can have a fixed payment day each month
-  (1st–28th, or the last day). Grace days count after an invoice's due date,
-  before the late fee: due the 10th with 5 days' grace, the fee is added from
-  the 16th while the invoice still shows the 10th.
+- **Generate rent** (Billing, the dashboard, or a lease's page) raises rent
+  invoices in three steps — select leases, edit invoices, review — and issues
+  them or saves them as drafts. Rent is billed for the time already lived: with
+  rent day 10, 11 Sep – 10 Oct is due on 10 Oct. Part months are charged day by
+  day; a first part month asks whether to bill it alone or with the next
+  invoice; older unbilled months are offered unticked; nothing is ever billed
+  twice. Electricity units, a charge for every invoice, other charges and a
+  logged rent adjustment are added before anything is created. Every rule, with
+  worked examples: [RENT_GENERATION.md](RENT_GENERATION.md).
+- **Drafts** — not sent, not owed, never overdue. Billing → Drafts issues them
+  one by one or all at once, each dated the day it is issued.
+- **The dashboard says what is left to bill** this month, which leases have
+  months never billed, and which need a rent day.
 - **Line items** — one invoice carries any mix of charges: rent, electricity
   (EB), water, gas, internet, parking, maintenance, late fees. Add rows as you
   go, each with a description, category, quantity and unit amount, and the total
@@ -86,8 +94,9 @@
 - **Part payments handled properly** — paid, balance and status (Unpaid →
   Partial → Paid) are recomputed on the server from the payment records, so the
   numbers can't drift out of sync.
-- Overdue detection, late fees and lease expiry run once a day — on the daily
-  scheduled job, and on the first load of the day as a safety net.
+- Overdue detection and lease expiry run once a day — on the daily scheduled
+  job, and on the first load of the day as a safety net. Late fees are never
+  added by it.
 - **A payment covering several months is spread automatically** across that
   tenant's outstanding invoices, oldest due first. More than the tenant owes in
   total is refused, so no balance can ever go negative and understate arrears.
@@ -246,13 +255,11 @@
 
 Honest about what the current features do *not* do:
 
-- **Rent invoices are not generated.** Each one is raised by hand, so the app
-  does not warn about a month nobody billed. (The old `billing_day` column is not read.)
+- **Rent is generated when you run Generate rent**, not on a schedule. The
+  dashboard shows what is waiting. (The old `billing_day` column is not read.)
 - **A sold property's history stays in the reports** while dropping out of the
   dashboard headline figures. That is deliberate: past income and costs remain
   true.
-- **A late fee on an invoice raised already overdue** is added at the next
-  day's housekeeping, not the moment it is saved.
 - **No QR code** for UPI on printed invoices — the UPI ID and a *Pay via UPI*
   link are shown instead.
 

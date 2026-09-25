@@ -22,6 +22,11 @@ import {
   PAGED, OPEN as OPEN_STATUSES, listPage, scopeSummary, scopeHistory, recordDetail, dashboardData,
   billingFigures, reportData, SEARCHED, searchAll
 } from './queries.js';
+import {
+  validRentDay, rentOn, rentPeriods, joinFirstStub, rentLineText, lateFeeFrom, CYCLES_PER_INVOICE
+} from './rent.js';
+
+export { validRentDay, lateFeeFrom };
 
 // ─────────────────────────────────────────────────────────── configuration ──
 
@@ -219,7 +224,10 @@ function humanise(column) {
 // ────────────────────────────────────────────────────────────────── router ──
 
 const READ_ONLY_ACTIONS = { ping: 1, login: 1, bootstrap: 1, list: 1, me: 1, stats: 1,
-                            page: 1, detail: 1, history: 1, report: 1, search: 1 };
+                            page: 1, detail: 1, history: 1, report: 1, search: 1, rentCandidates: 1 };
+
+/** Tables written only through their own actions, never the generic create/update/remove. */
+const OWN_ACTIONS_ONLY = { RentOffline: 'Mark as billed outside the app on Generate rent' };
 export { READ_ONLY_ACTIONS };
 
 async function route(r, action, payload, token) {
@@ -227,6 +235,10 @@ async function route(r, action, payload, token) {
   if (action === 'logout') return logout(r, token);
 
   const user = await requireAuth(r, token);
+
+  if ((action === 'create' || action === 'update' || action === 'remove') && OWN_ACTIONS_ONLY[payload.table]) {
+    return fail(payload.table + ' is changed only through ' + OWN_ACTIONS_ONLY[payload.table] + '.');
+  }
 
   switch (action) {
     case 'me':               return ok({ user, settings: await readSettings(r) });
@@ -249,6 +261,13 @@ async function route(r, action, payload, token) {
     case 'voidInvoice':      return ok(await withSnapshot(r, payload, user, await voidInvoice(r, payload, user)));
     case 'recordPayment':    return ok(await withSnapshot(r, payload, user, await recordPayment(r, payload, user)));
     case 'voidPayment':      return ok(await withSnapshot(r, payload, user, await voidPayment(r, payload.id, user)));
+    case 'rentCandidates':   return ok(await rentCandidates(r, payload, user));
+    case 'generateRent':     return ok(await withSnapshot(r, payload, user, await generateRent(r, payload, user)));
+    case 'markRentOffline':  return ok(await markRentOffline(r, payload, user));
+    case 'undoRentOffline':  return ok(await undoRentOffline(r, payload, user));
+    case 'chargeLateFee':    return ok(await withSnapshot(r, payload, user, await chargeLateFee(r, payload, user)));
+    case 'waiveLateFee':     return ok(await withSnapshot(r, payload, user, await waiveLateFee(r, payload, user)));
+    case 'issueDrafts':      return ok(await withSnapshot(r, payload, user, await issueDrafts(r, payload, user)));
     case 'settleDeposit':    return ok(await withSnapshot(r, payload, user, await settleDeposit(r, payload, user)));
     case 'renewLease':       return ok(await withSnapshot(r, payload, user, await renewLease(r, payload, user)));
     case 'saveOccupants':    return ok(await withSnapshot(r, payload, user, await saveOccupants(r, payload, user)));
@@ -299,7 +318,13 @@ async function detail(r, payload, user) {
   requireRole(user, readRoleFor(table));
   if (SCOPE_OF[table]) return scopeSummary(r, SCOPE_OF[table], payload.id);
   if (!PAGED[table] || table === 'ActivityLog' || table === 'InvoiceItems') throw new Error('No page for ' + table);
-  return recordDetail(r, table, payload.id);
+  const out = await recordDetail(r, table, payload.id);
+  // whether the invoice's page can offer to charge or waive its late fee
+  if (table === 'Invoices' && out && out.row) {
+    const lease = out.row.lease_id ? await findRow(r, 'Leases', out.row.lease_id) : null;
+    out.late_fee = lateFeeState(lease, out.row, await rentBook(r), today(r));
+  }
+  return out;
 }
 
 /** A property, unit, tenant or lease's invoices, payments and tickets in full: its timeline and statement. */
@@ -632,8 +657,17 @@ async function writeRowLocked(r, op, table, payload, user) {
     if (merged.start_date && merged.end_date && String(merged.end_date) < String(merged.start_date)) {
       throw new Error('A lease cannot end before it starts.');
     }
-    if (data.rent_day !== undefined && data.rent_day !== '' && data.rent_day !== null && validRentDay(data.rent_day) === null) {
-      throw new Error('Rent day must be between the 1st and the 28th, or the last day of the month.');
+    // Every lease bills on its rent day (rent.js), so a new lease needs one and
+    // a save that sends it cannot clear it. A lease from before rent days were
+    // required keeps working — status updates and the like — until it is set.
+    if (op === 'create' || data.rent_day !== undefined) {
+      const given = merged.rent_day;
+      if (given === '' || given === null || given === undefined) {
+        throw new Error('Rent day is required — the day of the month the rent is due.');
+      }
+      if (validRentDay(given) === null) {
+        throw new Error('Rent day must be between the 1st and the 28th, or the last day of the month.');
+      }
     }
     data.status = deriveLeaseStatus(r, merged.start_date, merged.end_date, merged.status);
     merged.status = data.status;
@@ -1096,7 +1130,9 @@ async function renewLease(r, payload, user) {
     start_date: start, end_date: end, rent_amount: rent,
     deposit_amount: carry ? held : num(payload.deposit_amount),
     deposit_status: carry && held > 0 ? 'Held' : 'Pending',
-    frequency: payload.frequency || old.frequency, rent_day: old.rent_day, late_fee: old.late_fee, grace_days: old.grace_days,
+    frequency: payload.frequency || old.frequency,
+    rent_day: payload.rent_day !== undefined && payload.rent_day !== '' ? payload.rent_day : old.rent_day,
+    late_fee: old.late_fee, grace_days: old.grace_days,
     escalation_pct: payload.escalation_pct !== undefined && payload.escalation_pct !== ''
       ? payload.escalation_pct : old.escalation_pct,
     gst_rate: old.gst_rate, renewed_from: old.id,
@@ -1296,12 +1332,7 @@ async function setPrimaryTenant(r, payload, user) {
 
 /** The monthly rent in force on a date, with annual escalation compounded from the lease start. */
 export function currentMonthlyRent(r, lease, onDate) {
-  const base = num(lease.rent_amount);
-  const pct = num(lease.escalation_pct);
-  const start = parseDate(lease.start_date), at = parseDate(onDate || today(r));
-  if (!pct || !start || !at || at < start) return round2(base);
-  const months = monthsBetween(start, at) - (at.getDate() < start.getDate() ? 1 : 0);
-  return round2(base * Math.pow(1 + pct / 100, Math.floor(Math.max(0, months) / 12)));
+  return rentOn(lease, onDate || today(r));
 }
 
 export function addDays(d, n) { const out = new Date(d.getTime()); out.setDate(out.getDate() + n); return out; }
@@ -2077,44 +2108,22 @@ function scrubUser(u) {
 
 // ───────────────────────────────────────────────────── billing operations ──
 
-/** A lease bills on a fixed day of the month when it is monthly and has one. */
-export function usesRentDay(lease) {
-  return (lease.frequency || 'Monthly') === 'Monthly' && validRentDay(lease.rent_day) !== null;
-}
-
-/** 1–28, or 31 for "the last day of the month"; anything else is no rent day. */
-export function validRentDay(v) {
-  if (v === '' || v === null || v === undefined) return null;
-  const n = Number(v);
-  return Number.isInteger(n) && ((n >= 1 && n <= 28) || n === 31) ? n : null;
-}
-
-/** The first day a late fee may be added to an invoice due on `due`. */
-export function lateFeeFrom(lease, due) {
-  const d = parseDate(due);
-  if (!d) return '';
-  return fmtDate(addDays(d, (parseInt(lease.grace_days || 0, 10) || 0) + 1));
-}
-
 /**
- * Create or update an invoice together with its line items. The header's
- * `amount` is always the sum of its lines; sending the full item list replaces
- * what was there.
+ * Price invoice lines: quantity × unit amount, and GST per line at its own
+ * rate. Every invoice — typed in the editor or raised by Generate rent — is
+ * priced here, so the same lines always come to the same total.
  */
-async function saveInvoice(r, payload, user) {
-  requireRole(user, 'manager');
-  const data = { ...(payload.data || {}) };
-  const items = payload.items || [];
-  if (!items.length) throw new Error('An invoice needs at least one line item');
-
-  // price each line, then let the lines define the invoice total
+function priceLines(items) {
   let subtotal = 0, lineTax = 0, hasRates = false;
   const priced = items.map(raw => {
-    const qty = raw.quantity === '' || raw.quantity === undefined ? 1 : (parseFloat(raw.quantity) || 0);
-    const unit = parseFloat(raw.unit_amount || 0) || 0;
+    const figure = (v) => Number(String(v).replace(/,/g, '').trim());
+    const qty = raw.quantity === '' || raw.quantity === undefined || raw.quantity === null ? 1 : figure(raw.quantity);
+    const unit = raw.unit_amount === '' || raw.unit_amount === undefined || raw.unit_amount === null ? 0 : figure(raw.unit_amount);
+    if (!Number.isFinite(qty)) throw new Error('Quantity "' + raw.quantity + '" is not a number.');
+    if (!Number.isFinite(unit)) throw new Error('Amount "' + raw.unit_amount + '" is not a number.');
     const amount = round2(qty * unit);
-    const rate = num(raw.tax_rate);
-    if (rate < 0 || rate > 100) throw new Error('GST rate must be between 0 and 100%.');
+    const rate = raw.tax_rate === '' || raw.tax_rate === undefined || raw.tax_rate === null ? 0 : figure(raw.tax_rate);
+    if (!Number.isFinite(rate) || rate < 0 || rate > 100) throw new Error('GST rate must be between 0 and 100%.');
     const taxAmount = round2(amount * rate / 100);
     if (rate > 0) hasRates = true;
     subtotal += amount;
@@ -2128,13 +2137,27 @@ async function saveInvoice(r, payload, user) {
       amount,
       tax_rate: rate || 0,
       tax_amount: taxAmount,
-      notes: raw.notes || ''
+      notes: raw.notes
     };
   });
-
   for (const it of priced) {
     if (!it.description) throw new Error('Every line item needs a description');
   }
+  return { priced, subtotal: round2(subtotal), lineTax: round2(lineTax), hasRates };
+}
+
+/**
+ * Create or update an invoice together with its line items. The header's
+ * `amount` is always the sum of its lines; sending the full item list replaces
+ * what was there.
+ */
+async function saveInvoice(r, payload, user) {
+  requireRole(user, 'manager');
+  const data = { ...(payload.data || {}) };
+  const items = payload.items || [];
+  if (!items.length) throw new Error('An invoice needs at least one line item');
+
+  const { priced, subtotal, lineTax, hasRates } = priceLines(items);
 
   // GST charged per line is the tax; an invoice with no rates keeps a flat tax
   // typed on the header, as invoices made before line rates existed do
@@ -2153,6 +2176,10 @@ async function saveInvoice(r, payload, user) {
   if (!prior) data.status = String(data.status) === 'Draft' ? 'Draft' : 'Unpaid';
   else if (String(prior.status) === 'Draft' && data.status && String(data.status) !== 'Draft') data.status = 'Unpaid';
   else delete data.status;
+  // a draft is dated the day it is issued, unless a date was chosen
+  if (prior && String(prior.status) === 'Draft' && data.status === 'Unpaid' && !data.issue_date && !prior.issue_date) {
+    data.issue_date = today(r);
+  }
 
   // a single-category invoice keeps that label; a mixed one says so — except
   // that Rent and Deposit are what billing keys on, so they keep their type
@@ -2173,7 +2200,10 @@ async function saveInvoice(r, payload, user) {
   for (const it of priced) {
     const row = { invoice_id: invoice.id, description: it.description, category: it.category,
                   quantity: it.quantity, unit_amount: it.unit_amount, amount: it.amount,
-                  tax_rate: it.tax_rate, tax_amount: it.tax_amount, notes: it.notes };
+                  tax_rate: it.tax_rate, tax_amount: it.tax_amount };
+    // the editor does not send a line's notes (a rent adjustment's reason is
+    // kept there), so a line that stays keeps them
+    if (it.notes !== undefined) row.notes = it.notes;
     if (it.id && existing.some(e => e.id === it.id)) {
       await updateRow(r, 'InvoiceItems', it.id, row, user, true);
       kept[it.id] = true;
@@ -2403,6 +2433,443 @@ async function gstSplit(r, invoice, gst) {
   return { cgst: half, sgst: round2(gst - half), igst: 0, place_of_supply: placeLabel };
 }
 
+// ─────────────────────────────────────────────────────────── generate rent ──
+//
+// The periods themselves are worked out in rent.js. This part reads what is
+// already billed, offers what is not (rentCandidates), and raises the invoices
+// the screen sends back (generateRent) — recomputing every rent figure here,
+// never taking an amount from the browser.
+
+/** Invoice types never charged a late fee: money held for the tenant, not owed. */
+const NO_LATE_FEE = ['Deposit', 'Deposit Deduction'];
+
+/** Charges typed in on Generate rent may be anything but these, which have their own paths. */
+const NOT_AN_EXTRA = ['Rent', 'Late Fee', 'Deposit'];
+
+/**
+ * Everything Generate rent reads, once per request: the days rent already
+ * covers on each lease, rent invoices that name no period, the late fees
+ * charged or waived, and the last electricity rate used on each lease.
+ */
+async function rentBook(r) {
+  const invoices = await readTable(r, 'Invoices');
+  const items = await readTable(r, 'InvoiceItems');
+  const offline = await readTable(r, 'RentOffline');
+  const byId = {};
+  invoices.forEach(i => { byId[i.id] = i; });
+
+  const rentLine = {}, feeFor = {}, feeOnItself = {}, eb = {};
+  for (const it of items) {
+    const cat = String(it.category);
+    if (cat === 'Rent') rentLine[it.invoice_id] = true;
+    if (it.late_fee_for) feeFor[it.late_fee_for] = it.invoice_id;
+    // a late fee added the old way, by the daily job, on the overdue invoice itself
+    else if (cat === 'Late Fee') feeOnItself[it.invoice_id] = true;
+    // a meter bill typed as units × rate gives the rate to suggest next time
+    if (cat === 'Electricity' && num(it.quantity) !== 1 && num(it.unit_amount) > 0) {
+      const inv = byId[it.invoice_id];
+      if (inv && inv.lease_id && String(inv.status) !== 'Void') {
+        const when = String(inv.issue_date || inv.due_date || '') + '|' + inv.id;
+        if (!eb[inv.lease_id] || when > eb[inv.lease_id].when) eb[inv.lease_id] = { when, rate: num(it.unit_amount) };
+      }
+    }
+  }
+
+  const billed = {}, unperioded = {}, lastBilled = {};
+  const push = (map, key, v) => { (map[key] || (map[key] = [])).push(v); };
+  for (const inv of invoices) {
+    if (!inv.lease_id || !(String(inv.type) === 'Rent' || rentLine[inv.id])) continue;
+    if (inv.period_start && inv.period_end) {
+      // void or draft, a period with a rent invoice is billed: voiding one does
+      // not put it back up for billing
+      push(billed, inv.lease_id, { start: inv.period_start, end: inv.period_end, invoice_id: inv.id });
+      const last = lastBilled[inv.lease_id];
+      if (!last || inv.period_end > last.end) lastBilled[inv.lease_id] = { end: inv.period_end, invoice_id: inv.id };
+    } else if (String(inv.status) !== 'Void') {
+      push(unperioded, inv.lease_id, {
+        id: inv.id, issue_date: inv.issue_date, due_date: inv.due_date, total: inv.total, status: inv.status
+      });
+    }
+  }
+  for (const o of offline) {
+    push(billed, o.lease_id, { start: o.period_start, end: o.period_end, offline_id: o.id });
+  }
+  return { invoices, byId, billed, unperioded, lastBilled, offline, feeFor, feeOnItself, eb };
+}
+
+/**
+ * The overdue invoices on a lease a late fee may now be charged for: open,
+ * past the grace days (counted from the later of the due and issue dates),
+ * not a deposit, and neither charged nor waived already.
+ */
+function lateFeeCandidates(lease, book, t) {
+  const fee = round2(num(lease.late_fee));
+  if (!(fee > 0)) return [];
+  return book.invoices
+    .filter(inv => inv.lease_id === lease.id && lateFeeState(lease, inv, book, t).eligible)
+    .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)))
+    .map(inv => ({
+      invoice_id: inv.id, type: inv.type, due_date: inv.due_date, issue_date: inv.issue_date,
+      period_start: inv.period_start, period_end: inv.period_end, balance: num(inv.balance),
+      fee, from: lateFeeFrom(lease, inv)
+    }));
+}
+
+/** Where one invoice stands for a late fee. */
+function lateFeeState(lease, inv, book, t) {
+  const fee = lease ? round2(num(lease.late_fee)) : 0;
+  const chargedOn = book.feeFor[inv.id] || (book.feeOnItself[inv.id] ? inv.id : '');
+  const from = lease && inv.due_date ? lateFeeFrom(lease, inv) : '';
+  const eligible = !!lease && fee > 0 && !chargedOn && !inv.late_fee_waived &&
+    OPEN_STATUSES.indexOf(String(inv.status)) >= 0 && num(inv.balance) > 0 &&
+    NO_LATE_FEE.indexOf(String(inv.type)) < 0 && !!from && from <= t;
+  return { eligible, fee, from, charged_on: chargedOn, waived: inv.late_fee_waived || '' };
+}
+
+/** A period as the screen gets it: the key it sends back is its start date. */
+function offered(p) {
+  return {
+    start: p.start, end: p.end, due: p.due, raise_from: p.raise_from, kind: p.kind,
+    amount: p.amount, first_stub: !!p.first_stub, final: !!p.final, joined: !!p.joined,
+    cycles: p.cycles.length,
+    lines: p.lines.map(l => ({ start: l.start, end: l.end, days: l.days, month_days: l.monthDays,
+                               rent: l.rent, amount: l.amount, text: rentLineText(l) }))
+  };
+}
+
+/**
+ * One lease as Generate rent sees it on day `t`.
+ *
+ *   state  ready            a period is due this month
+ *          backlog          only periods due before this month are unbilled
+ *          billed           nothing to bill until the next period's month
+ *          not_due          nothing billed yet and the first period is due later
+ *          missing_rent_day cannot be billed until a rent day is set
+ *          open_termination terminated with no end date on or before today,
+ *                           so where billing stops is not known
+ *          done             ended and billed to its last day — not listed
+ */
+function rentCandidate(lease, book, t) {
+  const base = {
+    lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id, property_id: lease.property_id,
+    lease_status: lease.status, frequency: lease.frequency || 'Monthly', rent_day: lease.rent_day,
+    rent_amount: num(lease.rent_amount), gst_rate: num(lease.gst_rate), late_fee: num(lease.late_fee),
+    grace_days: parseInt(lease.grace_days || 0, 10) || 0,
+    ended: String(lease.status) === 'Expired' || String(lease.status) === 'Terminated' ||
+           (!!lease.end_date && String(lease.end_date) < t),
+    periods: [], joined: null, next: null,
+    last_billed: book.lastBilled[lease.id] || null,
+    unperioded: book.unperioded[lease.id] || [],
+    offline: book.offline.filter(o => o.lease_id === lease.id)
+      .map(o => ({ id: o.id, start: o.period_start, end: o.period_end, reason: o.reason, by: o.created_by,
+                   at: o.created_at })),
+    late_fees: lateFeeCandidates(lease, book, t),
+    last_eb_rate: book.eb[lease.id] ? book.eb[lease.id].rate : null
+  };
+  if (validRentDay(lease.rent_day) === null) return { ...base, state: 'missing_rent_day' };
+  // An early termination is marked by the status alone; billing to the old end
+  // date would charge months nobody lived there, so wait for the real one.
+  if (String(lease.status) === 'Terminated' && (!lease.end_date || String(lease.end_date) > t)) {
+    return { ...base, state: 'open_termination' };
+  }
+
+  const all = rentPeriods(lease, { billed: book.billed[lease.id] || [], asOf: t });
+  const raisable = all.filter(p => p.kind !== 'future');
+  const future = all.find(p => p.kind === 'future') || null;
+  const joined = joinFirstStub(all);
+  const state = raisable.some(p => p.kind === 'current') ? 'ready'
+    : raisable.length ? 'backlog'
+    : future ? (base.last_billed ? 'billed' : 'not_due')
+    : 'done';
+  return {
+    ...base, state,
+    periods: raisable.map(offered),
+    joined: joined ? offered(joined) : null,
+    next: future ? offered(future) : null
+  };
+}
+
+/** Leases in the order they are listed and numbered: property, then unit. */
+async function leaseOrder(r) {
+  const props = {}, units = {};
+  (await readTable(r, 'Properties')).forEach(p => { props[p.id] = String(p.name || p.id); });
+  (await readTable(r, 'Units')).forEach(u => { units[u.id] = String(u.unit_number || u.id); });
+  const opts = { numeric: true, sensitivity: 'base' };
+  return (a, b) => (props[a.property_id] || '').localeCompare(props[b.property_id] || '', 'en', opts) ||
+                   (units[a.unit_id] || '').localeCompare(units[b.unit_id] || '', 'en', opts) ||
+                   String(a.id || a.lease_id).localeCompare(String(b.id || b.lease_id));
+}
+
+/** Step 1 of Generate rent: every lease with what it can be billed today. */
+async function rentCandidates(r, payload, user) {
+  requireRole(user, 'manager');
+  const t = today(r);
+  const book = await rentBook(r);
+  const order = await leaseOrder(r);
+  const leases = (await readTable(r, 'Leases')).sort(order);
+  const list = leases.map(l => rentCandidate(l, book, t)).filter(c => c.state !== 'done');
+  return { as_of: t, leases: list };
+}
+
+/** Which invoice or record already covers `start` on a lease, for a skip message. */
+function coveredBy(book, leaseId, start) {
+  const hit = (book.billed[leaseId] || []).find(b => b.start <= start && b.end >= start);
+  if (!hit) return '';
+  return hit.invoice_id ? 'already billed on ' + hit.invoice_id : 'marked as billed outside the app';
+}
+
+/**
+ * Raise the rent invoices chosen on the Generate rent screen, as drafts or
+ * issued, in one transaction. Each entry names a lease and the start of a
+ * period the screen was offered; the rent is recomputed here and checked
+ * against what the screen showed, so a lease edited in the meantime is
+ * skipped and named rather than billed at a figure nobody saw.
+ *
+ * @param payload.mode      'issue' or 'draft'
+ * @param payload.invoices  [{ lease_id, period_start, period_end, rent, join_first,
+ *                            extras: [{description, category, quantity, unit_amount, tax_rate}],
+ *                            adjust: { amount, reason }, late_fees: [invoice_id], notes }]
+ */
+async function generateRent(r, payload, user) {
+  requireRole(user, 'manager');
+  const mode = payload.mode === 'draft' ? 'draft' : payload.mode === 'issue' ? 'issue' : '';
+  if (!mode) throw new Error('Choose whether to issue the invoices or save them as drafts.');
+  const entries = Array.isArray(payload.invoices) ? payload.invoices : [];
+  if (!entries.length) throw new Error('Choose at least one lease to bill.');
+
+  const t = today(r);
+  const book = await rentBook(r);
+  const leases = {};
+  (await readTable(r, 'Leases')).forEach(l => { leases[l.id] = l; });
+  const tenants = {};
+  (await readTable(r, 'Tenants')).forEach(tn => { tenants[tn.id] = tn; });
+  const candidates = {};
+  const candidateOf = (lease) => candidates[lease.id] || (candidates[lease.id] = rentCandidate(lease, book, t));
+  const who = (lease) => (tenants[lease.tenant_id] ? tenants[lease.tenant_id].full_name + ' (' + lease.id + ')' : lease.id);
+
+  const plan = [], skipped = [], feesDropped = [];
+  const claimed = {}, feesClaimed = {};
+  for (const entry of entries) {
+    const lease = leases[entry.lease_id];
+    if (!lease) { skipped.push({ lease_id: entry.lease_id, reason: 'The lease no longer exists.' }); continue; }
+    const c = candidateOf(lease);
+    if (c.state === 'missing_rent_day') { skipped.push({ lease_id: lease.id, reason: 'The lease has no rent day.' }); continue; }
+    if (c.state === 'open_termination') {
+      skipped.push({ lease_id: lease.id, reason: 'The lease was terminated without an end date.' }); continue;
+    }
+
+    const start = String(entry.period_start || '');
+    const period = entry.join_first
+      ? (c.joined && c.joined.start === start && c.joined.kind !== 'future' ? c.joined : null)
+      : c.periods.find(p => p.start === start) || null;
+    if (!period) {
+      const why = coveredBy(book, lease.id, start);
+      skipped.push({ lease_id: lease.id, period_start: start,
+                     reason: why ? 'This period is ' + why + '.' : 'This period is no longer due to be billed.' });
+      continue;
+    }
+    // the screen and the server must be looking at the same invoice
+    if (String(entry.period_end || '') !== period.end || round2(num(entry.rent)) !== period.amount) {
+      skipped.push({ lease_id: lease.id, period_start: start,
+                     reason: 'The lease changed after you opened Generate rent (now ' + period.start + ' to ' +
+                             period.end + ', rent ' + period.amount + '). Open it again to review.' });
+      continue;
+    }
+    // a first part month is billed on its own or with the next invoice only when asked
+    if (period.first_stub && entry.join_first !== false) {
+      throw new Error(who(lease) + ': choose whether to bill the first part month on its own or with the next invoice.');
+    }
+    const mine = claimed[lease.id] || (claimed[lease.id] = []);
+    if (mine.some(x => !(period.end < x.start || period.start > x.end))) {
+      skipped.push({ lease_id: lease.id, period_start: start, reason: 'These days are already in another invoice on this screen.' });
+      continue;
+    }
+    mine.push({ start: period.start, end: period.end });
+
+    const rate = num(lease.gst_rate);
+    const lines = period.lines.map(l => ({
+      description: l.text, category: 'Rent', quantity: 1, unit_amount: l.amount, tax_rate: rate
+    }));
+
+    // a changed rent is its own line, so the calculated rent stays on record
+    if (entry.adjust && entry.adjust.amount !== undefined && entry.adjust.amount !== '') {
+      const to = round2(num(String(entry.adjust.amount).replace(/,/g, '')));
+      const reason = String(entry.adjust.reason || '').trim();
+      if (!(to >= 0)) throw new Error(who(lease) + ': the adjusted rent cannot be negative.');
+      if (!reason) throw new Error(who(lease) + ': give a reason for changing the rent.');
+      const diff = round2(to - period.amount);
+      if (diff !== 0) {
+        lines.push({ description: 'Rent adjustment', category: 'Rent', quantity: 1, unit_amount: diff, tax_rate: rate,
+                     notes: 'Rent adjusted from ' + period.amount + ' to ' + to + ': ' + reason.slice(0, 300),
+                     _adjust: { from: period.amount, to, reason } });
+      }
+    }
+
+    for (const id of [].concat(entry.late_fees || [])) {
+      const fee = c.late_fees.find(f => f.invoice_id === id);
+      if (!fee || feesClaimed[id]) { feesDropped.push({ lease_id: lease.id, invoice_id: id }); continue; }
+      feesClaimed[id] = true;
+      lines.push({ description: 'Late fee · ' + id + ' overdue since ' + fee.due_date, category: 'Late Fee',
+                   quantity: 1, unit_amount: fee.fee, tax_rate: rate, late_fee_for: id });
+    }
+
+    for (const x of [].concat(entry.extras || [])) {
+      const category = String(x.category || 'Other');
+      if (NOT_AN_EXTRA.indexOf(category) >= 0) {
+        throw new Error(who(lease) + ': a ' + category + ' charge cannot be added as an extra line.');
+      }
+      lines.push({ description: x.description, category, quantity: x.quantity, unit_amount: x.unit_amount,
+                   tax_rate: x.tax_rate });
+    }
+
+    let priced;
+    try { priced = priceLines(lines); }
+    catch (err) { throw new Error(who(lease) + ': ' + err.message); }
+    if (priced.subtotal < 0) throw new Error(who(lease) + ': the invoice cannot come to less than zero.');
+    priced.priced.forEach((p, i) => { p.late_fee_for = lines[i].late_fee_for || ''; p._adjust = lines[i]._adjust; });
+    plan.push({ lease, period, priced, notes: String(entry.notes || '').trim() });
+  }
+
+  const order = await leaseOrder(r);
+  plan.sort((a, b) => order(a.lease, b.lease) || a.period.start.localeCompare(b.period.start));
+
+  const headers = plan.map(({ lease, period, priced, notes }) => {
+    const tax = priced.hasRates ? priced.lineTax : 0;
+    const total = round2(priced.subtotal + tax);
+    return {
+      lease_id: lease.id, tenant_id: lease.tenant_id, unit_id: lease.unit_id, property_id: lease.property_id,
+      type: 'Rent', period_start: period.start, period_end: period.end,
+      issue_date: mode === 'issue' ? t : '', due_date: period.due,
+      amount: priced.subtotal, tax, total, amount_paid: 0, balance: total,
+      status: mode === 'issue' ? 'Unpaid' : 'Draft', notes
+    };
+  });
+  const created = await appendRows(r, 'Invoices', headers, user);
+  await appendRows(r, 'InvoiceItems', created.flatMap((inv, n) => plan[n].priced.priced.map(p => ({
+    invoice_id: inv.id, description: p.description, category: p.category, quantity: p.quantity,
+    unit_amount: p.unit_amount, amount: p.amount, tax_rate: p.tax_rate, tax_amount: p.tax_amount,
+    notes: p.notes || '', late_fee_for: p.late_fee_for
+  }))), user);
+
+  const saved = [];
+  for (let n = 0; n < created.length; n++) {
+    const inv = (await applyInvoiceTotals(r, created[n].id, user)) || created[n];
+    saved.push(inv);
+    for (const p of plan[n].priced.priced) {
+      if (p._adjust) {
+        await log(r, user, 'rent-adjusted', 'Invoices', inv.id,
+                  p._adjust.from + ' → ' + p._adjust.to + ' · ' + p._adjust.reason.slice(0, 150));
+      }
+      if (p.late_fee_for) await log(r, user, 'late-fee', 'Invoices', p.late_fee_for, p.amount + ' charged on ' + inv.id);
+    }
+  }
+  const total = round2(saved.reduce((s, i) => s + num(i.total), 0));
+  await log(r, user, 'generate-rent', 'Invoices', '',
+            saved.length + ' ' + (mode === 'issue' ? 'issued' : 'saved as drafts') + ', total ' + total +
+            (skipped.length ? ', ' + skipped.length + ' skipped' : ''));
+  return { mode, created: saved, total, skipped, fees_dropped: feesDropped };
+}
+
+/**
+ * Mark periods of a lease as billed outside the app — rent settled before the
+ * lease was entered here, say — so Generate rent stops offering them. Only
+ * periods it offers now can be marked, and a reason is kept with each.
+ */
+async function markRentOffline(r, payload, user) {
+  requireRole(user, 'manager');
+  const lease = await findRow(r, 'Leases', payload.lease_id);
+  if (!lease) throw new Error('Lease ' + payload.lease_id + ' not found');
+  const reason = String(payload.reason || '').trim();
+  if (!reason) throw new Error('Give a reason — for example "collected before we used the app".');
+  const starts = [].concat(payload.period_starts || []).map(String);
+  if (!starts.length) throw new Error('Choose at least one period.');
+
+  const c = rentCandidate(lease, await rentBook(r), today(r));
+  const rows = starts.map(start => {
+    const p = c.periods.find(x => x.start === start);
+    if (!p) throw new Error('The period from ' + start + ' is not waiting to be billed on ' + lease.id + '.');
+    return { lease_id: lease.id, period_start: p.start, period_end: p.end, reason: reason.slice(0, 500),
+             created_by: user.name || user.phone || '' };
+  });
+  const saved = await appendRows(r, 'RentOffline', rows, user);
+  await log(r, user, 'rent-billed-outside', 'Leases', lease.id,
+            saved.map(s => s.period_start + '..' + s.period_end).join(', ') + ' · ' + reason.slice(0, 120));
+  return { marked: saved };
+}
+
+/** Undo "billed outside the app": the period is offered again. */
+async function undoRentOffline(r, payload, user) {
+  requireRole(user, 'manager');
+  const row = await findRow(r, 'RentOffline', payload.id);
+  if (!row) throw new Error('That record no longer exists.');
+  await removeRow(r, 'RentOffline', row.id);
+  await log(r, user, 'rent-billed-outside-undone', 'Leases', row.lease_id, row.period_start + '..' + row.period_end);
+  return { removed: row.id };
+}
+
+/** Charge the late fee on an overdue invoice itself — for a tenant with no new invoice to carry it. */
+async function chargeLateFee(r, payload, user) {
+  requireRole(user, 'manager');
+  const inv = await findRow(r, 'Invoices', payload.invoice_id);
+  if (!inv) throw new Error('Invoice ' + payload.invoice_id + ' not found');
+  const lease = inv.lease_id ? await findRow(r, 'Leases', inv.lease_id) : null;
+  const state = lateFeeState(lease, inv, await rentBook(r), today(r));
+  if (!state.eligible) throw new Error(lateFeeRefusal(inv, lease, state, today(r)));
+  const rate = num(lease.gst_rate);
+  await createRow(r, 'InvoiceItems', {
+    invoice_id: inv.id, description: 'Late fee · overdue since ' + inv.due_date, category: 'Late Fee',
+    quantity: 1, unit_amount: state.fee, amount: state.fee, tax_rate: rate,
+    tax_amount: round2(state.fee * rate / 100), notes: '', late_fee_for: inv.id
+  }, user, true);
+  const saved = await applyInvoiceTotals(r, inv.id, user);
+  await log(r, user, 'late-fee', 'Invoices', inv.id, state.fee + ' charged on the invoice itself');
+  return { invoice: saved };
+}
+
+/** Waive an invoice's late fee for good, with the reason. It is not offered again. */
+async function waiveLateFee(r, payload, user) {
+  requireRole(user, 'manager');
+  const inv = await findRow(r, 'Invoices', payload.invoice_id);
+  if (!inv) throw new Error('Invoice ' + payload.invoice_id + ' not found');
+  const reason = String(payload.reason || '').trim();
+  if (!reason) throw new Error('Give a reason for waiving the late fee.');
+  const state = lateFeeState(inv.lease_id ? await findRow(r, 'Leases', inv.lease_id) : null, inv, await rentBook(r), today(r));
+  if (state.charged_on) throw new Error('The late fee for ' + inv.id + ' is already charged on ' + state.charged_on + '.');
+  if (state.waived) throw new Error('The late fee for ' + inv.id + ' is already waived.');
+  const saved = await updateRow(r, 'Invoices', inv.id, { late_fee_waived: reason.slice(0, 500) }, user, true);
+  await log(r, user, 'late-fee-waived', 'Invoices', inv.id, reason.slice(0, 180));
+  return { invoice: saved };
+}
+
+function lateFeeRefusal(inv, lease, state, t) {
+  if (!lease) return inv.id + ' is not on a lease, so there is no late fee to charge.';
+  if (!(state.fee > 0)) return 'Lease ' + lease.id + ' has no late fee set.';
+  if (state.charged_on) return 'The late fee for ' + inv.id + ' is already charged on ' + state.charged_on + '.';
+  if (state.waived) return 'The late fee for ' + inv.id + ' was waived: ' + state.waived;
+  if (NO_LATE_FEE.indexOf(String(inv.type)) >= 0) return 'A deposit is never charged a late fee.';
+  if (OPEN_STATUSES.indexOf(String(inv.status)) < 0 || !(num(inv.balance) > 0)) return inv.id + ' has nothing owing.';
+  if (state.from && state.from > t) return 'The grace days for ' + inv.id + ' run until the day before ' + state.from + '.';
+  return 'No late fee can be charged on ' + inv.id + '.';
+}
+
+/** Issue drafts: every draft, or the ones named. Each is dated today unless it has a date. */
+async function issueDrafts(r, payload, user) {
+  requireRole(user, 'manager');
+  const only = Array.isArray(payload.ids) && payload.ids.length ? new Set(payload.ids.map(String)) : null;
+  const drafts = (await readTable(r, 'Invoices'))
+    .filter(i => String(i.status) === 'Draft' && (!only || only.has(i.id)));
+  if (!drafts.length) throw new Error('There are no drafts to issue.');
+  const t = today(r);
+  const issued = [];
+  for (const d of drafts) {
+    await updateRow(r, 'Invoices', d.id, { status: 'Unpaid', issue_date: d.issue_date || t }, user, true);
+    issued.push((await applyInvoiceTotals(r, d.id, user)) || d);
+  }
+  const total = round2(issued.reduce((s, i) => s + num(i.total), 0));
+  await log(r, user, 'issue-drafts', 'Invoices', '', issued.length + ' issued, total ' + total);
+  return { issued, total };
+}
+
 // ───────────────────────────────────────────────────────────── housekeeping ──
 
 /**
@@ -2482,53 +2949,13 @@ async function refreshStatusesLocked(r, user, quiet) {
     }
   }
 
-  changes += await applyLateFees(r, sys);
+  // Late fees are no longer added here: they are chosen, invoice by invoice,
+  // when rent is generated or from the overdue invoice's page (see
+  // lateFeeCandidates).
   await pruneActivityLog(r);
 
   if (!quiet) await log(r, user || sys, 'refresh-statuses', 'System', '', changes + ' rows updated');
   return { changes };
-}
-
-/**
- * Charge the lease's late fee on an invoice that has gone overdue — once per
- * invoice, as an ordinary line item, and never on a security deposit.
- */
-async function applyLateFees(r, actor) {
-  const leases = {};
-  (await readTable(r, 'Leases')).forEach(l => { leases[l.id] = l; });
-
-  const charged = {};
-  (await readTable(r, 'InvoiceItems')).forEach(it => {
-    if (String(it.category) === 'Late Fee') charged[it.invoice_id] = true;
-  });
-
-  const t = today(r);
-  let applied = 0;
-  for (const inv of await readTable(r, 'Invoices')) {
-    if (String(inv.status) !== 'Overdue') continue;
-    if (charged[inv.id]) continue;
-    if (String(inv.type) === 'Deposit') continue;
-    const lease = leases[inv.lease_id];
-    if (!lease) continue;
-    const fee = round2(parseFloat(lease.late_fee || 0) || 0);
-    if (fee <= 0) continue;
-    // On a rent-day lease the invoice is due on the rent day itself and the
-    // grace days run after it: due the 10th with 5 days' grace, the fee is
-    // added from the 16th.
-    if (usesRentDay(lease) && lateFeeFrom(lease, inv.due_date) > t) continue;
-
-    // a late fee on rent is taxed like the rent it is charged on
-    const rate = num(lease.gst_rate);
-    await createRow(r, 'InvoiceItems', {
-      invoice_id: inv.id, description: 'Late fee · payment overdue since ' + inv.due_date,
-      category: 'Late Fee', quantity: 1, unit_amount: fee, amount: fee,
-      tax_rate: rate || 0, tax_amount: round2(fee * rate / 100), notes: ''
-    }, actor, true);
-    await applyInvoiceTotals(r, inv.id, actor);
-    await log(r, actor, 'late-fee', 'Invoices', inv.id, String(fee));
-    applied++;
-  }
-  return applied;
 }
 
 /** Keep the audit trail to a workable size, trimming in batches. */

@@ -4,7 +4,12 @@ import { navigate } from '../router.js';
 import { barChart, donut, rankedBars } from '../components/charts.js';
 import { openRenewLease } from './leases.js';
 import { refreshView } from '../router.js';
-import { ref } from '../components/detail.js';
+import { ref, awaiting } from '../components/detail.js';
+import { api } from '../api.js';
+import { openGenerateRent } from './rentrun.js';
+
+/** An API deployed before Generate rent: leave its panel out rather than show an error. */
+const outdatedApi = (err) => (/Unknown action/.test(err.message) ? null : Promise.reject(err));
 
 /** A month-over-month change chip, or null when there's nothing to compare. */
 function delta(current, previous) {
@@ -35,6 +40,37 @@ function panel(title, body, { action, count } = {}) {
     ]),
     el('div', { class: 'panel-body' }, [body])
   ]);
+}
+
+/**
+ * What rent is waiting to be billed this month, from Generate rent's own
+ * rules — so a month nobody billed does not go unnoticed. Managers only.
+ */
+function rentToBill() {
+  if (!store.can('manager')) return null;
+  return awaiting(() => api('rentCandidates', {}).catch(outdatedApi), (res) => {
+    if (!res) return el('span');
+    const ready = res.leases.filter(c => c.state === 'ready');
+    const backlog = res.leases.filter(c => c.periods.some(p => p.kind === 'backlog'));
+    const noDay = res.leases.filter(c => c.state === 'missing_rent_day' || c.state === 'open_termination');
+    const due = ready.reduce((s, c) => s + c.periods.filter(p => p.kind === 'current').reduce((t, p) => t + p.amount, 0), 0);
+    const fees = res.leases.reduce((n, c) => n + c.late_fees.length, 0);
+    const items = [
+      ready.length ? `${ready.length} lease${ready.length === 1 ? '' : 's'} to bill this month · ${money(due)} rent` : null,
+      backlog.length ? `${backlog.length} lease${backlog.length === 1 ? ' has' : 's have'} older months never billed` : null,
+      noDay.length ? `${noDay.length} lease${noDay.length === 1 ? ' needs' : 's need'} a rent day or end date before billing` : null,
+      fees ? `${fees} late fee${fees === 1 ? '' : 's'} to decide on overdue invoices` : null
+    ].filter(Boolean);
+    const body = items.length
+      ? el('div', { class: 'alert-list' }, items.map(text => el('div', { class: 'alert-item' }, [
+          el('span', { class: 'alert-dot' }), el('span', { text })])))
+      : el('p', { class: 'muted', text: 'All rent due this month is billed.' });
+    return panel('Rent to bill', body, {
+      count: ready.length || undefined,
+      action: el('button', { class: 'btn ' + (items.length ? 'btn-primary' : 'btn-ghost') + ' btn-sm', type: 'button',
+                             onClick: () => openGenerateRent() }, [icon('bolt', 14), ' Generate rent'])
+    });
+  }, { inline: true });
 }
 
 export function dashboardView() {
@@ -91,6 +127,9 @@ export function dashboardView() {
     kpi({ label: 'Deposits held', value: money(s.deposits_held, { compact: true }),
           sub: 'refundable', to: 'leases' })
   ]));
+
+  const rent = rentToBill();
+  if (rent) wrap.append(rent);
 
   const quickActions = [
     { label: 'Add tenant', path: 'tenants', icon: 'users' },

@@ -29,7 +29,7 @@ async function household({ lease = {}, occupants } = {}) {
   const ravi = await person('Ravi Kumar', '9880033333');
   const payload = { table: 'Leases', data: {
     property_id: prop.id, unit_id: unit.id, tenant_id: anita.id,
-    start_date: '2026-01-01', end_date: '2026-12-31', rent_amount: 20000, deposit_amount: 0, ...lease } };
+    start_date: '2026-01-01', end_date: '2026-12-31', rent_amount: 20000, deposit_amount: 0, rent_day: 1, ...lease } };
   if (occupants) payload.occupants = occupants({ anita, priya, ravi });
   const res = await c('create', payload);
   return { box, admin, c, must, prop, unit, anita, priya, ravi, leaseRes: res, lease: res.ok ? res.data.row : null };

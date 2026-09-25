@@ -123,6 +123,8 @@ const PRESETS = {
     overdue:     (tx) => tx`t.status in ${tx(OPEN)} and t.due_date < current_date`,
     week:        (tx) => tx`t.status in ${tx(OPEN)} and t.due_date >= current_date and t.due_date <= current_date + 7`,
     unpaid:      (tx) => tx`t.status in ${tx(OPEN)} and t.balance > 0`,
+    // written but not yet issued to the tenant
+    drafts:      (tx) => tx`t.status = 'Draft'`,
     // what a deposit can be applied to at move-out
     arrears:     (tx) => tx`t.status in ${tx(OPEN)} and t.balance > 0 and t.type is distinct from 'Deposit'`
   },
@@ -477,6 +479,8 @@ export async function billingFigures(r) {
       coalesce(sum(t.balance) filter (where t.status in ${tx(OPEN)} and t.due_date < current_date), 0) as overdue,
       count(*) filter (where t.status in ${tx(OPEN)} and t.due_date >= current_date and t.due_date <= current_date + 7)::int as week_n,
       coalesce(sum(t.balance) filter (where t.status in ${tx(OPEN)} and t.due_date >= current_date and t.due_date <= current_date + 7), 0) as week,
+      count(*) filter (where t.status = 'Draft')::int as drafts_n,
+      coalesce(sum(t.total) filter (where t.status = 'Draft'), 0) as drafts,
       count(*)::int as invoices
     from invoices t`;
   const [pay] = await tx`
@@ -489,6 +493,7 @@ export async function billingFigures(r) {
     outstanding: { count: inv.outstanding_n, sum: round2(inv.outstanding) },
     overdue: { count: inv.overdue_n, sum: round2(inv.overdue) },
     week: { count: inv.week_n, sum: round2(inv.week) },
+    drafts: { count: inv.drafts_n, sum: round2(inv.drafts) },
     month: { count: pay.month_n, sum: round2(pay.month) }
   };
 }

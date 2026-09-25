@@ -59,11 +59,15 @@ export const TABLES = {
     id: req, lease_id: text, tenant_id: text, unit_id: text, property_id: text, type: req,
     period_start: date, period_end: date, issue_date: date, due_date: date, amount: num0, tax: num0,
     total: num0, amount_paid: num0, balance: num0, status: oneOf('Unpaid'), notes: text, ...STAMPS,
-    cgst: num, sgst: num, igst: num, place_of_supply: text, last_reminded: date } },
+    cgst: num, sgst: num, igst: num, place_of_supply: text, last_reminded: date, late_fee_waived: text } },
 
   InvoiceItems: { sql: 'invoice_items', prefix: 'ITM', cols: {
     id: req, invoice_id: text, description: req, category: oneOf('Other'), quantity: col('num0'),
-    unit_amount: num0, amount: num0, notes: text, ...STAMPS, tax_rate: num0, tax_amount: num0 } },
+    unit_amount: num0, amount: num0, notes: text, ...STAMPS, tax_rate: num0, tax_amount: num0,
+    late_fee_for: text } },
+
+  RentOffline: { sql: 'rent_offline', prefix: 'RNO', cols: {
+    id: req, lease_id: text, period_start: date, period_end: date, reason: req, created_by: text, ...STAMPS } },
 
   Payments: { sql: 'payments', prefix: 'PAY', cols: {
     id: req, invoice_id: text, lease_id: text, tenant_id: text, property_id: text, payment_date: date,

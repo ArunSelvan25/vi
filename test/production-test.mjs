@@ -79,7 +79,7 @@ async function portfolio(leaseOverrides) {
     property_id: prop.id, unit_number: 'A-101', rent_amount: 28000 } })).data.row;
   const tenant = (await c('create', { table: 'Tenants', data: {
     full_name: 'Anita Rao', phone: '9880011111' } })).data.row;
-  const lease = await c('create', { table: 'Leases', data: Object.assign({
+  const lease = await c('create', { table: 'Leases', data: Object.assign({ rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: tenant.id,
     start_date: '2026-01-01', end_date: '2026-12-31',
     rent_amount: 28000, deposit_amount: 150000, grace_days: 5,
@@ -162,7 +162,7 @@ console.log('\n— a unit cannot be let twice —');
 await probe('an overlapping lease on the same unit is refused', async () => {
   const { c, prop, unit } = await portfolio();
   const other = (await c('create', { table: 'Tenants', data: { full_name: 'K', phone: '9940033333' } })).data.row;
-  const clash = await c('create', { table: 'Leases', data: {
+  const clash = await c('create', { table: 'Leases', data: { rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: other.id,
     start_date: '2026-06-01', end_date: '2027-05-31', rent_amount: 30000 } });
   return clash.ok ? 'the unit was let to two tenants at once' : null;
@@ -172,7 +172,7 @@ await probe('a lease starting after the previous one ends is allowed', async () 
   const { c, prop, unit, lease } = await portfolio();
   await c('update', { table: 'Leases', id: lease.data.row.id, data: { status: 'Terminated' } });
   const other = (await c('create', { table: 'Tenants', data: { full_name: 'K', phone: '9940033333' } })).data.row;
-  const next = await c('create', { table: 'Leases', data: {
+  const next = await c('create', { table: 'Leases', data: { rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: other.id,
     start_date: '2027-01-01', end_date: '2027-12-31', rent_amount: 30000 } });
   return next.ok ? null : 'a non-overlapping lease was blocked: ' + next.error;
@@ -180,7 +180,7 @@ await probe('a lease starting after the previous one ends is allowed', async () 
 
 await probe('a lease ending before it starts is refused', async () => {
   const { c, prop, unit, tenant } = await portfolio();
-  const bad = await c('create', { table: 'Leases', data: {
+  const bad = await c('create', { table: 'Leases', data: { rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: tenant.id,
     start_date: '2026-12-31', end_date: '2026-01-01', rent_amount: 1 } });
   return bad.ok ? 'a backwards date range was accepted' : null;
@@ -301,7 +301,7 @@ await probe('a sold property drops out of the headline numbers', async () => {
   const prop = (await c('create', { table: 'Properties', data: { name: 'Sold', status: 'Sold' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
+  await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 10000, deposit_amount: 50000 } });
   const s = (await c('stats', {})).data;
@@ -320,7 +320,7 @@ await probe('an active property still counts normally', async () => {
   const prop = (await c('create', { table: 'Properties', data: { name: 'Live' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
+  await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 10000, deposit_amount: 50000 } });
   // the deposit is only "held" once its invoice is paid
@@ -387,7 +387,7 @@ await probe('a tenant becomes Past when their last lease ends', async () => {
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  const l = (await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id,
+  const l = (await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id,
     tenant_id: t.id, start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 1000 } })).data.row;
   if ((await box.readTable('Tenants'))[0].status !== 'Active') return 'a housed tenant is not Active';
@@ -414,11 +414,11 @@ await probe('signing a new lease makes a past tenant Active again', async () => 
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  const l = (await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id,
+  const l = (await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id,
     tenant_id: t.id, start_date: (Y - 2) + '-01-01', end_date: (Y - 1) + '-12-31',
     rent_amount: 1000 } })).data.row;
   if ((await box.readTable('Tenants'))[0].status !== 'Past') return 'an expired lease did not make them Past';
-  await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
+  await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31', rent_amount: 1200 } });
   return (await box.readTable('Tenants'))[0].status === 'Active'
     ? null : 'a re-signed tenant is still ' + (await box.readTable('Tenants'))[0].status;
@@ -435,32 +435,35 @@ await probe('invoice_prefix drives new invoice numbers', async () => {
   return /^BILL-/.test(inv.id) ? null : 'invoice numbered ' + inv.id;
 });
 
-await probe('a late fee on the lease is charged once when an invoice goes overdue', async () => {
+await probe('housekeeping never adds a late fee; charging one by hand adds it once', async () => {
   const { box, admin } = await bootedSandbox();
   const c = async (a, p) => (await box.handle(a, p, admin));
   const Y = Number(box.today().slice(0, 4));
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
+  await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 10000, grace_days: 0, late_fee: 500 } });
   await raiseRent(box, c);
-  await box.refreshStatuses();                                // the next housekeeping run applies the fees
+  await box.refreshStatuses();                                // housekeeping: statuses only
 
   const overdue = (await box.readTable('Invoices')).filter(i => i.status === 'Overdue');
   if (!overdue.length) return 'no overdue invoices to test with';
-  const fees = (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee');
-  if (fees.length !== overdue.length) return `${overdue.length} overdue but ${fees.length} fees`;
-  if (fees.some(f => Number(f.amount) !== 500)) return 'the fee amount is wrong';
+  if ((await box.readTable('InvoiceItems')).some(i => i.category === 'Late Fee')) return 'housekeeping added a late fee';
 
+  const first = await c('chargeLateFee', { invoice_id: overdue[0].id });
+  if (!first.ok) return 'charging failed: ' + first.error;
   const inv = (await box.readTable('Invoices')).find(i => i.id === overdue[0].id);
   if (Number(inv.total) !== 10500) return 'the fee did not reach the invoice total: ' + inv.total;
+  const fee = (await box.readTable('InvoiceItems')).find(i => i.category === 'Late Fee');
+  if (fee.late_fee_for !== inv.id) return 'the fee does not say which invoice it is for';
 
-  // running housekeeping again must not stack a second fee
+  const again = await c('chargeLateFee', { invoice_id: overdue[0].id });
+  if (again.ok) return 'the same late fee was charged twice';
   await box.refreshStatuses();
-  const again = (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee').length;
-  return again === fees.length ? null : `fees grew from ${fees.length} to ${again} on a second run`;
+  return (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee').length === 1
+    ? null : 'more than one fee after a second housekeeping run';
 });
 
 await probe('no late fee is charged when the lease has none', async () => {
@@ -470,12 +473,14 @@ await probe('no late fee is charged when the lease has none', async () => {
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
+  await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31', rent_amount: 10000, grace_days: 0 } });
   await raiseRent(box, c);
   await box.refreshStatuses();
-  return (await box.readTable('InvoiceItems')).filter(i => i.category === 'Late Fee').length
-    ? 'a fee was charged with no late_fee set' : null;
+  const overdue = (await box.readTable('Invoices')).find(i => i.status === 'Overdue');
+  const r = await c('chargeLateFee', { invoice_id: overdue.id });
+  if (r.ok) return 'a fee was charged with no late_fee set';
+  return /no late fee set/.test(r.error) ? null : 'refused for the wrong reason: ' + r.error;
 });
 
 console.log('\n— paying more than one invoice at once —');
@@ -520,7 +525,7 @@ async function leaseWithDeposit(amount) {
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'Anita', phone: '9111111111' } })).data.row;
-  const lease = (await c('create', { table: 'Leases', data: {
+  const lease = (await c('create', { table: 'Leases', data: { rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: t.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 28000, deposit_amount: amount } })).data.row;
@@ -653,7 +658,7 @@ await probe('marking a deposit refunded records the expense, once', async () => 
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const t = (await c('create', { table: 'Tenants', data: { full_name: 'Anita', phone: '9111111111' } })).data.row;
-  const l = (await c('create', { table: 'Leases', data: { property_id: prop.id, unit_id: unit.id,
+  const l = (await c('create', { table: 'Leases', data: { rent_day: 1, property_id: prop.id, unit_id: unit.id,
     tenant_id: t.id, start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 1000, deposit_amount: 50000, deposit_status: 'Held' } })).data.row;
 
@@ -1000,7 +1005,7 @@ async function billedLease(leaseExtra = {}) {
   const prop = (await c('create', { table: 'Properties', data: { name: 'P' } })).data.row;
   const unit = (await c('create', { table: 'Units', data: { property_id: prop.id, unit_number: 'A' } })).data.row;
   const tenant = (await c('create', { table: 'Tenants', data: { full_name: 'T', phone: '9111111111' } })).data.row;
-  const lease = (await c('create', { table: 'Leases', data: {
+  const lease = (await c('create', { table: 'Leases', data: { rent_day: 1,
     property_id: prop.id, unit_id: unit.id, tenant_id: tenant.id,
     start_date: (Y - 1) + '-01-01', end_date: (Y + 1) + '-12-31',
     rent_amount: 10000, frequency: 'Monthly', grace_days: 5, ...leaseExtra } })).data.row;
@@ -1042,16 +1047,21 @@ await probe('the late fee is not charged on a security deposit', async () => {
   await c('bootstrap', {});
   const dep = (await box.readTable('Invoices')).find(i => i.type === 'Deposit');
   if (dep.status !== 'Overdue') return 'test set-up: deposit is ' + dep.status;
-  return (await box.readTable('InvoiceItems')).some(i => i.invoice_id === dep.id && i.category === 'Late Fee')
-    ? 'a late fee was added to the deposit invoice' : null;
+  const r = await c('chargeLateFee', { invoice_id: dep.id });
+  if (r.ok) return 'a late fee was charged on the deposit invoice';
+  const offered = (await c('rentCandidates', {})).data.leases[0].late_fees.map(f => f.invoice_id);
+  return offered.includes(dep.id) ? 'the deposit is offered a late fee on Generate rent' : null;
 });
 
-await probe('the late fee is still charged on overdue rent', async () => {
+await probe('overdue rent past its grace is offered a late fee on Generate rent', async () => {
   const { box, c } = await billedLease({ late_fee: 500 });
   await raiseRent(box, c);
   await box.refreshStatuses();
-  return (await box.readTable('InvoiceItems')).some(i => i.category === 'Late Fee')
-    ? null : 'no late fee on any overdue rent invoice';
+  const overdue = (await box.readTable('Invoices')).filter(i => i.status === 'Overdue' && i.type !== 'Deposit');
+  const offered = (await c('rentCandidates', {})).data.leases[0].late_fees;
+  if (!overdue.length) return 'test set-up: nothing overdue';
+  return offered.length === overdue.length && offered.every(f => f.fee === 500)
+    ? null : `${overdue.length} overdue rent invoices, ${offered.length} late fees offered`;
 });
 
 console.log('\n— a payment entered on the Payments page —');
@@ -1319,7 +1329,7 @@ await probe('a request that fails part-way leaves nothing behind', async () => {
   const after = JSON.stringify([await box.readTable('Invoices'), await box.readTable('InvoiceItems')]);
   if (after !== before) return 'a half-saved invoice was left behind';
   // and one that fails in the database, after writes, rolls back too
-  const lease = await c('create', { table: 'Leases', data: { property_id: 'PRP-99999', unit_id: 'UNT-99999',
+  const lease = await c('create', { table: 'Leases', data: { rent_day: 1, property_id: 'PRP-99999', unit_id: 'UNT-99999',
     tenant_id: tenant.id, start_date: '2030-01-01', rent_amount: 1, deposit_amount: 500 } });
   if (lease.ok) return 'a lease on a unit that does not exist was accepted';
   return (await box.readTable('Invoices')).length === JSON.parse(before)[0].length ? null : 'a deposit invoice survived the failed lease';
@@ -1407,7 +1417,10 @@ await probe('each line carries its own rate, and a late fee is taxed like the re
   if (Number(inv.tax) !== 1800 || Number(inv.total) !== 12600) return `tax ${inv.tax}, total ${inv.total}`;
   await c('update', { table: 'Leases', id: (await box.readTable('Leases'))[0].id, data: { late_fee: 500 } });
   await raiseRent(box, c);
-  await box.refreshStatuses();                                 // housekeeping adds the fee
+  await box.refreshStatuses();
+  const overdue = (await box.readTable('Invoices')).find(i => i.status === 'Overdue' && i.lease_id);
+  const charged = await c('chargeLateFee', { invoice_id: overdue.id });
+  if (!charged.ok) return charged.error;
   const fee = (await box.readTable('InvoiceItems')).find(i => i.category === 'Late Fee');
   return fee && Number(fee.tax_amount) === 90 ? null : 'late fee tax ' + (fee && fee.tax_amount);
 });
@@ -1624,7 +1637,7 @@ await probe('a setting added by a new release reaches an existing deployment', a
 });
 
 console.log('\n— rent day —');
-await probe('on a rent-day lease the grace days run after the rent day, before the late fee', async () => {
+await probe('the grace days run after the rent day, before a late fee can be charged', async () => {
   const Y = Number((await bootedSandbox()).box.today().slice(0, 4)) - 1;
   const late = async (grace) => {
     const { box, c, lease, tenant } = await billedLease({ start_date: Y + '-01-11', rent_amount: 30000, rent_day: 10,
@@ -1634,8 +1647,8 @@ await probe('on a rent-day lease the grace days run after the rent day, before t
       items: [{ description: 'Rent', category: 'Rent', quantity: 1, unit_amount: 30000 }] })).data.invoice;
     await box.refreshStatuses();
     const row = await rowOf(box, 'Invoices', inv.id);
-    const fees = (await box.readTable('InvoiceItems')).filter(i => i.invoice_id === inv.id && i.category === 'Late Fee');
-    return { status: row.status, fees: fees.length };
+    const fees = (await c('chargeLateFee', { invoice_id: inv.id })).ok ? 1 : 0;
+    return { status: row.status, fees };
   };
   const within = await late(100000), past = await late(5);   // a grace too long to have run out yet, and 5 days
   const problems = [];

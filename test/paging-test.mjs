@@ -61,7 +61,7 @@ for (const [u, t, start, months, rent, deposit, rentDay] of leaseSpec) {
     property_id: u.property_id, unit_id: u.id, tenant_id: t.id,
     start_date: shift(start, 1), end_date: leases.length === 0 ? shift(-2, 28) : end,
     rent_amount: rent, deposit_amount: deposit, grace_days: 3, late_fee: 500,
-    rent_day: rentDay === null ? '' : rentDay
+    rent_day: rentDay === null ? 1 : rentDay
   });
   leases.push(lease);
 }

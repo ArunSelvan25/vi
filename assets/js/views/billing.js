@@ -6,6 +6,7 @@ import { dataTable } from '../components/table.js';
 import { tabs } from '../components/detail.js';
 import { openInvoiceForm, recordPaymentFor, showInvoice, voidInvoiceFor, invoiceMessage } from './invoices.js';
 import { canPay, country, paymentTable } from './records.js';
+import { generateRentButton } from './rentrun.js';
 
 /**
  * Billing: invoices and the payments received against them, on one screen.
@@ -27,6 +28,7 @@ const FILTERS = {
   outstanding: { tab: 'invoices', label: 'Outstanding' },
   overdue: { tab: 'invoices', label: 'Overdue' },
   week: { tab: 'invoices', label: 'Due in the next 7 days' },
+  drafts: { tab: 'invoices', label: 'Drafts — not yet issued' },
   month: { tab: 'payments', label: 'Collected this month' }
 };
 
@@ -103,10 +105,27 @@ function bulkActions() {
       }
     }, [icon('mail', 16), ' Send reminders']),
     el('button', {
-      class: 'btn btn-primary',
+      class: 'btn btn-ghost',
       onClick: () => openInvoiceForm(null, { onSaved: () => refreshView() })
-    }, [icon('plus', 16), ' New invoice'])
+    }, [icon('plus', 16), ' New invoice']),
+    generateRentButton()
   ];
+}
+
+/** Issue every draft at once, after saying how many and for how much. */
+async function issueAllDrafts(drafts) {
+  const ok = await confirmDialog({
+    title: `Issue ${drafts.count} draft${drafts.count === 1 ? '' : 's'}?`,
+    message: `${money(drafts.sum)} in all. Each is dated today unless it already has an issue date, ` +
+             'and becomes owed by the tenant. Drafts past their due date show as Overdue.',
+    confirmLabel: 'Issue all', danger: false
+  });
+  if (!ok) return;
+  try {
+    const res = await store.act('issueDrafts', {});
+    toast(`${res.issued.length} invoice${res.issued.length === 1 ? '' : 's'} issued · ${money(res.total)}`, 'ok');
+    refreshView();
+  } catch (err) { toast(err.message, 'danger'); }
 }
 
 export function billingView(ctx = {}) {
@@ -127,6 +146,7 @@ export function billingView(ctx = {}) {
   const overdue = figures.overdue || none;
   const week = figures.week || none;
   const collected = figures.month || none;
+  const drafts = figures.drafts || none;
 
   // a figure that is already the filter clears it; any other sets it
   const figure = (key, label, value, sub, tone) => {
@@ -149,7 +169,11 @@ export function billingView(ctx = {}) {
           'Showing: ', el('strong', { text: FILTERS[show].label }),
           el('button', { type: 'button', class: 'filter-chip-clear', 'aria-label': 'Clear filter', title: 'Show everything',
                          onClick: () => navigate(address(tab, '')) }, [icon('close', 13)])
-        ])
+        ]),
+        show === 'drafts' && drafts.count && store.can('manager')
+          ? el('button', { class: 'btn btn-primary btn-sm', type: 'button', onClick: () => issueAllDrafts(drafts) },
+               [icon('check', 14), ` Issue all ${drafts.count} · ${money(drafts.sum)}`])
+          : null
       ])
     : null;
 
@@ -213,7 +237,10 @@ export function billingView(ctx = {}) {
       figure('overdue', 'Overdue', money(overdue.sum), plural(overdue.count, 'invoice'),
              overdue.count ? 'danger' : null),
       figure('week', 'Due in 7 days', money(week.sum), plural(week.count, 'invoice')),
-      figure('month', 'Collected this month', money(collected.sum), plural(collected.count, 'payment'), 'ok')
+      figure('month', 'Collected this month', money(collected.sum), plural(collected.count, 'payment'), 'ok'),
+      drafts.count || show === 'drafts'
+        ? figure('drafts', 'Drafts', money(drafts.sum), plural(drafts.count, 'invoice') + ' not issued', drafts.count ? 'warn' : null)
+        : null
     ]),
     t.el
   ]);

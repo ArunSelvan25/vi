@@ -176,18 +176,19 @@ export const entities = {
         help: 'Pending until the deposit invoice is paid, then Held. Choose Held for a deposit collected '
             + 'outside the app. At move-out use "Settle deposit", which records deductions and the refund.' },
       { key: 'frequency', label: 'Billing frequency', type: 'select',
-        options: ['Monthly', 'Quarterly', 'Half-Yearly', 'Yearly'] },
-      { key: 'rent_day', label: 'Rent day', type: 'select', options: RENT_DAY_OPTIONS, numeric: true,
-        blank: 'None', showWhen: { frequency: ['Monthly', ''] },
-        help: 'The payment date each month. Grace days count from an invoice\'s due date before the late fee is added.' },
+        options: ['Monthly', 'Quarterly', 'Half-Yearly', 'Yearly'],
+        help: 'Quarterly, half-yearly and yearly leases are billed 3, 6 or 12 months at a time, due on the rent day of the last month.' },
+      { key: 'rent_day', label: 'Rent day', type: 'select', options: RENT_DAY_OPTIONS, numeric: true, required: true,
+        help: 'The day rent is due. Each invoice covers the days since the last rent day: with the 10th, 11 Sep – 10 Oct is due on 10 Oct.' },
       // billing_day is kept as a column so existing values survive, but stays
       // off the form: nothing reads it. An input that does nothing is worse than no input.
       { key: 'billing_day', label: 'Billing day of month', type: 'number', form: false },
       { key: 'late_fee', label: 'Late fee', type: 'money',
-        help: 'Added once as a line item when an invoice on this lease goes overdue. Leave blank for none.' },
+        help: 'Offered, never added automatically, once an invoice is past its grace days: you choose whether to charge it '
+            + 'when you next generate rent, or from the overdue invoice. Leave blank for none.' },
       { key: 'grace_days', label: 'Grace days', type: 'number',
-        help: 'With a rent day: days after an invoice\'s due date before the late fee is added. Without one, '
-            + 'the late fee is added as soon as an invoice goes overdue.' },
+        help: 'Days after the due date before a late fee can be charged. For an invoice raised after its due date, '
+            + 'they count from the day it was issued.' },
       { key: 'escalation_pct', label: 'Annual escalation %', type: 'number',
         help: 'Rent increases by this % on each lease anniversary' },
       { key: 'gst_rate', label: 'GST on rent %', type: 'number',

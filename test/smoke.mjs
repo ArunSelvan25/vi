@@ -687,25 +687,25 @@ await step('an invoice page says how much is paid and what is left', async () =>
 });
 
 console.log('\n— rent day —');
-await step('the lease form offers a rent day for monthly leases only', async () => {
+await step('the lease form requires a rent day, whatever the billing frequency', async () => {
   await go('leases', 'Leases');
   await page.evaluate(() => [...document.querySelectorAll('.head-actions .btn-primary')].pop().click());
   await page.waitForSelector('#f_rent_day', { timeout: 5000 });
   const visible = () => page.$eval('#f_rent_day', e => !e.closest('.field').hidden);
   if (!await visible()) throw new Error('hidden on a new lease');
+  const required = await page.$eval('#f_rent_day', e => !!e.closest('.field').querySelector('.req'));
+  if (!required) throw new Error('not marked required');
   const labels = await page.$$eval('#f_rent_day option', o => o.map(x => x.textContent));
   if (!labels.includes('10th') || !labels.includes('Last day of month') || labels.includes('30th')) {
     throw new Error('options: ' + labels.join(', '));
   }
   await page.select('#f_frequency', 'Quarterly');
-  if (await visible()) throw new Error('still shown for a quarterly lease');
-  await page.select('#f_frequency', 'Monthly');
-  if (!await visible()) throw new Error('not shown again for monthly');
+  if (!await visible()) throw new Error('hidden for a quarterly lease');
   await page.keyboard.press('Escape');
   await page.waitForFunction(() => !document.querySelector('.backdrop'), { timeout: 5000 });
 });
 
-await step('a lease with a rent day shows it, and rent is raised by hand — nothing generates it', async () => {
+await step('a lease shows its rent day and where its rent billing stands; Billing offers Generate rent', async () => {
   const set = (value) => page.evaluate(async (v) => {
     const res = await fetch('/api', { method: 'POST', body: JSON.stringify({
       action: 'update', token: localStorage.getItem('vipm.token'),
@@ -720,15 +720,54 @@ await step('a lease with a rent day shows it, and rent is raised by hand — not
     await page.evaluate(() => { location.hash = '#/leases/LSE-00001'; });
     await page.waitForFunction(() => /Rent day10th/.test(document.querySelector('.view')?.textContent || ''),
                                { timeout: 5000 });
-    if (await page.evaluate(() => /Next rent invoice/.test(document.querySelector('.view').textContent))) {
-      throw new Error('the lease still previews a generated invoice');
-    }
+    await page.waitForFunction(() => /Rent billing/.test(document.querySelector('.view')?.textContent || ''),
+                               { timeout: 5000 });
   } finally {
-    await set('');
+    await set(31);
   }
   await go('billing', 'Billing');
   const buttons = await page.$$eval('.view button', b => b.map(x => x.textContent.trim()));
-  if (buttons.some(t => /Generate/i.test(t))) throw new Error('Billing still offers: ' + buttons.join(', '));
+  if (!buttons.some(t => /Generate rent/.test(t))) throw new Error('Billing offers: ' + buttons.join(', '));
+});
+
+await step('Generate rent: this month ticked, EB units typed, saved as drafts, then issued from Billing', async () => {
+  await go('billing', 'Billing');
+  await page.evaluate(() => [...document.querySelectorAll('.head-actions .btn')].find(b => /Generate rent/.test(b.textContent)).click());
+  await page.waitForSelector('.rr-lease', { timeout: 8000 });
+  // this month's rent is ticked; the months never billed before are not
+  const ticked = await page.$$eval('.rr-lease.is-on .rr-period input:checked', i => i.length);
+  const backlogTicked = await page.$$eval('.rr-older input:checked', i => i.length);
+  if (ticked !== 1 || backlogTicked) throw new Error(`ticked ${ticked}, backlog ticked ${backlogTicked}`);
+  const next = () => page.evaluate(() => [...document.querySelectorAll('.rr-foot button')].find(b => /^Next/.test(b.textContent)).click());
+  await next();
+  await page.waitForSelector('.rr-eb-units', { timeout: 5000 });
+  await page.type('.rr-eb-units', '100');
+  await page.$eval('.rr-eb-rate', e => { e.value = ''; });
+  await page.type('.rr-eb-rate', '9');
+  const other = await page.$eval('.rr-grid-row .rr-cell:nth-of-type(5)', e => e.textContent);
+  if (!/900/.test(other)) throw new Error('EB not priced: ' + other);
+  await next();
+  await page.waitForSelector('.rr-review-table', { timeout: 5000 });
+  await page.evaluate(() => [...document.querySelectorAll('.rr-foot button')].find(b => /Save as drafts/.test(b.textContent)).click());
+  await page.waitForSelector('.rr-result-head', { timeout: 8000 });
+  const head = await page.$eval('.rr-result-head h3', e => e.textContent);
+  if (!/1 invoice saved as drafts/.test(head)) throw new Error('result: ' + head);
+  await page.evaluate(() => [...document.querySelectorAll('.rr-foot button')].find(b => /Done/.test(b.textContent)).click());
+  await page.waitForFunction(() => !document.querySelector('.rr-modal'), { timeout: 5000 });
+  await page.evaluate(() => { location.hash = '#/billing?show=drafts'; });
+  await page.waitForFunction(() => [...document.querySelectorAll('.filter-chip-row button')].some(b => /Issue all 1/.test(b.textContent)),
+                             { timeout: 5000 });
+  await page.evaluate(() => [...document.querySelectorAll('.filter-chip-row button')].find(b => /Issue all/.test(b.textContent)).click());
+  await page.waitForSelector('.modal-foot .btn-primary', { timeout: 3000 });
+  await page.evaluate(() => [...document.querySelectorAll('.modal-foot button')].find(b => /Issue all/.test(b.textContent)).click());
+  await page.waitForFunction(() => !/Drafts/.test([...document.querySelectorAll('.stat-label')].map(s => s.textContent).join('|')) ||
+                                   /0 invoices not issued/.test(document.querySelector('.view').textContent), { timeout: 5000 });
+  const res = await page.evaluate(async () => {
+    const r = await fetch('/api', { method: 'POST', body: JSON.stringify({ action: 'rentCandidates',
+      token: localStorage.getItem('vipm.token'), payload: {} }) });
+    return (await r.json()).data.leases.find(l => l.lease_id === 'LSE-00001');
+  });
+  if (res.periods.some(p => p.kind === 'current')) throw new Error('this month is still offered after issuing');
 });
 
 console.log('\n— global search —');

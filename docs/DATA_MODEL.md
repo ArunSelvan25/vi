@@ -14,6 +14,7 @@ mean and the rules that keep them consistent.
 | `lease_tenants` | Everyone else living on a lease besides its primary tenant |
 | `invoices` | What is owed. Amounts, paid and balance are derived from the lines and payments |
 | `invoice_items` | The lines of an invoice: rent, electricity (EB), water, late fee … |
+| `rent_offline` | Rent periods marked as billed outside the app, with the reason |
 | `payments` | Money received, always against an invoice |
 | `maintenance` | Repair tickets |
 | `expenses` | Money spent on a property |
@@ -35,10 +36,12 @@ and "today" is measured in the `APP_TIMEZONE` of the API.
 
 - `frequency` — Monthly · Quarterly · Half-Yearly · Yearly. `rent_amount` is
   always the monthly rent.
-- `rent_day` — for a monthly lease, the payment day each month: 1–28, or 31 for
-  the last day of the month. `billing_day` is an older, unused column and is not read.
-- `grace_days` — with a rent day, the days after an invoice's due date before the
-  late fee is added.
+- `rent_day` — the day rent is due: 1–28, or 31 for the last day of the month.
+  Required on every new lease. Each rent invoice covers the days since the last
+  rent day (see [RENT_GENERATION.md](RENT_GENERATION.md)). `billing_day` is an
+  older, unused column and is not read.
+- `grace_days` — the days after an invoice's due date (or its issue date, if
+  later) before a late fee can be charged.
 - `gst_rate` — GST % added to rent invoices and late fees on this lease.
 - `renewed_from` — the lease this one renews.
 - `deposit_status` — Pending · Held · Partially Refunded · Refunded · Forfeited ·
@@ -58,6 +61,20 @@ invoices, statements and deposit. Everyone else living in the unit is a row in
   from the lease; a blank move-out means still living there.
 - A person is on a lease at most once, and never as both its primary tenant
   and an occupant. Nothing here is billed.
+
+## Rent billing records
+
+- A lease's rent is **billed** for the days covered by its rent invoices
+  (`type` Rent, or any invoice with a Rent line and a period) — draft, issued or
+  void — and by its `rent_offline` rows. Generate rent offers only the days in
+  between.
+- `rent_offline` — `period_start` / `period_end`, the `reason`, and who marked
+  it. Not money: never income, never owed. Deleting a row (Undo) offers the
+  period again. Written only through Generate rent.
+- `invoice_items.late_fee_for` — on a late-fee line, the overdue invoice it is
+  charged for. An overdue invoice is charged once at most.
+- `invoices.late_fee_waived` — the reason its late fee was waived for good;
+  blank when not waived.
 - Deleting a lease removes its occupant rows; a tenant still listed on a lease
   cannot be deleted.
 
@@ -119,7 +136,8 @@ property, known values only for statuses, nothing referenced can be deleted).
 | Deleting a payment | Restores the invoice's paid amount, balance and status |
 | Deleting anything referenced | Refused, listing what still points at it. An invoice's own line items and a lease's occupant rows are the exceptions, and are removed with it |
 | Voiding | Refused while any payment is recorded against the invoice |
-| Late fees | Added once, when an invoice on a lease with a late fee turns overdue — after the grace days on a rent-day lease |
+| Late fees | Never added automatically. Offered once an open invoice is past its grace days (from the later of its due and issue dates); charged at most once, on the next rent invoice or on itself, or waived for good with a reason |
+| Generating rent | Periods already covered by a rent invoice (even void) or marked billed outside the app are never offered again. Rent is recomputed on the server; an invoice whose lease changed since the screen opened is skipped |
 | Sold / Inactive properties | Excluded from the dashboard headline figures. Their history stays in the reports |
 | Tenant status | Active while they hold a live lease or live on one as an occupant (until their move-out date), Past once every lease has ended |
 | Occupants | Saved with the lease in one transaction. A form only removes occupants it was opened with, so someone added meanwhile is kept, and a stale edit of one is refused. Making an occupant primary moves the previous primary into their place as a co-tenant. Renewing carries over everyone still living there |
